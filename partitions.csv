@@ -1,0 +1,9 @@
+# Name,    Type, SubType, Offset,   Size
+# Layout for 32 MB flash (Waveshare ESP32-P4-WIFI6).
+# The loader lives in "factory"; the selected .bin is written to "ota_0".
+nvs,       data, nvs,     0x9000,   0x6000
+otadata,   data, ota,     0xF000,   0x2000
+phy_init,  data, phy,     0x11000,  0x1000
+factory,   app,  factory, 0x20000,  2M
+ota_0,     app,  ota_0,   0x220000, 10M
+storage,   data, fat,     0xC20000, 0x13E0000

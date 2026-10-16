@@ -1,0 +1,1723 @@
+// ui.c - on-screen file browser: pick a .bin on the SD card, confirm, flash it into ota_0 and boot it.
+#include "ui.h"
+
+#include <dirent.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/stat.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+#include "nvs.h"
+#include "sdkconfig.h"
+#include "keyboard.h"
+#include "lcd.h"
+#include "sdcard.h"
+#include "image_flash.h"
+#include "usb_drive.h"
+#include "webserver.h"
+
+static const char *TAG = "ui";
+
+// ---- colours / layout -------------------------------------------------------------------------
+#define C_BG     RGB565(18, 20, 28)
+#define C_FG     RGB565(235, 235, 235)
+#define C_DIM    RGB565(140, 145, 160)
+#define C_ACCENT RGB565(120, 200, 255)
+#define C_SEL_BG RGB565(215, 215, 215)
+#define C_SEL_FG RGB565(10, 10, 10)
+#define C_ERR    RGB565(255, 100, 100)
+#define C_OK     RGB565(110, 220, 110)
+#define C_WARN   RGB565(255, 190, 80)
+
+#define MARGIN    8
+#define TITLE_Y   6
+#define PATH_Y    24
+#define LIST_Y    46
+#define ROW_H     15
+#define FOOTER_Y  (LCD_H - 34)
+#define LIST_ROWS ((FOOTER_Y - 4 - LIST_Y) / ROW_H)
+#define COLS      ((LCD_W - 2 * MARGIN) / 7)
+
+#define MAX_ENTRIES 256
+#define PATH_MAX_LEN 256
+#define NVS_NS "loader"
+
+// ---- state ------------------------------------------------------------------------------------
+typedef struct {
+    char *name;
+    bool is_dir;
+    size_t size;
+} entry_t;
+
+typedef enum {
+    SCREEN_BROWSE,
+    SCREEN_CONFIRM,
+    SCREEN_ERROR,
+    SCREEN_USB,
+    SCREEN_WEB,
+    SCREEN_WIFI,      // F1: the Wi-Fi network the web server joins
+    SCREEN_WIFI_SCAN, // pick a network from a scan
+    SCREEN_HELP,      // how to use the loader (from F1)
+    SCREEN_PICK,      // choose the start folder (from F1)
+} screen_t;
+
+static screen_t s_screen;
+static bool s_sd_ok;
+static char s_cwd[PATH_MAX_LEN]; // absolute VFS path, e.g. "/sdcard/apps"
+static entry_t s_entries[MAX_ENTRIES];
+static int s_count;
+static int s_sel, s_top;
+static int s_battery = -1;
+static bool s_charging;
+
+static char s_sel_path[PATH_MAX_LEN + 256];
+static char s_sel_name[64];
+static image_info_t s_info;
+static char s_error[128];
+static const char *s_path_override; // shown in the header instead of s_cwd
+
+// ---- helpers ----------------------------------------------------------------------------------
+static bool at_root(void)
+{
+    return strcmp(s_cwd, SDCARD_MOUNT_POINT) == 0;
+}
+
+static void nvs_save_str(const char *key, const char *value)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, key, value);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static bool nvs_load_str(const char *key, char *buf, size_t len)
+{
+    nvs_handle_t h;
+    bool ok = false;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        ok = nvs_get_str(h, key, buf, &len) == ESP_OK;
+        nvs_close(h);
+    }
+    return ok;
+}
+
+static const esp_partition_t *app_partition(void)
+{
+    return esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
+}
+
+static bool installed_app(esp_app_desc_t *desc)
+{
+    const esp_partition_t *p = app_partition();
+    return p && esp_ota_get_partition_description(p, desc) == ESP_OK;
+}
+
+static void boot_installed(void)
+{
+    const esp_partition_t *p = app_partition();
+    if (p && esp_ota_set_boot_partition(p) == ESP_OK) {
+        ESP_LOGI(TAG, "Booting %s", p->label);
+        sdcard_unmount();
+        esp_restart();
+    }
+}
+
+// Copy `s` into `out` (cols+1 bytes), cutting it to `cols` characters with a trailing "..".
+static void fit(char *out, const char *s, int cols)
+{
+    int len = (int)strlen(s);
+    if (len <= cols) {
+        strcpy(out, s);
+    } else {
+        memcpy(out, s, cols - 2);
+        strcpy(out + cols - 2, "..");
+    }
+}
+
+static void format_size(char *out, size_t len, size_t bytes)
+{
+    size_t kb = (bytes + 1023) / 1024;
+    if (kb < 10000) {
+        snprintf(out, len, "%uKB", (unsigned)kb);
+    } else {
+        snprintf(out, len, "%uMB", (unsigned)(kb / 1024));
+    }
+}
+
+// ---- directory listing ------------------------------------------------------------------------
+static int cmp_entries(const void *a, const void *b)
+{
+    const entry_t *x = a, *y = b;
+    if (x->is_dir != y->is_dir) {
+        return x->is_dir ? -1 : 1;
+    }
+    return strcasecmp(x->name, y->name);
+}
+
+static bool has_bin_ext(const char *name)
+{
+    size_t len = strlen(name);
+    return len > 4 && strcasecmp(name + len - 4, ".bin") == 0;
+}
+
+static void free_entries(void)
+{
+    for (int i = 0; i < s_count; i++) {
+        free(s_entries[i].name);
+    }
+    s_count = 0;
+}
+
+static void scan_dir(void)
+{
+    free_entries();
+    s_sel = s_top = 0;
+    if (!s_sd_ok) {
+        return;
+    }
+    DIR *dir = opendir(s_cwd);
+    if (!dir) {
+        ESP_LOGW(TAG, "Cannot open %s", s_cwd);
+        return;
+    }
+    char path[PATH_MAX_LEN + 256];
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL && s_count < MAX_ENTRIES) {
+        // skip hidden files, macOS "._" files and "System Volume Information"
+        if (de->d_name[0] == '.' || strcasecmp(de->d_name, "System Volume Information") == 0) {
+            continue;
+        }
+        bool is_dir = de->d_type == DT_DIR;
+        if (!is_dir && !has_bin_ext(de->d_name)) {
+            continue;
+        }
+        entry_t *e = &s_entries[s_count];
+        e->name = strdup(de->d_name);
+        e->is_dir = is_dir;
+        e->size = 0;
+        if (!is_dir) {
+            struct stat st;
+            snprintf(path, sizeof(path), "%s/%s", s_cwd, de->d_name);
+            if (stat(path, &st) == 0) {
+                e->size = (size_t)st.st_size;
+            }
+        }
+        if (e->name) {
+            s_count++;
+        }
+    }
+    closedir(dir);
+    qsort(s_entries, s_count, sizeof(s_entries[0]), cmp_entries);
+}
+
+// Index 0 is ".." when not at the root; the rest map onto s_entries.
+static int item_count(void)
+{
+    return s_count + (at_root() ? 0 : 1);
+}
+
+static entry_t *item_entry(int idx)
+{
+    int i = at_root() ? idx : idx - 1;
+    return i >= 0 ? &s_entries[i] : NULL; // NULL = ".."
+}
+
+static void change_dir(const char *name)
+{
+    char prev[64] = "";
+    if (name == NULL) { // go up
+        char *slash = strrchr(s_cwd, '/');
+        if (at_root() || !slash) {
+            return;
+        }
+        strlcpy(prev, slash + 1, sizeof(prev));
+        *slash = '\0';
+    } else {
+        size_t len = strlen(s_cwd);
+        if (len + 1 + strlen(name) >= sizeof(s_cwd)) {
+            return;
+        }
+        snprintf(s_cwd + len, sizeof(s_cwd) - len, "/%s", name);
+    }
+    scan_dir();
+    // Coming back up: select the directory we came from.
+    for (int i = 0; prev[0] && i < item_count(); i++) {
+        entry_t *e = item_entry(i);
+        if (e && e->is_dir && strcmp(e->name, prev) == 0) {
+            s_sel = i;
+            break;
+        }
+    }
+    nvs_save_str("last_dir", s_cwd);
+}
+
+// ---- web server icon (top bar, shown while the server is on) ----------------------------------
+static uint16_t s_icon_shown; // colour of the icon last drawn, 0 = none
+
+static bool web_running(void)
+{
+    web_status_t st;
+    webserver_status(&st);
+    return st.state != WEB_OFF;
+}
+
+// 0 when the server is off; green when it's ready, blue while starting, amber while
+// reconnecting, red if it failed.
+static uint16_t web_icon_color(void)
+{
+    web_status_t st;
+    webserver_status(&st);
+    switch (st.state) {
+    case WEB_OFF:
+        return 0;
+    case WEB_STARTING:
+    case WEB_CONNECTING:
+        return C_ACCENT;
+    case WEB_RUNNING:
+        return st.ip[0] ? C_OK : C_WARN;
+    default:
+        return C_ERR;
+    }
+}
+
+// A Wi-Fi fan, WEB_ICON_W x 11 pixels, top-left at (x, y).
+#define WEB_ICON_W 15
+static void draw_web_icon(int x, int y, uint16_t color)
+{
+    int cx = x + WEB_ICON_W / 2, cy = y + 10;
+    for (int dy = 0; dy <= 10; dy++) {
+        for (int dx = -WEB_ICON_W / 2; dx <= WEB_ICON_W / 2; dx++) {
+            int r2 = dx * dx + dy * dy;
+            bool dot = r2 <= 2;
+            bool arc = 5 * abs(dx) <= 6 * dy && ((r2 >= 13 && r2 <= 28) || (r2 >= 49 && r2 <= 76));
+            if (dot || arc) {
+                lcd_fill_rect(cx + dx, cy - dy, 1, 1, color);
+            }
+        }
+    }
+}
+
+// ---- drawing ----------------------------------------------------------------------------------
+static void draw_header(void)
+{
+    lcd_fill_rect(0, 0, LCD_W, LCD_H, C_BG);
+    lcd_text(MARGIN, TITLE_Y, "ESP32-P4 Bin Loader", C_FG, FONT_LARGE);
+
+    int right = LCD_W - MARGIN; // where the next item to the left of the battery ends
+    if (s_battery >= 0) {
+        // battery icon: 18x9 body + 2x5 nub, fill proportional to charge
+        int bx = LCD_W - MARGIN - 20, by = TITLE_Y + 2;
+        char pct[16];
+        snprintf(pct, sizeof(pct), "%d%%", s_battery);
+        lcd_text(bx - 4 - 7 * (int)strlen(pct), TITLE_Y, pct, C_FG, FONT_LARGE);
+        lcd_fill_rect(bx, by, 18, 9, C_FG);
+        lcd_fill_rect(bx + 1, by + 1, 16, 7, C_BG);
+        lcd_fill_rect(bx + 18, by + 2, 2, 5, C_FG);
+        lcd_fill_rect(bx + 2, by + 2, 14 * s_battery / 100, 5, s_charging ? C_OK : C_FG);
+        right = bx - 4 - 7 * (int)strlen(pct) - 8;
+    }
+    s_icon_shown = web_icon_color();
+    if (s_icon_shown) {
+        draw_web_icon(right - WEB_ICON_W, TITLE_Y + 1, s_icon_shown);
+    }
+
+    char path[COLS + 1], shown[PATH_MAX_LEN + 8];
+    snprintf(shown, sizeof(shown), "Path: SD%s", (s_path_override ? s_path_override : s_cwd) + strlen(SDCARD_MOUNT_POINT));
+    if (strlen(shown) == strlen("Path: SD")) {
+        strcat(shown, "/");
+    }
+    fit(path, shown, COLS);
+    lcd_text(MARGIN, PATH_Y, path, C_FG, FONT_LARGE);
+    lcd_hline(MARGIN - 4, PATH_Y + 16, LCD_W - 2 * (MARGIN - 4), C_FG);
+}
+
+static void draw_footer(const char *line1, uint16_t line1_color, const char *keys)
+{
+    lcd_hline(MARGIN - 4, FOOTER_Y, LCD_W - 2 * (MARGIN - 4), C_FG);
+    if (line1) {
+        lcd_text(MARGIN, FOOTER_Y + 5, line1, line1_color, FONT_SMALL);
+    }
+    lcd_text(MARGIN, FOOTER_Y + 19, keys, C_FG, FONT_SMALL);
+}
+
+static void draw_browse(void)
+{
+    draw_header();
+
+    int n = item_count();
+    if (!s_sd_ok) {
+        lcd_text(MARGIN, LIST_Y + 2 * ROW_H, "No SD card found.", C_ERR, FONT_LARGE);
+        lcd_text(MARGIN, LIST_Y + 4 * ROW_H, "Insert a FAT32 card and press", C_DIM, FONT_LARGE);
+        lcd_text(MARGIN, LIST_Y + 5 * ROW_H, "Enter to retry.", C_DIM, FONT_LARGE);
+    } else if (n == 0) {
+        lcd_text(MARGIN, LIST_Y + 2 * ROW_H, "No .bin files here.", C_DIM, FONT_LARGE);
+    }
+
+    if (s_sel < s_top) {
+        s_top = s_sel;
+    } else if (s_sel >= s_top + LIST_ROWS) {
+        s_top = s_sel - LIST_ROWS + 1;
+    }
+
+    for (int row = 0; row < LIST_ROWS && s_top + row < n; row++) {
+        int idx = s_top + row;
+        int y = LIST_Y + row * ROW_H;
+        bool sel = idx == s_sel;
+        uint16_t fg = sel ? C_SEL_FG : C_FG;
+        if (sel) {
+            lcd_fill_rect(MARGIN - 4, y - 1, LCD_W - 2 * (MARGIN - 4), ROW_H, C_SEL_BG);
+        }
+
+        entry_t *e = item_entry(idx);
+        char label[COLS + 1], buf[300];
+        if (!e) {
+            lcd_text(MARGIN, y, "[..]", fg, FONT_LARGE);
+        } else if (e->is_dir) {
+            snprintf(buf, sizeof(buf), "[%s]", e->name);
+            fit(label, buf, COLS);
+            lcd_text(MARGIN, y, label, fg, FONT_LARGE);
+        } else {
+            char size[12];
+            format_size(size, sizeof(size), e->size);
+            int size_cols = (int)strlen(size);
+            fit(label, e->name, COLS - size_cols - 1);
+            lcd_text(MARGIN, y, label, fg, FONT_LARGE);
+            lcd_text(LCD_W - MARGIN - 7 * size_cols, y, size, sel ? C_SEL_FG : C_DIM, FONT_LARGE);
+        }
+    }
+
+    // scroll bar
+    if (n > LIST_ROWS) {
+        int track = LIST_ROWS * ROW_H;
+        int h = track * LIST_ROWS / n;
+        int y = LIST_Y + (track - h) * s_top / (n - LIST_ROWS);
+        lcd_fill_rect(LCD_W - 3, y - 1, 2, h, C_DIM);
+    }
+
+    esp_app_desc_t desc;
+    char installed[80];
+    if (installed_app(&desc)) {
+        snprintf(installed, sizeof(installed), "Installed: %.32s %.20s", desc.project_name, desc.version);
+    } else {
+        snprintf(installed, sizeof(installed), "Installed: (none)");
+    }
+    char line[COLS + 1];
+    fit(line, installed, (LCD_W - 2 * MARGIN) / 6);
+    draw_footer(line, C_DIM, "Enter open  F1 Setup  F4 Web  F5 USB drive");
+}
+
+static void draw_kv(int y, const char *key, const char *value)
+{
+    char v[COLS + 1];
+    lcd_text(MARGIN, y, key, C_DIM, FONT_LARGE);
+    fit(v, value, COLS - 10);
+    lcd_text(MARGIN + 70, y, v, C_FG, FONT_LARGE);
+}
+
+static void draw_confirm(void)
+{
+    draw_header();
+    char buf[96];
+    int y = LIST_Y + 4;
+    lcd_text(MARGIN, y, "Flash and run this app?", C_ACCENT, FONT_LARGE);
+    y += 2 * ROW_H;
+    draw_kv(y, "File", s_sel_name);
+    y += ROW_H;
+    snprintf(buf, sizeof(buf), "%.32s", s_info.desc.project_name);
+    draw_kv(y, "Project", buf);
+    y += ROW_H;
+    snprintf(buf, sizeof(buf), "%.32s", s_info.desc.version);
+    draw_kv(y, "Version", buf);
+    y += ROW_H;
+    snprintf(buf, sizeof(buf), "%.32s", s_info.desc.idf_ver);
+    draw_kv(y, "ESP-IDF", buf);
+    y += ROW_H;
+    snprintf(buf, sizeof(buf), "%.16s %.16s", s_info.desc.date, s_info.desc.time);
+    draw_kv(y, "Built", buf);
+    y += ROW_H;
+    format_size(buf, sizeof(buf), s_info.app_size);
+    draw_kv(y, "Size", buf);
+    y += ROW_H;
+    unsigned min = s_info.hdr.min_chip_rev_full, max = s_info.hdr.max_chip_rev_full;
+    snprintf(buf, sizeof(buf), "v%u.%u - v%u.%u", min / 100, min % 100, max / 100, max % 100);
+    draw_kv(y, "Chip rev", buf);
+    y += ROW_H;
+    if (s_info.merged) {
+        snprintf(buf, sizeof(buf), "merged image, app at 0x%x", (unsigned)s_info.app_offset);
+        draw_kv(y, "Format", buf);
+    } else {
+        draw_kv(y, "Format", "application image");
+    }
+    draw_footer(NULL, C_FG, "Enter: flash & run    Esc: back");
+}
+
+static void draw_wrapped(int y, const char *text, uint16_t color)
+{
+    char line[COLS + 1];
+    size_t len = strlen(text);
+    for (size_t pos = 0; pos < len; y += ROW_H) {
+        size_t n = len - pos > COLS ? COLS : len - pos;
+        if (pos + n < len) { // break at the last space
+            size_t sp = n;
+            while (sp > 0 && text[pos + sp] != ' ') {
+                sp--;
+            }
+            if (sp > 0) {
+                n = sp;
+            }
+        }
+        memcpy(line, text + pos, n);
+        line[n] = '\0';
+        lcd_text(MARGIN, y, line, color, FONT_LARGE);
+        pos += n;
+        while (text[pos] == ' ') {
+            pos++;
+        }
+    }
+}
+
+static void draw_error(void)
+{
+    draw_header();
+    int y = LIST_Y + 4;
+    lcd_text(MARGIN, y, "Can't run this file", C_ERR, FONT_LARGE);
+    y += 2 * ROW_H;
+    draw_kv(y, "File", s_sel_name);
+    y += 2 * ROW_H;
+    draw_wrapped(y, s_error, C_FG);
+    draw_footer(NULL, C_FG, "Esc / Enter: back");
+}
+
+static usbdrive_state_t s_usb_shown = USBDRIVE_OFF;
+
+static void draw_usb(void)
+{
+    usbdrive_state_t st = usbdrive_state();
+    s_usb_shown = st;
+    draw_header();
+    int y = LIST_Y + 4;
+    lcd_text(MARGIN, y, "USB drive mode", C_ACCENT, FONT_LARGE);
+    y += 2 * ROW_H;
+    char buf[48];
+    snprintf(buf, sizeof(buf), "%u MB", (unsigned)usbdrive_size_mb());
+    draw_kv(y, "SD card", buf);
+    y += 2 * ROW_H;
+
+    const char *status, *help;
+    uint16_t color;
+    switch (st) {
+    case USBDRIVE_CONNECTED:
+        status = "Connected to the PC";
+        color = C_OK;
+        help = "The SD card is now a drive on your PC. Copy your .bin files, then eject "
+               "the drive on the PC to come back here.";
+        break;
+    case USBDRIVE_SUSPENDED:
+        status = "Cable unplugged or PC asleep";
+        color = C_ERR;
+        help = "Plug the cable back in, or press Esc to leave USB drive mode.";
+        break;
+    default:
+        status = "Waiting for the PC...";
+        color = C_FG;
+        help = "Connect the ESP32-P4 board's 4-pin USB OTG header to the PC. The USB-C port is serial only.";
+        break;
+    }
+    lcd_text(MARGIN, y, "Status", C_DIM, FONT_LARGE);
+    lcd_text(MARGIN + 70, y, status, color, FONT_LARGE);
+    y += 2 * ROW_H;
+    draw_wrapped(y, help, C_DIM);
+    draw_footer(NULL, C_FG, st == USBDRIVE_CONNECTED ? "Esc: stop (eject on the PC first!)"
+                                                     : "Esc: back to the file list");
+}
+
+static void leave_usb(void)
+{
+    usbdrive_stop();
+    s_sd_ok = sdcard_mount() == ESP_OK;
+    struct stat st;
+    if (!s_sd_ok || stat(s_cwd, &st) != 0) {
+        strlcpy(s_cwd, SDCARD_MOUNT_POINT, sizeof(s_cwd));
+    }
+    scan_dir();
+    s_screen = SCREEN_BROWSE;
+}
+
+static void enter_usb(void)
+{
+    if (web_running()) {
+        webserver_stop(); // the PC gets the raw card; the web server can't share it
+    }
+    free_entries(); // the listing goes stale while the PC owns the card
+    esp_err_t err = usbdrive_start();
+    if (err != ESP_OK) {
+        s_sd_ok = sdcard_mount() == ESP_OK;
+        scan_dir();
+        snprintf(s_error, sizeof(s_error), "Could not start USB drive mode: %s", esp_err_to_name(err));
+        strlcpy(s_sel_name, "(SD card)", sizeof(s_sel_name));
+        s_screen = SCREEN_ERROR;
+        return;
+    }
+    s_screen = SCREEN_USB;
+}
+
+// ---- web server mode (F4) ---------------------------------------------------------------------
+static uint32_t s_web_rev_shown;
+static int64_t s_web_drawn_us;
+
+static void draw_web(void)
+{
+    web_status_t st;
+    s_web_rev_shown = webserver_status(&st);
+    s_web_drawn_us = esp_timer_get_time();
+    draw_header();
+    int y = LIST_Y + 4;
+    lcd_text(MARGIN, y, "Web file manager", C_ACCENT, FONT_LARGE);
+    y += 2 * ROW_H;
+
+    char buf[96];
+    switch (st.state) {
+    case WEB_STARTING:
+        lcd_text(MARGIN, y, "Starting Wi-Fi (ESP32-C6)...", C_FG, FONT_LARGE);
+        break;
+    case WEB_CONNECTING:
+        draw_kv(y, "Network", st.ssid);
+        y += ROW_H;
+        lcd_text(MARGIN, y, "Status", C_DIM, FONT_LARGE);
+        lcd_text(MARGIN + 70, y, "Connecting...", C_FG, FONT_LARGE);
+        y += 2 * ROW_H;
+        draw_wrapped(y, "If it can't join within 20 s, the loader starts its own Wi-Fi network instead.", C_DIM);
+        break;
+    case WEB_RUNNING:
+        if (st.ap_mode) {
+            draw_kv(y, "Wi-Fi", st.ssid);
+            y += ROW_H;
+            draw_kv(y, "Password", st.password);
+            y += ROW_H;
+        } else {
+            draw_kv(y, "Network", st.ssid);
+            y += ROW_H;
+        }
+        lcd_text(MARGIN, y, "Open", C_DIM, FONT_LARGE);
+        if (st.ip[0]) {
+            snprintf(buf, sizeof(buf), "http://%s/", st.ip);
+            lcd_text(MARGIN + 70, y, buf, C_OK, FONT_LARGE);
+            y += ROW_H;
+            lcd_text(MARGIN + 70, y, "http://" WEB_HOSTNAME ".local/", C_FG, FONT_LARGE);
+        } else {
+            lcd_text(MARGIN + 70, y, "(reconnecting...)", C_ERR, FONT_LARGE);
+        }
+        y += 2 * ROW_H;
+        if (st.activity[0]) {
+            char act[COLS + 1];
+            fit(act, st.activity, COLS);
+            lcd_text(MARGIN, y, act, C_FG, FONT_LARGE);
+            y += ROW_H + 2;
+            if (st.progress >= 0) {
+                int w = LCD_W - 2 * MARGIN;
+                lcd_fill_rect(MARGIN, y, w, 10, C_FG);
+                lcd_fill_rect(MARGIN + 1, y + 1, w - 2, 8, C_BG);
+                lcd_fill_rect(MARGIN + 2, y + 2, (w - 4) * st.progress / 100, 6, C_ACCENT);
+            }
+        }
+        if (st.ap_mode) {
+            draw_wrapped(FOOTER_Y - 3 * ROW_H, "Join this network, or save your own Wi-Fi in Setup (F1) to use that instead.", C_DIM);
+        }
+        break;
+    case WEB_FAILED:
+    default:
+        lcd_text(MARGIN, y, "Wi-Fi failed", C_ERR, FONT_LARGE);
+        y += 2 * ROW_H;
+        draw_wrapped(y, st.error, C_FG);
+        break;
+    }
+    draw_footer(st.state == WEB_FAILED ? "The server is still on until you stop it." : "Esc leaves it running in the background.",
+                C_DIM, st.state == WEB_FAILED ? "F4 / Esc: stop" : "Esc: back to the files   F4: stop server");
+}
+
+static uint32_t s_web_changes_seen;
+
+static void stop_web(void)
+{
+    webserver_stop();
+    s_web_changes_seen = webserver_changes();
+    struct stat st;
+    if (!s_sd_ok || stat(s_cwd, &st) != 0) {
+        strlcpy(s_cwd, SDCARD_MOUNT_POINT, sizeof(s_cwd));
+    }
+    scan_dir(); // the browser may have changed anything
+    s_screen = SCREEN_BROWSE;
+}
+
+static void enter_web(void)
+{
+    if (!s_sd_ok) {
+        snprintf(s_error, sizeof(s_error), "Insert an SD card first.");
+        strlcpy(s_sel_name, "(SD card)", sizeof(s_sel_name));
+        s_screen = SCREEN_ERROR;
+        return;
+    }
+    s_web_changes_seen = webserver_changes();
+    esp_err_t err = webserver_start();
+    if (err != ESP_OK) {
+        snprintf(s_error, sizeof(s_error), "Could not start the web server: %s", esp_err_to_name(err));
+        strlcpy(s_sel_name, "(web server)", sizeof(s_sel_name));
+        s_screen = SCREEN_ERROR;
+        return;
+    }
+    s_screen = SCREEN_WEB;
+}
+
+// ---- Wi-Fi settings (F1) ----------------------------------------------------------------------
+enum { WF_SSID, WF_PASS, WF_SHOW, WF_SCAN, WF_SAVE, WF_FORGET, WF_START, WF_HELP, WF_ROWS };
+#define WF_ROW_H   18
+#define WF_FIELD_X (MARGIN + 74)
+#define WF_COLS    ((LCD_W - MARGIN - WF_FIELD_X - 4) / 7)
+#define MAX_APS    24
+
+static char s_wf_ssid[33], s_wf_pass[65];
+static bool s_wf_show, s_wf_dirty;
+static int s_wf_row;
+static char s_wf_msg[64];
+static uint16_t s_wf_msg_color;
+static web_ap_t s_aps[MAX_APS];
+static int s_ap_count, s_ap_sel, s_ap_top;
+
+static void wf_message(const char *msg, uint16_t color)
+{
+    strlcpy(s_wf_msg, msg, sizeof(s_wf_msg));
+    s_wf_msg_color = color;
+}
+
+// ---- help (F1 > Help) -------------------------------------------------------------------------
+// "#" starts a heading, "" is a blank line; everything else is wrapped to the screen width.
+static const char *const HELP_TEXT[] = {
+    "#What it does",
+    "Copy ESP32-P4 firmware (.bin files) to the SD card, pick one here, and the loader flashes it and boots it.",
+    "",
+    "#The file list",
+    "Up/Down, PgUp/PgDn, Home/End: move.",
+    "Enter or Right: open a folder, or show the details of a .bin file.",
+    "Enter on the details screen: flash and run it. Esc: back.",
+    "Backspace or Left: parent folder.",
+    "The installed app starts after flashing, or on reset / power-on.",
+    "F1: Setup (Wi-Fi network) and this help.",
+    "F4: web file manager. F5: USB drive mode.",
+    "Only folders and .bin files are listed. The last folder and file are remembered.",
+    "No card? Insert a FAT32 card and press Enter.",
+    "",
+    "#Back to the loader",
+    "Hold Up, F1 or F5 while pressing reset or switching on. The board's BOOT button also works: press it within 0.5 s after releasing RESET.",
+    "Your own apps can call binloader_reboot_to_menu() from loader_api.h.",
+    "",
+    "#Which files work",
+    "App images for the ESP32-P4 (ESP-IDF, Arduino, MicroPython) built for this chip revision. Merged *.factory.bin images work too: only the app part is used, and the bootloader is never overwritten.",
+    "Each file is checked before flashing; an unsuitable one shows why.",
+    "",
+    "#Setup (F1)",
+    "Type the network name and password, or choose Scan for networks and pick one.",
+    "Up/Down or Tab: move. Backspace: delete. Enter: select.",
+    "Save keeps the network on the board. Forget removes it.",
+    "2.4 GHz networks only. Passwords are 8-64 characters, or empty for an open network.",
+    "Start folder: the folder the file list opens in at switch-on. Choose one, or Remember the last folder (the default).",
+    "",
+    "#Web file manager (F4)",
+    "Joins your saved network and shows the address to open in a browser. http://" WEB_HOSTNAME ".local/ often works too.",
+    "With no network saved, or if joining fails within 20 s, it makes its own network PicoCalc-Loader-XXXX. Its password and the address http://192.168.4.1/ are shown on screen.",
+    "In the browser: upload (drag and drop works), download, rename, delete, new folder, and Flash a .bin straight away.",
+    "There is no login: use it on trusted networks only.",
+    "Esc goes back to the files and keeps the server running. A Wi-Fi icon at the top shows it is on: green ready, blue starting, amber reconnecting, red failed. The file list refreshes when the browser changes files.",
+    "F4 shows the server screen again; F4 there stops it. Flashing a file or USB drive mode stops it too.",
+    "",
+    "#USB drive mode (F5)",
+    "Shows the SD card on a PC as a USB drive. Needs a cable on the board's 4-pin USB OTG header (VBUS, D-, D+, GND); the USB-C port is serial only.",
+    "Eject the drive on the PC when done: the loader takes the card back by itself. Esc also leaves, but only press it after ejecting.",
+    "Starting USB drive mode stops the web server.",
+    "",
+    "#Serial console",
+    "115200 baud on the USB-C port. Arrows, Enter, Backspace, Esc, F1, F4, F5 and typing work like the PicoCalc keyboard.",
+    "",
+    "#This help",
+    "Up/Down: scroll. PgUp/PgDn: page. Home/End: top/bottom. Esc: back.",
+};
+
+#define HELP_MAX_LINES 200
+typedef struct {
+    const char *text;
+    uint8_t len;
+    bool heading;
+} help_line_t;
+
+static help_line_t s_help[HELP_MAX_LINES];
+static int s_help_count, s_help_top;
+
+static void help_add(const char *text, size_t len, bool heading)
+{
+    if (s_help_count < HELP_MAX_LINES) {
+        s_help[s_help_count++] = (help_line_t){text, (uint8_t)len, heading};
+    }
+}
+
+// Wrap HELP_TEXT into screen lines (once).
+static void help_layout(void)
+{
+    if (s_help_count) {
+        return;
+    }
+    for (size_t i = 0; i < sizeof(HELP_TEXT) / sizeof(HELP_TEXT[0]); i++) {
+        const char *t = HELP_TEXT[i];
+        bool heading = t[0] == '#';
+        t += heading;
+        size_t len = strlen(t);
+        if (!len) {
+            help_add("", 0, false);
+        }
+        for (size_t pos = 0; pos < len;) {
+            size_t n = len - pos > COLS - 1 ? COLS - 1 : len - pos; // leave room for the scroll bar
+            if (pos + n < len) { // break at the last space
+                size_t sp = n;
+                while (sp > 0 && t[pos + sp] != ' ') {
+                    sp--;
+                }
+                if (sp > 0) {
+                    n = sp;
+                }
+            }
+            help_add(t + pos, n, heading);
+            pos += n;
+            while (t[pos] == ' ') {
+                pos++;
+            }
+        }
+    }
+}
+
+static void enter_help(void)
+{
+    help_layout();
+    s_help_top = 0;
+    s_screen = SCREEN_HELP;
+}
+
+static void draw_help(void)
+{
+    draw_header();
+    int max_top = s_help_count > LIST_ROWS ? s_help_count - LIST_ROWS : 0;
+    if (s_help_top > max_top) {
+        s_help_top = max_top;
+    }
+    for (int r = 0; r < LIST_ROWS && s_help_top + r < s_help_count; r++) {
+        const help_line_t *l = &s_help[s_help_top + r];
+        char line[COLS + 1];
+        memcpy(line, l->text, l->len);
+        line[l->len] = '\0';
+        lcd_text(MARGIN, LIST_Y + r * ROW_H, line, l->heading ? C_ACCENT : C_FG, FONT_LARGE);
+    }
+    if (max_top) { // scroll bar
+        int track = LIST_ROWS * ROW_H;
+        int h = track * LIST_ROWS / s_help_count;
+        int y = LIST_Y + (track - h) * s_help_top / max_top;
+        lcd_fill_rect(LCD_W - 3, y - 1, 2, h, C_DIM);
+    }
+    char where[32];
+    int last = s_help_top + LIST_ROWS < s_help_count ? s_help_top + LIST_ROWS : s_help_count;
+    snprintf(where, sizeof(where), "Help  line %d of %d", last, s_help_count);
+    draw_footer(where, C_DIM, "Up/Down scroll  PgUp/PgDn page  Esc back");
+}
+
+static bool help_key(int key)
+{
+    switch (key) {
+    case KEY_UP:
+        s_help_top -= s_help_top > 0;
+        return true;
+    case KEY_DOWN:
+        s_help_top++; // clamped when drawing
+        return true;
+    case KEY_PAGE_UP:
+    case KEY_LEFT:
+        s_help_top = s_help_top > LIST_ROWS - 1 ? s_help_top - (LIST_ROWS - 1) : 0;
+        return true;
+    case KEY_PAGE_DOWN:
+    case KEY_RIGHT:
+    case ' ':
+        s_help_top += LIST_ROWS - 1;
+        return true;
+    case KEY_HOME:
+        s_help_top = 0;
+        return true;
+    case KEY_END:
+        s_help_top = s_help_count;
+        return true;
+    case KEY_ESC:
+    case KEY_ENTER:
+    case KEY_BACKSPACE:
+    case KEY_F1:
+        s_screen = SCREEN_WIFI;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void enter_wifi(void)
+{
+    web_wifi_load(s_wf_ssid, sizeof(s_wf_ssid), s_wf_pass, sizeof(s_wf_pass));
+    s_wf_show = false;
+    s_wf_dirty = false;
+    s_wf_row = s_wf_ssid[0] ? WF_PASS : WF_SSID;
+    wf_message(s_wf_ssid[0] ? "This network is used when you press F4." : "No network set up yet.", C_DIM);
+    s_screen = SCREEN_WIFI;
+}
+
+// ---- start folder (Setup) ---------------------------------------------------------------------
+// Rows: "use this folder", "remember the last folder", then ".." (below the root) and subfolders.
+enum { PICK_USE, PICK_LAST, PICK_FIRST };
+#define MAX_PICK 128
+
+static char s_start_dir[PATH_MAX_LEN]; // folder to open at switch-on; "" = the last one used
+static char s_pick[PATH_MAX_LEN];      // folder being looked at in the picker
+static char *s_pick_dirs[MAX_PICK];
+static int s_pick_count, s_pick_sel, s_pick_top;
+
+static bool pick_at_root(void)
+{
+    return strcmp(s_pick, SDCARD_MOUNT_POINT) == 0;
+}
+
+static int pick_rows(void)
+{
+    return PICK_FIRST + (pick_at_root() ? 0 : 1) + s_pick_count;
+}
+
+// Subfolder index for a row, -1 for "..", -2 for the two fixed rows.
+static int pick_dir_index(int row)
+{
+    if (row < PICK_FIRST) {
+        return -2;
+    }
+    row -= PICK_FIRST;
+    if (!pick_at_root()) {
+        if (row == 0) {
+            return -1;
+        }
+        row--;
+    }
+    return row;
+}
+
+static int cmp_names(const void *a, const void *b)
+{
+    return strcasecmp(*(char *const *)a, *(char *const *)b);
+}
+
+static void pick_scan(void)
+{
+    for (int i = 0; i < s_pick_count; i++) {
+        free(s_pick_dirs[i]);
+    }
+    s_pick_count = 0;
+    s_pick_sel = s_pick_top = 0;
+    DIR *dir = opendir(s_pick);
+    if (!dir) {
+        return;
+    }
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL && s_pick_count < MAX_PICK) {
+        if (de->d_type != DT_DIR || de->d_name[0] == '.' ||
+            strcasecmp(de->d_name, "System Volume Information") == 0) {
+            continue;
+        }
+        char *name = strdup(de->d_name);
+        if (name) {
+            s_pick_dirs[s_pick_count++] = name;
+        }
+    }
+    closedir(dir);
+    qsort(s_pick_dirs, s_pick_count, sizeof(s_pick_dirs[0]), cmp_names);
+}
+
+// "SD/apps" for "/sdcard/apps", "SD/" for the root.
+static void sd_name(char *out, size_t len, const char *vfs)
+{
+    const char *rest = vfs + strlen(SDCARD_MOUNT_POINT);
+    snprintf(out, len, "SD%s", rest[0] ? rest : "/");
+}
+
+static void enter_pick(void)
+{
+    if (!s_sd_ok) {
+        wf_message("Insert an SD card first.", C_ERR);
+        return;
+    }
+    struct stat st;
+    const char *from = s_start_dir[0] ? s_start_dir : s_cwd;
+    strlcpy(s_pick, stat(from, &st) == 0 && S_ISDIR(st.st_mode) ? from : SDCARD_MOUNT_POINT, sizeof(s_pick));
+    pick_scan();
+    s_screen = SCREEN_PICK;
+}
+
+static void draw_pick(void)
+{
+    s_path_override = s_pick;
+    draw_header();
+    s_path_override = NULL;
+    int n = pick_rows();
+    if (s_pick_sel < s_pick_top) {
+        s_pick_top = s_pick_sel;
+    } else if (s_pick_sel >= s_pick_top + LIST_ROWS) {
+        s_pick_top = s_pick_sel - LIST_ROWS + 1;
+    }
+    for (int r = 0; r < LIST_ROWS && s_pick_top + r < n; r++) {
+        int row = s_pick_top + r, y = LIST_Y + r * ROW_H;
+        bool sel = row == s_pick_sel;
+        if (sel) {
+            lcd_fill_rect(MARGIN - 4, y - 1, LCD_W - 2 * (MARGIN - 4), ROW_H, C_SEL_BG);
+        }
+        char label[COLS + 1], buf[PATH_MAX_LEN + 8];
+        int d = pick_dir_index(row);
+        uint16_t fg = sel ? C_SEL_FG : C_FG;
+        if (row == PICK_USE) {
+            fit(label, "Use this folder", COLS);
+            fg = sel ? C_SEL_FG : C_OK;
+        } else if (row == PICK_LAST) {
+            fit(label, "Remember the last folder instead", COLS);
+            fg = sel ? C_SEL_FG : C_ACCENT;
+        } else if (d == -1) {
+            fit(label, "[..]", COLS);
+        } else {
+            snprintf(buf, sizeof(buf), "[%s]", s_pick_dirs[d]);
+            fit(label, buf, COLS);
+        }
+        lcd_text(MARGIN, y, label, fg, FONT_LARGE);
+    }
+    if (n > LIST_ROWS) { // scroll bar
+        int track = LIST_ROWS * ROW_H;
+        int h = track * LIST_ROWS / n;
+        int y = LIST_Y + (track - h) * s_pick_top / (n - LIST_ROWS);
+        lcd_fill_rect(LCD_W - 3, y - 1, 2, h, C_DIM);
+    }
+    draw_footer("Choose the folder to open at switch-on", C_DIM, "Enter open/choose  Left up  Esc cancel");
+}
+
+static void pick_up(void)
+{
+    char *slash = strrchr(s_pick, '/');
+    if (pick_at_root() || !slash) {
+        return;
+    }
+    char prev[64];
+    strlcpy(prev, slash + 1, sizeof(prev));
+    *slash = '\0';
+    pick_scan();
+    for (int row = PICK_FIRST; row < pick_rows(); row++) { // select the folder we came from
+        int d = pick_dir_index(row);
+        if (d >= 0 && strcmp(s_pick_dirs[d], prev) == 0) {
+            s_pick_sel = row;
+            break;
+        }
+    }
+}
+
+static bool pick_key(int key)
+{
+    int n = pick_rows();
+    switch (key) {
+    case KEY_UP:
+        s_pick_sel = s_pick_sel > 0 ? s_pick_sel - 1 : n - 1;
+        return true;
+    case KEY_DOWN:
+        s_pick_sel = s_pick_sel + 1 < n ? s_pick_sel + 1 : 0;
+        return true;
+    case KEY_PAGE_UP:
+        s_pick_sel = s_pick_sel > LIST_ROWS ? s_pick_sel - LIST_ROWS : 0;
+        return true;
+    case KEY_PAGE_DOWN:
+        s_pick_sel = s_pick_sel + LIST_ROWS < n ? s_pick_sel + LIST_ROWS : n - 1;
+        return true;
+    case KEY_HOME:
+        s_pick_sel = 0;
+        return true;
+    case KEY_END:
+        s_pick_sel = n - 1;
+        return true;
+    case KEY_BACKSPACE:
+    case KEY_LEFT:
+        pick_up();
+        return true;
+    case KEY_ESC:
+        s_screen = SCREEN_WIFI;
+        return true;
+    case KEY_ENTER:
+    case KEY_RIGHT:
+        break;
+    default:
+        return false;
+    }
+    int d = pick_dir_index(s_pick_sel);
+    if (s_pick_sel == PICK_USE || s_pick_sel == PICK_LAST) {
+        if (key == KEY_RIGHT) {
+            return true;
+        }
+        char msg[64], name[48];
+        if (s_pick_sel == PICK_USE) {
+            strlcpy(s_start_dir, s_pick, sizeof(s_start_dir));
+            sd_name(name, sizeof(name), s_start_dir);
+            snprintf(msg, sizeof(msg), "Opens %.40s at switch-on.", name);
+        } else {
+            s_start_dir[0] = '\0';
+            snprintf(msg, sizeof(msg), "Opens the last folder used.");
+        }
+        nvs_save_str("start_dir", s_start_dir);
+        ESP_LOGI(TAG, "Start folder: %s", s_start_dir[0] ? s_start_dir : "(last used)");
+        wf_message(msg, C_OK);
+        s_screen = SCREEN_WIFI;
+    } else if (d == -1) {
+        pick_up();
+    } else if (strlen(s_pick) + 1 + strlen(s_pick_dirs[d]) < sizeof(s_pick)) {
+        strlcat(s_pick, "/", sizeof(s_pick));
+        strlcat(s_pick, s_pick_dirs[d], sizeof(s_pick));
+        pick_scan();
+    }
+    return true;
+}
+
+static void draw_field(int y, const char *label, const char *text, bool masked, bool sel)
+{
+    lcd_text(MARGIN, y, label, sel ? C_ACCENT : C_DIM, FONT_LARGE);
+    lcd_fill_rect(WF_FIELD_X - 4, y - 3, LCD_W - MARGIN - WF_FIELD_X + 4, ROW_H + 2, sel ? C_SEL_BG : RGB565(40, 44, 58));
+    char shown[66];
+    size_t len = strlen(text);
+    if (masked) {
+        memset(shown, '*', len);
+        shown[len] = '\0';
+    } else {
+        strlcpy(shown, text, sizeof(shown));
+    }
+    if (sel) {
+        strlcat(shown, "_", sizeof(shown)); // cursor
+    }
+    size_t n = strlen(shown);
+    const char *tail = n > WF_COLS ? shown + n - WF_COLS : shown; // keep the end (where you type) visible
+    lcd_text(WF_FIELD_X, y, tail, sel ? C_SEL_FG : C_FG, FONT_LARGE);
+}
+
+static void draw_option(int y, const char *text, bool sel)
+{
+    if (sel) {
+        lcd_fill_rect(MARGIN - 4, y - 3, LCD_W - 2 * (MARGIN - 4), ROW_H + 2, C_SEL_BG);
+    }
+    lcd_text(MARGIN, y, text, sel ? C_SEL_FG : C_FG, FONT_LARGE);
+}
+
+static void draw_wifi(void)
+{
+    draw_header();
+    int y = LIST_Y + 4;
+    int x = lcd_text(MARGIN, y, "Setup", C_ACCENT, FONT_LARGE);
+    lcd_text(x + 10, y, "Wi-Fi for the web server (F4)", C_DIM, FONT_LARGE);
+    y += WF_ROW_H + 4;
+    draw_field(y, "Network", s_wf_ssid, false, s_wf_row == WF_SSID);
+    y += WF_ROW_H;
+    draw_field(y, "Password", s_wf_pass, !s_wf_show, s_wf_row == WF_PASS);
+    y += WF_ROW_H + 4;
+    draw_option(y, s_wf_show ? "Show password: yes" : "Show password: no", s_wf_row == WF_SHOW);
+    y += WF_ROW_H;
+    draw_option(y, "Scan for networks...", s_wf_row == WF_SCAN);
+    y += WF_ROW_H;
+    draw_option(y, s_wf_dirty ? "Save *" : "Save", s_wf_row == WF_SAVE);
+    y += WF_ROW_H;
+    draw_option(y, "Forget this network", s_wf_row == WF_FORGET);
+    y += WF_ROW_H + 4;
+    char start[COLS + 1], buf[PATH_MAX_LEN + 24], name[PATH_MAX_LEN + 4];
+    if (s_start_dir[0]) {
+        sd_name(name, sizeof(name), s_start_dir);
+    } else {
+        strlcpy(name, "last used", sizeof(name));
+    }
+    snprintf(buf, sizeof(buf), "Start folder: %s", name);
+    fit(start, buf, COLS);
+    draw_option(y, start, s_wf_row == WF_START);
+    y += WF_ROW_H;
+    draw_option(y, "Help: how to use the loader", s_wf_row == WF_HELP);
+    y += WF_ROW_H + 6;
+    lcd_text(MARGIN, y, s_wf_msg, s_wf_msg_color, FONT_LARGE);
+    y += ROW_H + 4;
+    draw_wrapped(y, s_wf_row <= WF_PASS    ? "Type to edit, Backspace deletes. 2.4 GHz networks only."
+                    : s_wf_row == WF_HELP ? "Keys, flashing, Wi-Fi, web and USB drive mode explained."
+                    : s_wf_row == WF_START ? "The folder the file list opens in when you switch on."
+                                          : "F4 joins this network and starts the web file manager.",
+                 C_DIM);
+    draw_footer(NULL, C_FG, s_wf_dirty ? "Up/Down move  Enter select  Esc discard"
+                                       : "Up/Down move  Enter select  Esc back");
+}
+
+static void draw_signal(int x, int y, int rssi, uint16_t color)
+{
+    int bars = rssi >= -55 ? 4 : rssi >= -67 ? 3 : rssi >= -78 ? 2 : 1;
+    for (int i = 0; i < 4; i++) {
+        int h = 3 + 3 * i;
+        lcd_fill_rect(x + i * 4, y + 12 - h, 3, h, i < bars ? color : RGB565(70, 74, 90));
+    }
+}
+
+static void draw_wifi_scan(void)
+{
+    draw_header();
+    lcd_text(MARGIN, LIST_Y - 2, s_ap_count ? "Choose a network" : "No networks found", C_ACCENT, FONT_LARGE);
+    int top = LIST_Y + ROW_H + 2, rows = (FOOTER_Y - 4 - top) / ROW_H;
+    if (s_ap_sel < s_ap_top) {
+        s_ap_top = s_ap_sel;
+    } else if (s_ap_sel >= s_ap_top + rows) {
+        s_ap_top = s_ap_sel - rows + 1;
+    }
+    for (int r = 0; r < rows && s_ap_top + r < s_ap_count; r++) {
+        int i = s_ap_top + r, y = top + r * ROW_H;
+        bool sel = i == s_ap_sel;
+        if (sel) {
+            lcd_fill_rect(MARGIN - 4, y - 1, LCD_W - 2 * (MARGIN - 4), ROW_H, C_SEL_BG);
+        }
+        char name[COLS + 1];
+        fit(name, s_aps[i].ssid, COLS - 6);
+        lcd_text(MARGIN, y, name, sel ? C_SEL_FG : C_FG, FONT_LARGE);
+        if (!s_aps[i].secure) {
+            lcd_text(LCD_W - MARGIN - 18 - 7 * 5, y, "open", sel ? C_SEL_FG : C_DIM, FONT_LARGE);
+        }
+        draw_signal(LCD_W - MARGIN - 16, y, s_aps[i].rssi, sel ? C_SEL_FG : C_OK);
+    }
+    draw_footer(NULL, C_FG, s_ap_count ? "Up/Down select  Enter choose  Esc back" : "Esc: back");
+}
+
+static void wifi_scan(void)
+{
+    if (web_running()) {
+        wf_message("Stop the web server (F4) to scan.", C_ERR);
+        return;
+    }
+    wf_message("Scanning...", C_FG);
+    draw_wifi();
+    lcd_flush();
+    int n = web_wifi_scan(s_aps, MAX_APS);
+    if (n < 0) {
+        wf_message("Scan failed - is the Wi-Fi chip working?", C_ERR);
+        return;
+    }
+    s_ap_count = n;
+    s_ap_sel = s_ap_top = 0;
+    s_screen = SCREEN_WIFI_SCAN;
+}
+
+static void wifi_save(void)
+{
+    size_t pl = strlen(s_wf_pass);
+    if (!s_wf_ssid[0]) {
+        wf_message("Enter the network name first.", C_ERR);
+        s_wf_row = WF_SSID;
+    } else if (pl > 0 && pl < 8) {
+        wf_message("The password needs 8+ characters.", C_ERR);
+        s_wf_row = WF_PASS;
+    } else if (web_wifi_save(s_wf_ssid, s_wf_pass) != ESP_OK) {
+        wf_message("Could not save the settings.", C_ERR);
+    } else {
+        s_wf_dirty = false;
+        wf_message(web_running() ? "Saved. Restart the web server to use it." : "Saved. Press F4 to connect.", C_OK);
+    }
+}
+
+// Returns false if the key isn't used here.
+static bool wifi_key(int key)
+{
+    char *field = s_wf_row == WF_SSID ? s_wf_ssid : s_wf_row == WF_PASS ? s_wf_pass : NULL;
+    size_t cap = s_wf_row == WF_SSID ? sizeof(s_wf_ssid) : sizeof(s_wf_pass);
+    if (field && key >= 0x20 && key < 0x7F) {
+        size_t len = strlen(field);
+        if (len + 1 < cap) {
+            field[len] = (char)key;
+            field[len + 1] = '\0';
+            s_wf_dirty = true;
+        }
+        return true;
+    }
+    switch (key) {
+    case KEY_UP:
+        s_wf_row = (s_wf_row + WF_ROWS - 1) % WF_ROWS;
+        return true;
+    case KEY_DOWN:
+    case KEY_TAB:
+        s_wf_row = (s_wf_row + 1) % WF_ROWS;
+        return true;
+    case KEY_HOME:
+        s_wf_row = 0;
+        return true;
+    case KEY_END:
+        s_wf_row = WF_ROWS - 1; // Help
+        return true;
+    case KEY_BACKSPACE:
+    case KEY_DEL:
+        if (field && field[0]) {
+            field[strlen(field) - 1] = '\0';
+            s_wf_dirty = true;
+        }
+        return true;
+    case KEY_ESC:
+    case KEY_F1:
+        s_screen = SCREEN_BROWSE;
+        return true;
+    case KEY_ENTER:
+        break;
+    default:
+        return false;
+    }
+    switch (s_wf_row) {
+    case WF_SSID:
+        s_wf_row = WF_PASS;
+        break;
+    case WF_PASS:
+        s_wf_row = WF_SAVE;
+        break;
+    case WF_SHOW:
+        s_wf_show = !s_wf_show;
+        break;
+    case WF_SCAN:
+        wifi_scan();
+        break;
+    case WF_SAVE:
+        wifi_save();
+        break;
+    case WF_FORGET:
+        web_wifi_save("", "");
+        s_wf_ssid[0] = s_wf_pass[0] = '\0';
+        s_wf_dirty = false;
+        s_wf_row = WF_SSID;
+        wf_message(web_running() ? "Forgotten. Used when the server restarts." : "Forgotten. F4 will start its own network.", C_OK);
+        break;
+    case WF_START:
+        enter_pick();
+        break;
+    case WF_HELP:
+        enter_help();
+        break;
+    }
+    return true;
+}
+
+static bool wifi_scan_key(int key)
+{
+    switch (key) {
+    case KEY_UP:
+        s_ap_sel = s_ap_sel > 0 ? s_ap_sel - 1 : (s_ap_count ? s_ap_count - 1 : 0);
+        return true;
+    case KEY_DOWN:
+        s_ap_sel = s_ap_sel + 1 < s_ap_count ? s_ap_sel + 1 : 0;
+        return true;
+    case KEY_ENTER:
+        if (s_ap_count) {
+            web_ap_t *ap = &s_aps[s_ap_sel];
+            if (strcmp(ap->ssid, s_wf_ssid) != 0) {
+                strlcpy(s_wf_ssid, ap->ssid, sizeof(s_wf_ssid));
+                s_wf_pass[0] = '\0';
+                s_wf_dirty = true;
+            }
+            s_wf_row = ap->secure ? WF_PASS : WF_SAVE;
+            wf_message(ap->secure ? "Now type the password, then Save." : "Open network: just Save.", C_FG);
+        }
+        s_screen = SCREEN_WIFI;
+        return true;
+    case KEY_ESC:
+    case KEY_BACKSPACE:
+    case KEY_LEFT:
+        s_screen = SCREEN_WIFI;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool inspect_file(void);
+static void flash_and_run(void);
+
+// Rescan the current folder, keeping the selection where possible.
+static void rescan_dir(void)
+{
+    char name[64] = "";
+    int sel = s_sel;
+    entry_t *e = item_count() ? item_entry(s_sel) : NULL;
+    if (e) {
+        strlcpy(name, e->name, sizeof(name));
+    }
+    struct stat st;
+    if (stat(s_cwd, &st) != 0) { // the browser removed this folder
+        strlcpy(s_cwd, SDCARD_MOUNT_POINT, sizeof(s_cwd));
+        name[0] = '\0';
+        sel = 0;
+    }
+    scan_dir();
+    int n = item_count();
+    s_sel = sel < n ? sel : (n > 0 ? n - 1 : 0);
+    for (int i = 0; name[0] && i < n; i++) {
+        entry_t *it = item_entry(i);
+        if (it && strcmp(it->name, name) == 0) {
+            s_sel = i;
+            break;
+        }
+    }
+}
+
+// Runs on every screen: the server keeps going in the background.
+static void web_tick(void)
+{
+    if (!web_running()) {
+        if (s_icon_shown && s_screen != SCREEN_USB) {
+            ui_redraw(); // drop the icon
+        }
+        return;
+    }
+    char path[sizeof(s_sel_path)];
+    if (webserver_take_flash_request(path, sizeof(path))) {
+        vTaskDelay(pdMS_TO_TICKS(300)); // let the reply reach the browser
+        stop_web();
+        strlcpy(s_sel_path, path, sizeof(s_sel_path));
+        strlcpy(s_sel_name, strrchr(path, '/') + 1, sizeof(s_sel_name));
+        if (inspect_file()) {
+            flash_and_run(); // reboots on success, else shows the error screen
+        } else {
+            ui_redraw();
+        }
+        return;
+    }
+    if (s_screen == SCREEN_WEB) {
+        web_status_t st;
+        // redraw on changes, at most 4 times a second (uploads update the progress a lot)
+        if (webserver_status(&st) != s_web_rev_shown && esp_timer_get_time() - s_web_drawn_us > 250000) {
+            ui_redraw();
+        }
+        return;
+    }
+    uint32_t changes = webserver_changes();
+    if (s_screen == SCREEN_BROWSE && changes != s_web_changes_seen) {
+        s_web_changes_seen = changes;
+        rescan_dir();
+        ui_redraw();
+    } else if (web_icon_color() != s_icon_shown) {
+        ui_redraw();
+    }
+}
+
+void ui_tick(void)
+{
+    web_tick();
+    if (s_screen != SCREEN_USB) {
+        return;
+    }
+    usbdrive_state_t st = usbdrive_state();
+    if (st == USBDRIVE_EJECTED) {
+        leave_usb();
+        ui_redraw();
+    } else if (st != s_usb_shown) {
+        ui_redraw();
+    }
+}
+
+void ui_redraw(void)
+{
+    switch (s_screen) {
+    case SCREEN_BROWSE:
+        draw_browse();
+        break;
+    case SCREEN_CONFIRM:
+        draw_confirm();
+        break;
+    case SCREEN_ERROR:
+        draw_error();
+        break;
+    case SCREEN_USB:
+        draw_usb();
+        break;
+    case SCREEN_WEB:
+        draw_web();
+        break;
+    case SCREEN_WIFI:
+        draw_wifi();
+        break;
+    case SCREEN_WIFI_SCAN:
+        draw_wifi_scan();
+        break;
+    case SCREEN_HELP:
+        draw_help();
+        break;
+    case SCREEN_PICK:
+        draw_pick();
+        break;
+    }
+    lcd_flush();
+}
+
+// ---- flashing ---------------------------------------------------------------------------------
+#define BAR_X MARGIN
+#define BAR_Y 170
+#define BAR_W (LCD_W - 2 * MARGIN)
+#define BAR_H 16
+
+static void draw_progress(size_t done, size_t total)
+{
+    static int last = -1;
+    int pct = total ? (int)((uint64_t)done * 100 / total) : 0;
+    if (pct == last || (pct % 2 && done != total)) {
+        return;
+    }
+    last = done == total ? -1 : pct;
+
+    lcd_fill_rect(BAR_X, BAR_Y, BAR_W, BAR_H, C_FG);
+    lcd_fill_rect(BAR_X + 1, BAR_Y + 1, BAR_W - 2, BAR_H - 2, C_BG);
+    lcd_fill_rect(BAR_X + 2, BAR_Y + 2, (BAR_W - 4) * pct / 100, BAR_H - 4, C_ACCENT);
+    char txt[16];
+    snprintf(txt, sizeof(txt), "%d%%", pct);
+    lcd_fill_rect(0, BAR_Y + BAR_H + 6, LCD_W, 14, C_BG);
+    lcd_text((LCD_W - 7 * (int)strlen(txt)) / 2, BAR_Y + BAR_H + 6, txt, C_FG, FONT_LARGE);
+    lcd_flush();
+}
+
+static void flash_and_run(void)
+{
+    const esp_partition_t *dst = app_partition();
+    draw_header();
+    lcd_text(MARGIN, LIST_Y + 4, "Flashing...", C_ACCENT, FONT_LARGE);
+    draw_kv(LIST_Y + 4 + 2 * ROW_H, "File", s_sel_name);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.32s %.20s", s_info.desc.project_name, s_info.desc.version);
+    draw_kv(LIST_Y + 4 + 3 * ROW_H, "App", buf);
+    draw_footer(NULL, C_FG, "Do not switch off");
+    draw_progress(0, 1);
+    if (web_running()) {
+        webserver_stop(); // nothing should touch the card or the radio while flashing
+    }
+
+    esp_err_t err = image_flash(s_sel_path, &s_info, dst, draw_progress);
+    if (err != ESP_OK) {
+        snprintf(s_error, sizeof(s_error), "Flashing failed: %s. The previous app may be damaged; "
+                 "flash another one.", esp_err_to_name(err));
+        s_screen = SCREEN_ERROR;
+        ui_redraw();
+        return;
+    }
+    nvs_save_str("last_file", s_sel_name);
+
+    lcd_text(MARGIN, BAR_Y + BAR_H + 30, "Done. Starting app...", C_OK, FONT_LARGE);
+    lcd_flush();
+    vTaskDelay(pdMS_TO_TICKS(400));
+    boot_installed();
+}
+
+// ---- input ------------------------------------------------------------------------------------
+static void open_selected(void)
+{
+    if (!s_sd_ok) {
+        sdcard_unmount();
+        s_sd_ok = sdcard_mount() == ESP_OK;
+        strlcpy(s_cwd, SDCARD_MOUNT_POINT, sizeof(s_cwd));
+        scan_dir();
+        return;
+    }
+    if (item_count() == 0) {
+        return;
+    }
+    entry_t *e = item_entry(s_sel);
+    if (!e) {
+        change_dir(NULL);
+        return;
+    }
+    if (e->is_dir) {
+        change_dir(e->name);
+        return;
+    }
+
+    snprintf(s_sel_path, sizeof(s_sel_path), "%s/%s", s_cwd, e->name);
+    strlcpy(s_sel_name, e->name, sizeof(s_sel_name));
+    inspect_file();
+}
+
+// Check s_sel_path; go to the confirm screen if it can be flashed, else to the error screen.
+static bool inspect_file(void)
+{
+    char err[96];
+    if (image_inspect(s_sel_path, &s_info, err, sizeof(err)) != ESP_OK) {
+        snprintf(s_error, sizeof(s_error), "%s", err);
+        s_screen = SCREEN_ERROR;
+    } else if (s_info.app_size > app_partition()->size) {
+        snprintf(s_error, sizeof(s_error), "The app (%u KB) is larger than the app partition (%u KB).",
+                 (unsigned)(s_info.app_size / 1024), (unsigned)(app_partition()->size / 1024));
+        s_screen = SCREEN_ERROR;
+    } else {
+        s_screen = SCREEN_CONFIRM;
+        return true;
+    }
+    return false;
+}
+
+void ui_key(int key)
+{
+    switch (s_screen) {
+    case SCREEN_BROWSE: {
+        int n = item_count();
+        switch (key) {
+        case KEY_UP:
+            s_sel = s_sel > 0 ? s_sel - 1 : (n > 0 ? n - 1 : 0);
+            break;
+        case KEY_DOWN:
+            s_sel = s_sel + 1 < n ? s_sel + 1 : 0;
+            break;
+        case KEY_PAGE_UP:
+            s_sel = s_sel > LIST_ROWS ? s_sel - LIST_ROWS : 0;
+            break;
+        case KEY_PAGE_DOWN:
+            s_sel = s_sel + LIST_ROWS < n ? s_sel + LIST_ROWS : (n > 0 ? n - 1 : 0);
+            break;
+        case KEY_HOME:
+            s_sel = 0;
+            break;
+        case KEY_END:
+            s_sel = n > 0 ? n - 1 : 0;
+            break;
+        case KEY_ENTER:
+        case KEY_RIGHT:
+            open_selected();
+            break;
+        case KEY_BACKSPACE:
+        case KEY_LEFT:
+            change_dir(NULL);
+            break;
+        case KEY_F1:
+            enter_wifi();
+            break;
+        case KEY_F4:
+            if (web_running()) {
+                s_screen = SCREEN_WEB; // already on in the background
+            } else {
+                enter_web();
+            }
+            break;
+        case KEY_F5:
+            enter_usb();
+            break;
+        default: // Esc does nothing here: the installed app only starts after a flash or a reset
+            return;
+        }
+        break;
+    }
+    case SCREEN_CONFIRM:
+        if (key == KEY_ENTER) {
+            flash_and_run();
+            return;
+        }
+        if (key == KEY_ESC || key == KEY_BACKSPACE || key == KEY_LEFT) {
+            s_screen = SCREEN_BROWSE;
+            break;
+        }
+        return;
+    case SCREEN_USB:
+        if (key == KEY_ESC) {
+            leave_usb();
+            break;
+        }
+        return;
+    case SCREEN_WIFI:
+        if (!wifi_key(key)) {
+            return;
+        }
+        break;
+    case SCREEN_WIFI_SCAN:
+        if (!wifi_scan_key(key)) {
+            return;
+        }
+        break;
+    case SCREEN_HELP:
+        if (!help_key(key)) {
+            return;
+        }
+        break;
+    case SCREEN_PICK:
+        if (!pick_key(key)) {
+            return;
+        }
+        break;
+    case SCREEN_WEB: {
+        web_status_t st;
+        webserver_status(&st);
+        if (key == KEY_F4 || (key == KEY_ESC && st.state == WEB_FAILED)) {
+            lcd_fill_rect(0, FOOTER_Y + 1, LCD_W, LCD_H - FOOTER_Y - 1, C_BG);
+            lcd_text(MARGIN, FOOTER_Y + 19, "Stopping...", C_FG, FONT_SMALL);
+            lcd_flush();
+            stop_web();
+            break;
+        }
+        if (key == KEY_ESC || key == KEY_BACKSPACE || key == KEY_LEFT) {
+            s_screen = SCREEN_BROWSE; // the server keeps running
+            break;
+        }
+        return;
+    }
+    case SCREEN_ERROR:
+        if (key == KEY_ESC || key == KEY_ENTER || key == KEY_BACKSPACE || key == KEY_LEFT) {
+            s_screen = SCREEN_BROWSE;
+            break;
+        }
+        return;
+    }
+    ui_redraw();
+}
+
+void ui_set_battery(int percent, bool charging)
+{
+    if (percent != s_battery || charging != s_charging) {
+        s_battery = percent;
+        s_charging = charging;
+        ui_redraw();
+    }
+}
+
+void ui_init(bool sd_ok)
+{
+    s_sd_ok = sd_ok;
+    s_screen = SCREEN_BROWSE;
+    strlcpy(s_cwd, SDCARD_MOUNT_POINT, sizeof(s_cwd));
+
+    // Open the start folder from Setup, else the last directory, else LOADER_BIN_DIR
+    char last[PATH_MAX_LEN];
+    struct stat st;
+    if (!nvs_load_str("start_dir", s_start_dir, sizeof(s_start_dir))) {
+        s_start_dir[0] = '\0';
+    }
+    if (s_start_dir[0] && sd_ok && stat(s_start_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
+        strlcpy(last, s_start_dir, sizeof(last));
+    } else if (!sd_ok || !nvs_load_str("last_dir", last, sizeof(last))) {
+        strlcpy(last, CONFIG_LOADER_BIN_DIR, sizeof(last));
+    }
+    if (sd_ok &&
+        strncmp(last, SDCARD_MOUNT_POINT, strlen(SDCARD_MOUNT_POINT)) == 0 &&
+        stat(last, &st) == 0 && S_ISDIR(st.st_mode)) {
+        strlcpy(s_cwd, last, sizeof(s_cwd));
+    }
+    ESP_LOGI(TAG, "Opening %s", s_cwd);
+    scan_dir();
+
+    // Preselect the file that was flashed last
+    char last_file[64];
+    if (nvs_load_str("last_file", last_file, sizeof(last_file))) {
+        for (int i = 0; i < item_count(); i++) {
+            entry_t *e = item_entry(i);
+            if (e && !e->is_dir && strcmp(e->name, last_file) == 0) {
+                s_sel = i;
+                break;
+            }
+        }
+    }
+    ui_redraw();
+}

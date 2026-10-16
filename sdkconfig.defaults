@@ -1,0 +1,39 @@
+CONFIG_IDF_TARGET="esp32p4"
+
+# Chip revision: v3.x silicon is the default. For older v1.x boards uncomment:
+# CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+
+CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+
+# Loaded apps don't know about rollback; never revert them to the loader.
+# CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE is not set
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+CONFIG_FATFS_API_ENCODING_UTF_8=y
+
+# GPIO24/25 (USB-Serial-JTAG pads) are the PicoCalc LCD's DC/RST; console stays on UART0.
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# The keyboard trigger makes the bootloader too big for 0x2000-0x8000 at INFO log level.
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+
+# F5 "USB drive mode": the SD card as a USB mass-storage device on the P4's OTG HS port.
+# (main/usb_drive.c implements the MSC callbacks; esp_tinyusb's storage layer is not used.)
+CONFIG_TINYUSB_MSC_ENABLED=y
+CONFIG_TINYUSB_DESC_MANUFACTURER_STRING="esp32loader"
+CONFIG_TINYUSB_DESC_PRODUCT_STRING="ESP32-P4 Bin Loader"
+CONFIG_TINYUSB_DESC_MSC_STRING="PicoCalc SD card"
+
+# Wi-Fi through the board's ESP32-C6 (ESP-Hosted over SDIO), used by the F4 web server.
+# Pin defaults of the ESP32-P4 Function EV board: CLK 18, CMD 19, D0-D3 14-17, C6 reset 54.
+CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
+CONFIG_ESP_HOSTED_P4_DEV_BOARD_FUNC_BOARD=y
+CONFIG_ESP_HOSTED_HOST_TRANSPORT_BUS_SDIO=y
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048
+CONFIG_HTTPD_MAX_URI_LEN=1024
+CONFIG_LWIP_MAX_SOCKETS=16

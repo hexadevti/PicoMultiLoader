@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PicoCalc SD</title>
+<style>
+:root{--bg:#12141c;--panel:#1b1e29;--line:#2c3040;--fg:#e8e8e8;--dim:#8c91a0;--accent:#78c8ff;--err:#ff6464;--ok:#6edc6e}
+@media (prefers-color-scheme: light){:root{--bg:#f4f5f8;--panel:#fff;--line:#dde0e8;--fg:#1a1c22;--dim:#6a6f80;--accent:#1f7acc;--err:#c62828;--ok:#2e7d32}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
+header h1{font-size:17px;margin:0;font-weight:600}
+#space{color:var(--dim);font-size:13px;margin-left:auto}
+main{max-width:960px;margin:0 auto;padding:12px 16px 80px}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+#crumbs{flex:1 1 100%;font-size:15px;word-break:break-all;margin-bottom:4px}
+#crumbs a{color:var(--accent);text-decoration:none;cursor:pointer}
+#crumbs a:hover{text-decoration:underline}
+button,.btn{font:inherit;font-size:14px;border:1px solid var(--line);background:var(--panel);color:var(--fg);padding:6px 12px;border-radius:6px;cursor:pointer}
+button:hover,.btn:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#000}
+button.small{padding:3px 8px;font-size:13px}
+button.danger:hover{border-color:var(--err);color:var(--err)}
+table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+th,td{padding:7px 10px;text-align:left;border-bottom:1px solid var(--line);vertical-align:middle}
+th{font-size:12px;color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+tr:last-child td{border-bottom:0}
+td.name{word-break:break-all}
+td.name a{color:var(--fg);text-decoration:none;cursor:pointer}
+td.name a.dir{color:var(--accent);font-weight:600}
+td.num,th.num{text-align:right;white-space:nowrap;color:var(--dim);font-variant-numeric:tabular-nums}
+td.act{text-align:right;white-space:nowrap}
+td.act button{margin-left:4px}
+.empty{padding:24px;text-align:center;color:var(--dim)}
+#drop{position:fixed;inset:0;background:rgba(30,120,200,.25);border:3px dashed var(--accent);display:none;align-items:center;justify-content:center;font-size:22px;z-index:5;pointer-events:none}
+body.dragging #drop{display:flex}
+#queue{position:fixed;right:16px;bottom:16px;width:min(360px,calc(100vw - 32px));background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;display:none;box-shadow:0 4px 20px rgba(0,0,0,.3);z-index:4}
+#queue .item{font-size:13px;margin:6px 0}
+#queue .item .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#queue progress{width:100%;height:8px}
+#msg{position:fixed;left:50%;top:14px;transform:translateX(-50%);background:var(--panel);border:1px solid var(--line);padding:8px 14px;border-radius:6px;display:none;z-index:6;max-width:90vw}
+#msg.err{border-color:var(--err);color:var(--err)}
+dialog{background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:10px;padding:18px;width:min(380px,92vw)}
+dialog::backdrop{background:rgba(0,0,0,.5)}
+dialog label{display:block;font-size:13px;color:var(--dim);margin:10px 0 4px}
+dialog input{width:100%;font:inherit;padding:7px 9px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg)}
+dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+dialog p{margin:6px 0 0;font-size:13px;color:var(--dim)}
+@media (max-width:600px){th.date,td.date{display:none}td.act button{padding:3px 6px}}
+</style>
+</head>
+<body>
+<header>
+  <h1>PicoCalc SD card</h1>
+  <span id="space"></span>
+  <button id="wifiBtn" class="small">Wi-Fi settings</button>
+</header>
+<main>
+  <div class="bar">
+    <div id="crumbs"></div>
+    <button id="upBtn">&uarr; Up</button>
+    <button id="refreshBtn">Refresh</button>
+    <button id="mkdirBtn">New folder</button>
+    <label class="btn primary" style="background:var(--accent);border-color:var(--accent);color:#000">Upload files<input id="fileInput" type="file" multiple hidden></label>
+  </div>
+  <table>
+    <thead><tr><th>Name</th><th class="num">Size</th><th class="num date">Modified</th><th></th></tr></thead>
+    <tbody id="list"></tbody>
+  </table>
+  <p style="color:var(--dim);font-size:13px">Drop files anywhere on the page to upload them to this folder.
+  <b>Flash</b> writes a .bin to the PicoCalc and starts it (this stops the web server).</p>
+</main>
+<div id="drop">Drop to upload</div>
+<div id="queue"></div>
+<div id="msg"></div>
+
+<dialog id="wifiDlg">
+  <form method="dialog" id="wifiForm">
+    <b>Wi-Fi network</b>
+    <p>Saved on the PicoCalc (the same setting as its Setup screen, F1). It joins this network the next time
+    you press F4; if it can't, it starts its own access point again. 2.4 GHz networks only.</p>
+    <label>Network name (SSID)</label><input id="ssid" maxlength="32" required>
+    <label>Password</label><input id="pass" type="password" minlength="8" maxlength="64" placeholder="empty for an open network">
+    <div class="row"><button value="cancel" formnovalidate>Cancel</button><button value="ok" class="primary">Save</button></div>
+  </form>
+</dialog>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+let cwd = "/", entries = [];
+try { cwd = sessionStorage.getItem("cwd") || "/"; } catch (e) {}
+
+const join = (dir, name) => (dir === "/" ? "" : dir) + "/" + name;
+const parent = p => p === "/" ? "/" : (p.slice(0, p.lastIndexOf("/")) || "/");
+const enc = encodeURIComponent;
+
+function fmtSize(n) {
+  if (n < 1024) return n + " B";
+  const u = ["KB", "MB", "GB"]; let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return (n < 10 ? n.toFixed(1) : Math.round(n)) + " " + u[i];
+}
+function fmtDate(t) {
+  if (!t || t < 315532800) return "";
+  return new Date(t * 1000).toLocaleString(undefined, {year:"numeric", month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"});
+}
+let msgTimer;
+function toast(text, err) {
+  const m = $("msg"); m.textContent = text; m.className = err ? "err" : ""; m.style.display = "block";
+  clearTimeout(msgTimer); msgTimer = setTimeout(() => m.style.display = "none", err ? 6000 : 2500);
+}
+async function api(method, url, body) {
+  const r = await fetch(url, {method, body});
+  if (!r.ok) throw new Error((await r.text()) || r.statusText);
+  return r.headers.get("content-type")?.includes("json") ? r.json() : r.text();
+}
+
+async function load(path) {
+  try {
+    const d = await api("GET", "/api/list?path=" + enc(path));
+    cwd = d.path; entries = d.entries;
+    try { sessionStorage.setItem("cwd", cwd); } catch (e) {}
+    render();
+  } catch (e) {
+    if (path !== "/") { load("/"); } else { toast(e.message, true); }
+  }
+  info();
+}
+async function info() {
+  try {
+    const i = await api("GET", "/api/info");
+    $("space").textContent = fmtSize(i.free) + " free of " + fmtSize(i.total) + (i.ssid ? " · " + (i.ap ? "AP " : "") + i.ssid : "");
+  } catch (e) {}
+}
+
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const k in attrs || {}) { if (k.startsWith("on")) e.addEventListener(k.slice(2), attrs[k]); else e.setAttribute(k, attrs[k]); }
+  for (const c of kids) e.append(c);
+  return e;
+}
+function render() {
+  const c = $("crumbs"); c.innerHTML = "";
+  c.append(el("a", {onclick: () => load("/")}, "SD"));
+  let acc = "";
+  for (const part of cwd.split("/").filter(Boolean)) {
+    acc += "/" + part; const p = acc;
+    c.append(" / ", el("a", {onclick: () => load(p)}, part));
+  }
+  $("upBtn").disabled = cwd === "/";
+
+  const list = $("list"); list.innerHTML = "";
+  entries.sort((a, b) => (b.d - a.d) || a.n.localeCompare(b.n, undefined, {numeric: true, sensitivity: "base"}));
+  if (!entries.length) list.append(el("tr", {}, el("td", {colspan: 4, class: "empty"}, "This folder is empty")));
+  for (const e of entries) {
+    const path = join(cwd, e.n);
+    const name = e.d ? el("a", {class: "dir", onclick: () => load(path)}, "\u{1F4C1} " + e.n)
+                     : el("a", {href: "/api/file?path=" + enc(path), target: "_blank"}, e.n);
+    const act = el("td", {class: "act"});
+    if (!e.d && /\.bin$/i.test(e.n)) act.append(el("button", {class: "small", onclick: () => flash(path)}, "Flash"));
+    if (!e.d) act.append(el("button", {class: "small", onclick: () => { location.href = "/api/file?dl=1&path=" + enc(path); }}, "Download"));
+    act.append(el("button", {class: "small", onclick: () => rename(e)}, "Rename"),
+               el("button", {class: "small danger", onclick: () => del(e)}, "Delete"));
+    list.append(el("tr", {}, el("td", {class: "name"}, name), el("td", {class: "num"}, e.d ? "" : fmtSize(e.s)),
+                   el("td", {class: "num date"}, fmtDate(e.t)), act));
+  }
+}
+
+const badName = n => !n || /[\\/:*?"<>|]/.test(n) || n === "." || n === "..";
+async function mkdir() {
+  const n = prompt("New folder name:");
+  if (n === null) return;
+  if (badName(n.trim())) return toast("That name isn't allowed", true);
+  try { await api("POST", "/api/mkdir?path=" + enc(join(cwd, n.trim()))); load(cwd); } catch (e) { toast(e.message, true); }
+}
+async function rename(e) {
+  const n = prompt("Rename “" + e.n + "” to:", e.n);
+  if (n === null || n.trim() === e.n) return;
+  if (badName(n.trim())) return toast("That name isn't allowed", true);
+  try { await api("POST", "/api/rename?from=" + enc(join(cwd, e.n)) + "&to=" + enc(join(cwd, n.trim()))); load(cwd); }
+  catch (err) { toast(err.message, true); }
+}
+async function del(e) {
+  if (!confirm(e.d ? "Delete the folder “" + e.n + "” and everything in it?" : "Delete “" + e.n + "”?")) return;
+  try { await api("POST", "/api/delete?path=" + enc(join(cwd, e.n))); toast("Deleted " + e.n); load(cwd); }
+  catch (err) { toast(err.message, true); }
+}
+async function flash(path) {
+  if (!confirm("Flash " + path + " to the PicoCalc and start it?\n\nThe web server stops; watch the PicoCalc screen.")) return;
+  try { await api("POST", "/api/flash?path=" + enc(path)); toast("Flashing — see the PicoCalc screen"); }
+  catch (e) { toast(e.message, true); }
+}
+
+// ---- uploads: one at a time, raw body, with progress ----
+const queue = []; let busy = false;
+function enqueue(files) {
+  const names = new Set(entries.filter(e => !e.d).map(e => e.n));
+  const dirs = new Set(entries.filter(e => e.d).map(e => e.n));
+  const clash = [...files].filter(f => names.has(f.name)).map(f => f.name);
+  if (clash.length && !confirm("Replace " + (clash.length === 1 ? "“" + clash[0] + "”" : clash.length + " files") + "?")) {
+    files = [...files].filter(f => !names.has(f.name));
+  }
+  for (const f of files) {
+    if (dirs.has(f.name) || badName(f.name)) { toast("Skipped " + f.name, true); continue; }
+    const row = el("div", {class: "item"}, el("div", {class: "nm"}, f.name + " (" + fmtSize(f.size) + ")"), el("progress", {max: 100, value: 0}));
+    $("queue").append(row); $("queue").style.display = "block";
+    queue.push({file: f, dir: cwd, row});
+  }
+  pump();
+}
+function pump() {
+  if (busy) return;
+  const job = queue.shift();
+  if (!job) {
+    setTimeout(() => { if (!busy && !queue.length) { $("queue").style.display = "none"; $("queue").innerHTML = ""; } }, 1500);
+    return;
+  }
+  busy = true;
+  const bar = job.row.querySelector("progress");
+  const xhr = new XMLHttpRequest();
+  const t0 = Date.now();
+  xhr.open("POST", "/api/upload?path=" + enc(join(job.dir, job.file.name)) + "&mtime=" + Math.floor(job.file.lastModified / 1000));
+  xhr.upload.onprogress = ev => {
+    if (!ev.lengthComputable) return;
+    bar.value = ev.loaded * 100 / ev.total;
+    const s = (Date.now() - t0) / 1000;
+    if (s > 1) job.row.firstChild.textContent = job.file.name + " — " + fmtSize(ev.loaded / s) + "/s";
+  };
+  const done = ok => {
+    busy = false;
+    job.row.firstChild.textContent = job.file.name + (ok ? " ✓" : " ✗ " + (xhr.responseText || "failed"));
+    if (ok) bar.value = 100;
+    if (job.dir === cwd && (!queue.length || !queue.some(q => q.dir === cwd))) load(cwd);
+    pump();
+  };
+  xhr.onload = () => done(xhr.status === 200);
+  xhr.onerror = () => done(false);
+  xhr.send(job.file);
+}
+
+$("fileInput").onchange = e => { enqueue(e.target.files); e.target.value = ""; };
+$("mkdirBtn").onclick = mkdir;
+$("refreshBtn").onclick = () => load(cwd);
+$("upBtn").onclick = () => load(parent(cwd));
+let dragDepth = 0;
+addEventListener("dragenter", e => { if ([...e.dataTransfer.types].includes("Files")) { e.preventDefault(); dragDepth++; document.body.classList.add("dragging"); } });
+addEventListener("dragleave", () => { if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove("dragging"); } });
+addEventListener("dragover", e => e.preventDefault());
+addEventListener("drop", e => {
+  e.preventDefault(); dragDepth = 0; document.body.classList.remove("dragging");
+  const files = [...e.dataTransfer.files].filter(f => f.size > 0 || f.type);
+  if (files.length) enqueue(files);
+});
+
+$("wifiBtn").onclick = () => { $("wifiDlg").showModal(); $("ssid").focus(); };
+$("wifiDlg").addEventListener("close", async () => {
+  if ($("wifiDlg").returnValue !== "ok") return;
+  try { await api("POST", "/api/wifi", $("ssid").value + "\n" + $("pass").value); toast("Saved. Press Esc then F4 on the PicoCalc to reconnect."); }
+  catch (e) { toast(e.message, true); }
+  $("pass").value = "";
+});
+
+load(cwd);
+</script>
+</body>
+</html>

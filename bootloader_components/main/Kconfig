@@ -1,0 +1,43 @@
+menu "Bin loader: bootloader"
+
+    config LOADER_TRIGGER_WINDOW_MS
+        int "Time window (ms) after reset to request the loader"
+        default 500
+        range 0 5000
+        help
+            For this many milliseconds after reset the bootloader watches the BOOT button
+            and the PicoCalc keyboard. A press of either starts the "factory" loader instead
+            of the installed app. This adds the same delay to every normal boot.
+
+    config LOADER_BUTTON_GPIO
+        int "Button GPIO that enters the loader (-1 = none)"
+        default 35
+        help
+            Active-low button with internal pull-up. GPIO35 is the BOOT button on the Waveshare
+            ESP32-P4-WIFI6. It is a strapping pin: holding it low *during* reset enters ROM
+            download mode, so press it just after releasing RESET.
+
+    config LOADER_BUTTON_DEBOUNCE_MS
+        int "Button must read low for this many consecutive ms"
+        default 20
+        range 1 1000
+
+    config LOADER_KBD_ENABLE
+        bool "Watch the PicoCalc keyboard (Up / F1 / F5 enter the loader)"
+        default y
+        help
+            Poll the PicoCalc's STM32 keyboard controller (I2C address 0x1F) by bit-banging
+            I2C. A fresh Up, F1 or F5 key press in the window opens the loader, just like
+            the PicoCalc UF2 Loader.
+
+    config LOADER_KBD_SDA_GPIO
+        int "Keyboard I2C SDA GPIO"
+        default 50
+        depends on LOADER_KBD_ENABLE
+
+    config LOADER_KBD_SCL_GPIO
+        int "Keyboard I2C SCL GPIO"
+        default 49
+        depends on LOADER_KBD_ENABLE
+
+endmenu

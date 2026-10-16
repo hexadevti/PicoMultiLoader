@@ -1,0 +1,6 @@
+dependencies:
+  idf: ">=5.5"
+  espressif/esp_tinyusb: "~1.7.0"
+  espressif/esp_wifi_remote: "*"
+  espressif/esp_hosted: "*"
+  espressif/mdns: "*"

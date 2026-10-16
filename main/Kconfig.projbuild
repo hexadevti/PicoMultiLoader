@@ -1,0 +1,9 @@
+menu "Bin loader"
+
+    config LOADER_BIN_DIR
+        string "Directory on the SD card the browser starts in"
+        default "/sdcard"
+        help
+            Pins for the PicoCalc LCD, keyboard and SD card are in main/board.h.
+
+endmenu
