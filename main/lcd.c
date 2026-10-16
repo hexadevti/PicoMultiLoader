@@ -1,6 +1,7 @@
 #include "lcd.h"
 
 #include <string.h>
+#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -200,4 +201,35 @@ int lcd_text(int x, int y, const char *s, uint16_t color, lcd_font_t font)
         }
     }
     return x;
+}
+
+void lcd_dump(void)
+{
+    if (!s_fb) {
+        return;
+    }
+    // One line per row: "FB <y> " then runs of "<rgb565 hex>" or "<rgb565 hex>*<count>".
+    for (int y = 0; y < LCD_H; y++) {
+        const uint16_t *row = &s_fb[y * LCD_W];
+        printf("FB %d ", y);
+        for (int x = 0; x < LCD_W;) {
+            int n = 1;
+            while (x + n < LCD_W && row[x + n] == row[x]) {
+                n++;
+            }
+            if (n > 1) {
+                printf("%04x*%d,", swap16(row[x]), n);
+            } else {
+                printf("%04x,", swap16(row[x]));
+            }
+            x += n;
+        }
+        printf("\n");
+        if (y % 16 == 15) {
+            fflush(stdout);
+            vTaskDelay(1); // let the idle task feed the watchdog
+        }
+    }
+    printf("FB end\n");
+    fflush(stdout);
 }

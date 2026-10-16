@@ -1,22 +1,19 @@
-# esp32loader
+<p align="center"><img src="docs/esp32loader.png" width="320" alt="esp32loader logo"></p>
 
 An SD-card firmware loader for a **Waveshare ESP32-P4-WIFI6 fitted in a ClockworkPi PicoCalc**,
 in the spirit of [uf2loader](https://github.com/pelrun/uf2loader). Copy `.bin` files to the
 PicoCalc's microSD card, browse to one on the LCD with the keyboard, and the loader flashes and
 boots it. Hold **Up** (or F1/F5) while resetting to come back.
 
-```
-ESP32-P4 Bin Loader           (wifi) 92% [###]
-Path: SD/apps
-------------------------------------------------
-[..]
-[games]
-emu8.bin                                1840KB
-hello_world.bin                          180KB
-------------------------------------------------
-Installed: emu8 1.2.0
-Enter open  F1 Setup  F4 Web  F5 USB drive
-```
+## Screenshots
+
+| <img src="docs/screenshots/file-list.png" width="400" alt="File list on the SD card"> | <img src="docs/screenshots/details.png" width="400" alt="Details of a .bin before flashing"> |
+|:---:|:---:|
+| File list (the Wi-Fi icon shows the web server is on) | Checking an app before flashing it |
+| <img src="docs/screenshots/web-server.png" width="400" alt="Web file manager screen"> | <img src="docs/screenshots/setup.png" width="400" alt="Setup screen"> |
+| Web file manager (F4) | Setup (F1): Wi-Fi network and start folder |
+| <img src="docs/screenshots/help.png" width="400" alt="On-screen help"> | <img src="docs/screenshots/usb-drive.png" width="400" alt="USB drive mode"> |
+| On-screen help | USB drive mode (F5) |
 
 ## How it works
 
@@ -97,7 +94,8 @@ family, and the loader rejects ones that aren't.
 
    Esc in the file list does nothing: the installed app only starts after flashing, or on
    reset / power-on. The serial console accepts the same keys (arrows, Enter, Backspace, Esc,
-   F1/F4/F5 and typed text), so it works without the PicoCalc keyboard too.
+   F1/F4/F5 and typed text), so it works without the PicoCalc keyboard too. Ctrl+P prints the
+   screen as text; `tools/screenshots/` turns that into the pictures above.
 4. The loader remembers the last folder, and preselects the file you flashed last.
 
 The board's BOOT button also works: press it within 0.5 s *after* releasing RESET. Holding

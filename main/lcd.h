@@ -26,3 +26,6 @@ int lcd_text(int x, int y, const char *s, uint16_t color, lcd_font_t font);
 
 int lcd_font_width(lcd_font_t font);
 int lcd_font_height(lcd_font_t font);
+
+/** Print the framebuffer on the console as run-length hex rows (Ctrl+P, used for screenshots). */
+void lcd_dump(void);
