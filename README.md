@@ -48,6 +48,67 @@ boots it. Hold **Up** (or F1/F5) while resetting to come back.
 
 ## Hardware
 
+### The board: Waveshare ESP32-P4-WIFI6
+
+<p align="center">
+  <img src="https://www.waveshare.com/w/upload/2/28/360px-ESP32-P4-WIFI6-1.jpg" width="300" alt="Waveshare ESP32-P4-WIFI6">
+</p>
+
+The [ESP32-P4-WIFI6](https://www.waveshare.com/wiki/ESP32-P4-WIFI6) has the same footprint and
+pin layout as a Raspberry Pi Pico, so it goes in the PicoCalc's Pico socket in place of a Pico /
+Pico 2. It carries an ESP32-P4NRW32 (32 MB PSRAM in the package), 32 MB flash, an ESP32-C6
+co-processor for Wi-Fi 6 / Bluetooth LE, MIPI display and camera connectors, a microSD slot and a
+4-pin USB 2.0 high-speed header.
+
+| Onboard parts | Pinout |
+|:---:|:---:|
+| <img src="https://www.waveshare.com/w/upload/d/d5/ESP32-P4-WIFI6-details-intro.jpg" width="420" alt="ESP32-P4-WIFI6 onboard parts"> | <img src="https://www.waveshare.com/w/upload/e/e2/ESP32-P4-WIFI6-details-inter.jpg" width="420" alt="ESP32-P4-WIFI6 pinout"> |
+
+*Pictures: Waveshare. They are linked from the [Waveshare wiki](https://www.waveshare.com/wiki/ESP32-P4-WIFI6), not copied into this repo.*
+
+### Fitting it in the PicoCalc (case modification)
+
+The PicoCalc's case has a small opening for the Pico's micro-USB port. The ESP32-P4-WIFI6 has a
+larger **USB-C** connector in that spot, so the board doesn't sit in the socket, and no cable fits,
+until the opening is made bigger:
+
+1. Open the PicoCalc and take out the Pico.
+2. Enlarge the opening for the Pico's USB port (the right-hand one in the photo; the left one is
+   the PicoCalc's own USB-C) to fit the board's USB-C connector and a cable plug. A craft knife,
+   small files or a rotary tool work. Take a little off at a time and test-fit the board.
+3. Clean up the plastic dust, fit the ESP32-P4-WIFI6 in the Pico socket with the USB-C port
+   facing the opening, and close the case.
+
+This USB-C port is the board's serial/flashing port (CH343). Use it to flash the loader and to
+reach the serial console.
+
+<p align="center">
+  <img src="docs/picocalc-case-mod.jpg" width="320" alt="PicoCalc case with the Pico USB opening enlarged for the board's USB-C port"><br>
+  <em>The enlarged opening (right) next to the PicoCalc's own USB-C port (left).</em>
+</p>
+
+### ESP32-P4 vs RP2040 vs RP2350
+
+How the P4 board compares with the chips on the Picos that the PicoCalc normally takes:
+
+| | **ESP32-P4** (Waveshare ESP32-P4-WIFI6) | **RP2040** (Pico / Pico W) | **RP2350** (Pico 2 / Pico 2 W) |
+|---|---|---|---|
+| CPU | 2× RISC-V @ 360 MHz (chip v1.x) / 400 MHz (v3.x), plus a RISC-V low-power core @ 40 MHz | 2× Arm Cortex-M0+ @ 133 MHz (200 MHz certified) | 2× Arm Cortex-M33 or 2× Hazard3 RISC-V @ 150 MHz |
+| Floating point | Single-precision FPU, SIMD/AI instructions | None (software) | Single-precision FPU (M33), double-precision coprocessor |
+| On-chip SRAM | 768 KB + 32 KB low-power + 8 KB TCM | 264 KB | 520 KB |
+| PSRAM | 32 MB in the package | None | None on the Pico 2 (supported via QSPI) |
+| Flash on the board | 32 MB | 2 MB | 4 MB |
+| Wireless | Wi-Fi 6 (2.4 GHz) + Bluetooth 5 LE, through the ESP32-C6 | Pico W: Wi-Fi 4 (2.4 GHz) + Bluetooth 5.2 (CYW43439) | Pico 2 W: Wi-Fi 4 (2.4 GHz) + Bluetooth 5.2 (CYW43439) |
+| USB | USB 2.0 **high-speed** OTG (480 Mbit/s) + full-speed; USB-C serial via CH343 | USB 1.1 full-speed (12 Mbit/s) device/host | USB 1.1 full-speed (12 Mbit/s) device/host |
+| Programmable I/O | No PIO (has a parallel I/O peripheral) | 2 PIO blocks, 8 state machines | 3 PIO blocks, 12 state machines, HSTX |
+| Display / camera / media | MIPI-DSI, MIPI-CSI, ISP, H.264 encoder, JPEG codec, 2D pixel accelerator | — | — (HSTX can drive DVI) |
+| SD card | SD 3.0 host controller (SDIO slot on the board) | SPI or PIO | SPI or PIO |
+| GPIO on the chip | 55 | 30 | 30 (QFN-60) / 48 (QFN-80) |
+| Security | Secure boot, flash encryption, crypto accelerators | — | Secure boot, TrustZone, OTP, glitch detectors |
+| PicoCalc firmware loader | **esp32loader** (`.bin` from SD) | [uf2loader](https://github.com/pelrun/uf2loader) (`.uf2` from SD) | [uf2loader](https://github.com/pelrun/uf2loader) (`.uf2` from SD) |
+
+### Pins used by the loader
+
 The pin map is in `main/board.h` (taken from emu8's `BOARD_PICOCALC_P4`):
 
 | Part | Bus | Pins |
