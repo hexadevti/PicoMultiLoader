@@ -243,6 +243,58 @@ Copy `main/loader_api.h` into your project and call `binloader_reboot_to_menu()`
 a magic value to `LP_SYSTEM_REG_LP_STORE15_REG`, which survives a software reset, and then
 restarts. This is the equivalent of the PicoCalc UF2 Loader's watchdog-scratch command.
 
+## Building apps to load
+
+Any ESP32-P4 app image works. The rules are the same for ESP-IDF and the Arduino IDE:
+
+* **Chip revision:** build for the same revision family as the loader (v3.x by default, see
+  [Build and flash the loader](#build-and-flash-the-loader-once-over-usb)). The loader
+  checks this and shows why it rejects an image on its details screen.
+* **Partition table:** your app's own table, bootloader and partition settings are ignored.
+  The app runs from `ota_0` (up to 10 MB) with the loader's [partitions.csv](partitions.csv):
+  `nvs`, `phy_init` and a 20 MB FAT partition named `storage`.
+* **Flash size:** 32 MB. **Rollback:** not needed; the app doesn't have to confirm itself.
+* Copy the `.bin` to the SD card (F4 web upload or F5 USB drive mode work too), pick it, Enter.
+
+### ESP-IDF
+
+```sh
+idf.py set-target esp32p4
+idf.py menuconfig   # Serial flasher config > Flash size: 32 MB
+                    # Component config > Hardware Settings > Chip revision: match the loader
+idf.py build
+```
+
+Copy `build/<project>.bin` to the SD card. `build/<project>.factory.bin` or any
+`esptool merge_bin` output works too. Copying [partitions.csv](partitions.csv) into your
+project (with `CONFIG_PARTITION_TABLE_CUSTOM=y`) keeps `esp_partition_find()` results the
+same as when the app runs under the loader.
+
+### Arduino IDE
+
+1. Install the *esp32* boards package by Espressif (3.x) and select an ESP32-P4 board
+   (e.g. *ESP32P4 Dev Module*).
+2. Tools menu: *Flash Size* 32MB, *PSRAM* enabled. If your core version has a chip revision
+   option, pick the one that matches the loader; older cores only build for v1.x silicon,
+   which a v3.x loader rejects. *Partition Scheme* doesn't matter (see above).
+3. *Sketch > Export Compiled Binary*. This writes `build/<board>/<sketch>.ino.bin` (and
+   `<sketch>.ino.merged.bin`) into the sketch folder. Copy either one to the SD card.
+
+File systems: `Preferences` works as is (it uses `nvs`). SPIFFS and LittleFS look for a
+partition named `spiffs`, which doesn't exist, so use the `storage` partition instead:
+
+```cpp
+#include <FFat.h>
+FFat.begin(true, "/ffat", 10, "storage");          // FAT, the partition's native format
+
+#include <LittleFS.h>
+LittleFS.begin(true, "/littlefs", 10, "storage");  // formats it as LittleFS on first use
+```
+
+Wi-Fi in sketches goes through the board's ESP32-C6, like the loader's web server.
+To go back to the loader from a sketch, put `loader_api.h` in the sketch folder (see
+[Returning to the loader](#returning-to-the-loader-from-your-own-app)).
+
 ## Configuration (`idf.py menuconfig`)
 
 * *Bin loader: bootloader*: trigger window, BOOT button GPIO and debounce, keyboard
