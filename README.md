@@ -15,6 +15,11 @@ boots it. Hold **Up** (or F1/F5) while resetting to come back.
 | <img src="docs/screenshots/help.png" width="400" alt="On-screen help"> | <img src="docs/screenshots/usb-drive.png" width="400" alt="USB drive mode"> |
 | On-screen help | USB drive mode (F5) |
 
+<p align="center">
+  <img src="docs/screenshots/web-browser.png" width="820" alt="Web file manager in a browser"><br>
+  <em>The web file manager (F4) in a browser</em>
+</p>
+
 ## How it works
 
 ```
