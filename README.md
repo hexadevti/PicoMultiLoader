@@ -190,6 +190,8 @@ Press **F1** in the file list to choose the Wi-Fi network the web server joins:
   mask), or pick **Scan for networks...** and choose one from the list.
 * **Save** stores them in NVS on the board's flash. **Forget this network** removes them.
 * Up/Down or Tab move between rows; Home/End jump to the first/last row.
+* **Wi-Fi autostart** (ON/OFF, Enter toggles) starts the web file manager in the background at
+  switch-on, as if you pressed F4 and then Esc. It is OFF by default.
 * **Start folder** picks the folder the file list opens in at switch-on: browse to it (Enter
   opens a folder, Left goes up) and choose *Use this folder*. *Remember the last folder*
   (the default) reopens wherever you were last.

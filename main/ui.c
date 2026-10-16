@@ -677,14 +677,15 @@ static void enter_web(void)
 }
 
 // ---- Wi-Fi settings (F1) ----------------------------------------------------------------------
-enum { WF_SSID, WF_PASS, WF_SHOW, WF_SCAN, WF_SAVE, WF_FORGET, WF_START, WF_HELP, WF_ROWS };
-#define WF_ROW_H   18
+enum { WF_SSID, WF_PASS, WF_SHOW, WF_SCAN, WF_SAVE, WF_FORGET, WF_AUTO, WF_START, WF_HELP, WF_ROWS };
+#define WF_ROW_H   17
 #define WF_FIELD_X (MARGIN + 74)
 #define WF_COLS    ((LCD_W - MARGIN - WF_FIELD_X - 4) / 7)
 #define MAX_APS    24
 
 static char s_wf_ssid[33], s_wf_pass[65];
 static bool s_wf_show, s_wf_dirty;
+static bool s_web_auto; // start the web server at switch-on
 static int s_wf_row;
 static char s_wf_msg[64];
 static uint16_t s_wf_msg_color;
@@ -727,6 +728,7 @@ static const char *const HELP_TEXT[] = {
     "Up/Down or Tab: move. Backspace: delete. Enter: select.",
     "Save keeps the network on the board. Forget removes it.",
     "2.4 GHz networks only. Passwords are 8-64 characters, or empty for an open network.",
+    "Wi-Fi autostart: ON starts the web file manager in the background at switch-on, as if you pressed F4 and then Esc. OFF (the default) waits for F4.",
     "Start folder: the folder the file list opens in at switch-on. Choose one, or Remember the last folder (the default).",
     "",
     "#Web file manager (F4)",
@@ -1124,11 +1126,11 @@ static void draw_wifi(void)
     int y = LIST_Y + 4;
     int x = lcd_text(MARGIN, y, "Setup", C_ACCENT, FONT_LARGE);
     lcd_text(x + 10, y, "Wi-Fi for the web server (F4)", C_DIM, FONT_LARGE);
-    y += WF_ROW_H + 4;
+    y += WF_ROW_H + 3;
     draw_field(y, "Network", s_wf_ssid, false, s_wf_row == WF_SSID);
     y += WF_ROW_H;
     draw_field(y, "Password", s_wf_pass, !s_wf_show, s_wf_row == WF_PASS);
-    y += WF_ROW_H + 4;
+    y += WF_ROW_H + 3;
     draw_option(y, s_wf_show ? "Show password: yes" : "Show password: no", s_wf_row == WF_SHOW);
     y += WF_ROW_H;
     draw_option(y, "Scan for networks...", s_wf_row == WF_SCAN);
@@ -1136,7 +1138,9 @@ static void draw_wifi(void)
     draw_option(y, s_wf_dirty ? "Save *" : "Save", s_wf_row == WF_SAVE);
     y += WF_ROW_H;
     draw_option(y, "Forget this network", s_wf_row == WF_FORGET);
-    y += WF_ROW_H + 4;
+    y += WF_ROW_H + 3;
+    draw_option(y, s_web_auto ? "Wi-Fi autostart: ON" : "Wi-Fi autostart: OFF", s_wf_row == WF_AUTO);
+    y += WF_ROW_H;
     char start[COLS + 1], buf[PATH_MAX_LEN + 24], name[PATH_MAX_LEN + 4];
     if (s_start_dir[0]) {
         sd_name(name, sizeof(name), s_start_dir);
@@ -1148,12 +1152,13 @@ static void draw_wifi(void)
     draw_option(y, start, s_wf_row == WF_START);
     y += WF_ROW_H;
     draw_option(y, "Help: how to use the loader", s_wf_row == WF_HELP);
-    y += WF_ROW_H + 6;
+    y += WF_ROW_H + 4;
     lcd_text(MARGIN, y, s_wf_msg, s_wf_msg_color, FONT_LARGE);
-    y += ROW_H + 4;
+    y += ROW_H + 2;
     draw_wrapped(y, s_wf_row <= WF_PASS    ? "Type to edit, Backspace deletes. 2.4 GHz networks only."
                     : s_wf_row == WF_HELP ? "Keys, flashing, Wi-Fi, web and USB drive mode explained."
                     : s_wf_row == WF_START ? "The folder the file list opens in when you switch on."
+                    : s_wf_row == WF_AUTO  ? "ON: the web file manager starts by itself at switch-on."
                                           : "F4 joins this network and starts the web file manager.",
                  C_DIM);
     draw_footer(NULL, C_FG, s_wf_dirty ? "Up/Down move  Enter select  Esc discard"
@@ -1298,6 +1303,12 @@ static bool wifi_key(int key)
         s_wf_dirty = false;
         s_wf_row = WF_SSID;
         wf_message(web_running() ? "Forgotten. Used when the server restarts." : "Forgotten. F4 will start its own network.", C_OK);
+        break;
+    case WF_AUTO:
+        s_web_auto = !s_web_auto;
+        nvs_save_str("web_auto", s_web_auto ? "1" : "0");
+        ESP_LOGI(TAG, "Wi-Fi autostart: %s", s_web_auto ? "on" : "off");
+        wf_message(s_web_auto ? "The web server starts at switch-on." : "The web server waits for F4.", C_OK);
         break;
     case WF_START:
         enter_pick();
@@ -1717,6 +1728,17 @@ void ui_init(bool sd_ok)
                 s_sel = i;
                 break;
             }
+        }
+    }
+
+    // Wi-Fi autostart: bring the web server up in the background (the top icon shows its state)
+    char web_auto[4];
+    s_web_auto = nvs_load_str("web_auto", web_auto, sizeof(web_auto)) && web_auto[0] == '1';
+    if (s_web_auto && sd_ok) {
+        s_web_changes_seen = webserver_changes();
+        esp_err_t err = webserver_start();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Wi-Fi autostart failed: %s", esp_err_to_name(err));
         }
     }
     ui_redraw();
