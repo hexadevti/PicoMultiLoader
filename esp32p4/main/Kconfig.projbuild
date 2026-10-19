@@ -1,4 +1,4 @@
-menu "Bin loader"
+menu "PicoMultiLoader"
 
     config LOADER_BIN_DIR
         string "Directory on the SD card the browser starts in"

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PicoCalc SD</title>
+<title>PicoMultiLoader</title>
 <style>
 :root{--bg:#12141c;--panel:#1b1e29;--line:#2c3040;--fg:#e8e8e8;--dim:#8c91a0;--accent:#78c8ff;--err:#ff6464;--ok:#6edc6e}
 @media (prefers-color-scheme: light){:root{--bg:#f4f5f8;--panel:#fff;--line:#dde0e8;--fg:#1a1c22;--dim:#6a6f80;--accent:#1f7acc;--err:#c62828;--ok:#2e7d32}}
@@ -69,7 +69,7 @@ dialog p{margin:6px 0 0;font-size:13px;color:var(--dim)}
     <tbody id="list"></tbody>
   </table>
   <p style="color:var(--dim);font-size:13px">Drop files anywhere on the page to upload them to this folder.
-  <b>Flash</b> writes a .bin to the PicoCalc and starts it (this stops the web server).</p>
+  <b>Flash</b> writes an app (.bin on the ESP32-P4, .uf2 on the Pico 2 W) to the PicoCalc and starts it (this stops the web server).</p>
 </main>
 <div id="drop">Drop to upload</div>
 <div id="queue"></div>
@@ -159,7 +159,7 @@ function render() {
     const name = e.d ? el("a", {class: "dir", onclick: () => load(path)}, "\u{1F4C1} " + e.n)
                      : el("a", {href: "/api/file?path=" + enc(path), target: "_blank"}, e.n);
     const act = el("td", {class: "act"});
-    if (!e.d && /\.bin$/i.test(e.n)) act.append(el("button", {class: "small", onclick: () => flash(path)}, "Flash"));
+    if (!e.d && /\.(bin|uf2)$/i.test(e.n)) act.append(el("button", {class: "small", onclick: () => flash(path)}, "Flash"));
     if (!e.d) act.append(el("button", {class: "small", onclick: () => { location.href = "/api/file?dl=1&path=" + enc(path); }}, "Download"));
     act.append(el("button", {class: "small", onclick: () => rename(e)}, "Rename"),
                el("button", {class: "small danger", onclick: () => del(e)}, "Delete"));

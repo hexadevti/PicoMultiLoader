@@ -1,7 +1,7 @@
 /*
- * ESP32-P4 bin loader for the PicoCalc: browse the SD card on the LCD, pick a firmware .bin,
+ * PicoMultiLoader (ESP32-P4 build) for the PicoCalc: browse the SD card on the LCD, pick a firmware .bin,
  * flash it into the "ota_0" partition and boot it. Hold Up, F1 or F5 while resetting (or call
- * binloader_reboot_to_menu() from loader_api.h) to come back here.
+ * picomultiloader_reboot_to_menu() from loader_api.h) to come back here.
  *
  * The serial console works as a second keyboard: arrows, PgUp/PgDn, Enter, Backspace, Esc, F4, F5.
  */

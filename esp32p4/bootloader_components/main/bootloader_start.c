@@ -1,5 +1,5 @@
 /*
- * Custom second-stage bootloader for the bin loader.
+ * Custom second-stage bootloader for PicoMultiLoader.
  *
  * Identical to the stock ESP-IDF bootloader, except that before booting the installed app it
  * checks whether the loader ("factory" partition) was requested:

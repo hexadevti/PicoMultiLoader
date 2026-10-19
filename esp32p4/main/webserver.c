@@ -43,7 +43,7 @@
 static const char *TAG = "web";
 
 #define CONNECT_TIMEOUT_MS 20000
-#define AP_SSID_PREFIX     "PicoCalc-Loader"
+#define AP_SSID_PREFIX     "PicoMultiLoader"
 #define AP_CHANNEL         6
 #define NVS_NS             "loader"
 #define IO_BUF_SIZE        (16 * 1024)
@@ -926,7 +926,7 @@ static esp_err_t start_http(void)
     if (mdns_init() == ESP_OK) {
         s_mdns = true;
         mdns_hostname_set(WEB_HOSTNAME);
-        mdns_instance_name_set("PicoCalc loader");
+        mdns_instance_name_set("PicoMultiLoader");
         mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
     }
     return ESP_OK;
