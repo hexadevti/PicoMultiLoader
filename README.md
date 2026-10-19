@@ -7,8 +7,8 @@ boots it. Hold **Up** (or F1/F5) while resetting to come back. It runs on three 
 | Board in the Pico socket | Apps | Wi-Fi web file manager | Source | Build output |
 |---|---|---|---|---|
 | Waveshare ESP32-P4-WIFI6 | `.bin` | yes (through the ESP32-C6) | [esp32p4/](esp32p4/) | flashed over USB |
-| Raspberry Pi Pico / Pico W (RP2040) | `.uf2` | no | [rp2xxx/](rp2xxx/) | `BOOT2040.UF2` on the SD card |
-| Raspberry Pi Pico 2 W (RP2350) | `.uf2` | yes (CYW43439) | [rp2xxx/](rp2xxx/) | `BOOT2350.UF2` on the SD card |
+| Raspberry Pi Pico / Pico W (RP2040) | `.uf2` | no | [rp2xxx/](rp2xxx/) | `PicoMultiLoader-rp2040.uf2`, flashed through BOOTSEL |
+| Raspberry Pi Pico 2 W (RP2350) | `.uf2` | yes (CYW43439) | [rp2xxx/](rp2xxx/) | `PicoMultiLoader-rp2350.uf2` (boot stub) flashed through BOOTSEL + `pml2350.uf2` in the SD root |
 
 All three have the same screens and keys: file list, app details, Setup (F1), web file manager
 (F4, Wi-Fi boards), USB drive mode (F5), on-screen help, and the serial console. The browser page
@@ -121,7 +121,7 @@ How the P4 board compares with the chips on the Picos that the PicoCalc normally
 | SD card | SD 3.0 host controller (SDIO slot on the board) | SPI or PIO | SPI or PIO |
 | GPIO on the chip | 55 | 30 | 30 (QFN-60) / 48 (QFN-80) |
 | Security | Secure boot, flash encryption, crypto accelerators | — | Secure boot, TrustZone, OTP, glitch detectors |
-| PicoCalc firmware loader | **PicoMultiLoader** (`.bin` from SD) | **PicoMultiLoader** menu on [uf2loader](https://github.com/pelrun/uf2loader) (`.uf2` from SD) | **PicoMultiLoader** menu on [uf2loader](https://github.com/pelrun/uf2loader) (`.uf2` from SD) |
+| PicoCalc firmware loader | **PicoMultiLoader** (`.bin` from SD) | **PicoMultiLoader** (`.uf2` from SD) | **PicoMultiLoader** (`.uf2` from SD) |
 
 ### Pins used by the loader
 
@@ -329,28 +329,55 @@ To go back to the loader from a sketch, put `loader_api.h` in the sketch folder 
 ## Raspberry Pi Pico / Pico 2 W build (RP2040 / RP2350)
 
 The [rp2xxx/](rp2xxx/) folder builds the same loader for a Raspberry Pi Pico (RP2040, no Wi-Fi)
-or a Pico 2 W (RP2350, with the web file manager) in the PicoCalc. It works as the menu of
-pelrun's [PicoCalc UF2 Loader](https://github.com/pelrun/uf2loader) and follows its conventions:
+or a Pico 2 W (RP2350, with the web file manager) in the PicoCalc. It replaces uf2loader; no other
+bootloader is needed. On the RP2040 the whole loader is the firmware in flash. On the RP2350 only
+an 8 KB boot stub is in flash, laid out exactly like uf2loader (apps get `0x2000` to the end of
+flash), and the full loader is the file `pml2350.uf2` on the SD card, which the stub loads into RAM
+when the menu is wanted. So apps made for uf2loader see the same flash layout.
 
-* uf2loader's small **stage3** bootloader stays at the start of flash. At power-on it starts the
-  installed app, or, when you hold **Up, F1 or F5** (or no app is installed), loads
-  `BOOT2040.UF2` / `BOOT2350.UF2` from the root of the SD card **into RAM** and runs it.
-  PicoMultiLoader is that file.
-* PicoMultiLoader lists folders and `*.uf2` files, checks the selected file (UF2 family for the
-  chip, addresses, name/version from `binary_info`), writes it into the app area after stage3,
-  verifies every page, and reboots into it. RAM-only UF2s are handed to stage3 to run instead
-  of being flashed.
-* Apps return to the menu the uf2loader way (hold Up/F1/F5 at reset, or its watchdog-scratch
-  request), so apps made for uf2loader work unchanged.
+* At power-on it watches the keyboard for half a second. If **Up, F1 or F5** is held, an app
+  asked for the menu, or no app is installed, it shows the menu; otherwise it starts the app.
+* It lists folders and `*.uf2` files, checks the selected file (UF2 family for the chip,
+  addresses, name/version from `binary_info`), writes it into the app area, verifies every page,
+  and reboots into it.
+* Apps can ask for the menu the uf2loader way (watchdog scratch 0 = `0xe98cc638`, scratch 1 =
+  `1`, then a watchdog reboot), so PicoCalc apps written for uf2loader still work.
+
+Flash layout:
+
+| Chip | Layout |
+|---|---|
+| RP2040 (2 MB) | `0x000000` boot2 (ours, enters the loader) + app, up to `0x1BF000` · `0x1BF000` app record · `0x1C0000` loader (256 KB) |
+| RP2350 (4 MB) | `0x000000` boot stub + partition table (8 KB) · `0x002000` app (4088 KB), started with the bootrom's `chain_image`, which maps it to `0x10000000` (same as uf2loader). The loader runs from RAM. |
+
+Apps are normal Pico SDK flash builds linked at `0x10000000`; RAM-only (`no_flash`) UF2s are
+refused.
 
 ### Install
 
-1. Install the uf2loader bootloader (**stage3**) on the Pico once, as
-   [its README](https://github.com/pelrun/uf2loader) describes (hold BOOTSEL, plug in USB, and
-   copy its bootloader UF2 for your Pico).
-2. Copy `BOOT2040.UF2` (Pico) or `BOOT2350.UF2` (Pico 2 W) to the **root** of the SD card,
-   replacing uf2loader's own menu if it is there.
-3. Hold **Up** and switch the PicoCalc on.
+1. Hold **BOOTSEL** on the Pico, plug it into USB, and copy `PicoMultiLoader-rp2040.uf2` (Pico)
+   or `PicoMultiLoader-rp2350.uf2` (Pico 2 W) to the `RPI-RP2` / `RP2350` drive. This replaces
+   uf2loader. (The RP2350 file uses the UF2 "absolute" family, so it is written to the start of
+   flash whatever partition table is there; an app already installed by uf2loader stays and
+   still starts.)
+2. **RP2350 only:** copy `pml2350.uf2` to the root of the SD card. Without it the menu can't open:
+   the stub starts the app, or drops into BOOTSEL if there is none.
+3. Put the Pico back in the PicoCalc and switch it on: with no app installed, the menu opens.
+
+On the RP2350, apps can also be installed through BOOTSEL: a normal RP2350 UF2 copied to the
+drive goes into the app partition at `0x2000`.
+
+### Caveats
+
+* **Apps that keep data in flash.** On the RP2040 the loader sits in the last 256 KB of the
+  2 MB flash: an app that writes there (a file system at "the end of flash", for example)
+  overwrites the loader, which then has to be flashed again through BOOTSEL. On the RP2350 the
+  app runs from a window mapped to `0x10000000`, exactly as under uf2loader, so apps that work
+  there (including Arduino-Pico ones with a file system at the end of flash) work here.
+* A power cut while flashing leaves no valid app; the menu opens at the next start. On the
+  RP2040, a cut while sector 0 is being rewritten can also lose boot2: flash the loader again
+  through BOOTSEL. (On the RP2350 the app's first sector is written last, so a half-written app
+  is never started.)
 
 ### Build
 
@@ -360,8 +387,8 @@ toolchain, CMake and Ninja.
 ```sh
 cd rp2xxx
 export PICO_SDK_PATH=/path/to/pico-sdk
-cmake -B build-rp2040 -G Ninja -DPICO_BOARD=pico      # -> build-rp2040/BOOT2040.uf2
-cmake -B build-rp2350 -G Ninja -DPICO_BOARD=pico2_w   # -> build-rp2350/BOOT2350.uf2
+cmake -B build-rp2040 -G Ninja -DPICO_BOARD=pico      # -> build-rp2040/PicoMultiLoader-rp2040.uf2
+cmake -B build-rp2350 -G Ninja -DPICO_BOARD=pico2_w   # -> build-rp2350/PicoMultiLoader-rp2350.uf2 + pml2350.uf2
 cmake --build build-rp2040
 cmake --build build-rp2350
 ```
@@ -378,8 +405,7 @@ point the build at a working one with `-DPICOTOOL_EXE=/path/to/picotool`.
 * **Web file manager (F4)**, Pico 2 W only: lwIP and the CYW43439 driver from the Pico SDK, with
   the same page, API, `picocalc.local` name, `PicoMultiLoader-XXXX` access point and DHCP server
   at `192.168.4.1`. Up to 3 browser connections at a time.
-* The whole loader runs from RAM. On the Pico 2 W the radio firmware alone takes 225 KB of the
-  520 KB, so the browser page is stored gzipped.
+* The browser page is stored gzipped to keep the loader small.
 
 ### Pins (PicoCalc mainboard)
 
@@ -394,5 +420,6 @@ The pin map is in `rp2xxx/src/board.h`:
 
 ### Licensing note
 
-PicoMultiLoader does not include uf2loader code. It runs as a separate program loaded by
-uf2loader's stage3 (GPL) and only follows its file names and boot-information format.
+PicoMultiLoader does not include uf2loader code; it only answers the same watchdog-scratch
+"open the menu" request and uses the same RP2350 flash layout. The RP2040 boot2 is the Pico SDK's W25Q080 boot2 (BSD-3-Clause) with a
+different jump target.

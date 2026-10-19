@@ -1,8 +1,8 @@
 /*
  * PicoMultiLoader (RP2040 / RP2350 build) for the PicoCalc: browse the SD card on the LCD, pick a
- * .uf2, flash it into the program area of the PicoCalc UF2 Loader (pelrun/uf2loader) and boot it.
- * This program is that loader's menu: stage3 loads it into RAM from BOOT2040.UF2 / BOOT2350.UF2 at
- * the root of the SD card when you hold Up, F1 or F5 at power-on (or when no app is installed).
+ * .uf2, flash it into the app area and boot it. This is the firmware the chip boots (flashed once
+ * through BOOTSEL, no other bootloader): at power-on it starts the installed app, or shows the
+ * menu when Up, F1 or F5 is held, an app asked for it, or no app is installed.
  *
  * The serial console (PicoCalc USB-C, UART0) works as a second keyboard: arrows, PgUp/PgDn, Enter,
  * Backspace, Esc, F1, F4, F5.
@@ -115,11 +115,8 @@ int main(void)
 {
     stdio_uart_init_full(CONSOLE_UART, CONSOLE_BAUD, CONSOLE_TX_PIN, CONSOLE_RX_PIN);
     printf("\nPicoMultiLoader for %s\n", uf2_chip_name());
+    uf2_boot_or_menu(); // returns only if the menu is wanted
 
-    uf2_platform_init();
-    if (!uf2_bootloader_ok()) {
-        printf("loader: no UF2 Loader (stage3) info - flashing is disabled\n");
-    }
     bool sd_ok = sdcard_mount();
     if (!lcd_init()) {
         printf("loader: LCD init failed\n");

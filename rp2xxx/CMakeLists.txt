@@ -1,17 +1,21 @@
 # PicoMultiLoader for the PicoCalc with a Raspberry Pi Pico (RP2040) or Pico 2 W (RP2350).
 #
-#   cmake -B build-rp2040 -G Ninja -DPICO_BOARD=pico     # -> BOOT2040.UF2 (no Wi-Fi)
-#   cmake -B build-rp2350 -G Ninja -DPICO_BOARD=pico2_w  # -> BOOT2350.UF2 (Wi-Fi web file manager)
+#   cmake -B build-rp2040 -G Ninja -DPICO_BOARD=pico     # -> PicoMultiLoader-rp2040.uf2 (no Wi-Fi)
+#   cmake -B build-rp2350 -G Ninja -DPICO_BOARD=pico2_w  # -> PicoMultiLoader-rp2350.uf2 (Wi-Fi web file manager)
 #   cmake --build build-rp2350
 #
-# The output is a RAM-only (no_flash) image meant to be started by the PicoCalc UF2 Loader's
-# stage3 from the root of the SD card.
+# Flash layout:
+#   RP2040:  0x10000000 boot2 (enters the loader) + apps | 0x101BF000 app record | 0x101C0000 loader
+#            PicoMultiLoader-rp2040.uf2 is all of it (flash it once through BOOTSEL).
+#   RP2350:  0x10000000 boot stub + partition table | 0x10002000 apps (to the end of flash), the
+#            same layout as pelrun's uf2loader. PicoMultiLoader-rp2350.uf2 is the stub (BOOTSEL);
+#            the loader itself, pml2350.uf2, goes in the root of the SD card and runs from RAM.
 cmake_minimum_required(VERSION 3.13)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
-# Everything lives in RAM (and on the Pico 2 W the radio firmware alone takes 225 KB): optimise for size.
+# The loader must stay small (it shares flash with the apps): optimise for size.
 if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE MinSizeRel CACHE STRING "Build type")
 endif()
@@ -38,9 +42,9 @@ endif()
 pico_sdk_init()
 
 if (PICO_PLATFORM MATCHES "rp2040")
-    set(LOADER_NAME BOOT2040)
+    set(LOADER_NAME PicoMultiLoader-rp2040)
 else()
-    set(LOADER_NAME BOOT2350)
+    set(LOADER_NAME pml2350)
 endif()
 
 set(LOADER_WIFI 0)
@@ -109,7 +113,61 @@ if (LOADER_WIFI)
     )
 endif()
 
-pico_set_binary_type(${LOADER_NAME} no_flash)
+if (PICO_PLATFORM MATCHES "rp2040")
+    # Linker script: the SDK's default flash layout, moved to where the loader lives (see the top).
+    file(READ ${PICO_SDK_PATH}/src/rp2_common/pico_crt0/rp2040/memmap_default.ld memmap)
+    set(LOADER_BASE 0x101C0000)
+    string(REPLACE "INCLUDE \"pico_flash_region.ld\""
+        "BOOT2(rx) : ORIGIN = 0x10000000, LENGTH = 256\n    FLASH(rx) : ORIGIN = ${LOADER_BASE}, LENGTH = 256k"
+        memmap "${memmap}")
+    # boot2 stays at the start of flash, where the bootrom loads it from
+    string(REGEX REPLACE "(__boot2_end__ = [.];[ \t\r\n]*})[ \t]*> FLASH" "\\1 > BOOT2" memmap "${memmap}")
+    if (NOT memmap MATCHES "> BOOT2")
+        message(FATAL_ERROR "Could not place .boot2 in memmap_default.ld")
+    endif()
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/memmap_pml.ld "${memmap}")
+    pico_set_linker_script(${LOADER_NAME} ${CMAKE_CURRENT_BINARY_DIR}/memmap_pml.ld)
+
+    # Our boot2 enters the loader rather than the app
+    pico_define_boot_stage2(pml_boot2 ${CMAKE_CURRENT_LIST_DIR}/boot/boot2_pml.S)
+    target_include_directories(pml_boot2 PRIVATE ${PICO_SDK_PATH}/src/rp2040/boot_stage2)
+    target_compile_definitions(pml_boot2 PRIVATE PML_LOADER_BASE=${LOADER_BASE})
+    pico_set_boot_stage2(${LOADER_NAME} pml_boot2)
+else()
+    # The loader runs from RAM; the boot stub loads it from the SD card.
+    pico_set_binary_type(${LOADER_NAME} no_flash)
+
+    # Boot stub: the first 8 KB of flash. Its RAM is the scratch banks, so it can load the loader
+    # into main RAM.
+    set(STUB_NAME PicoMultiLoader-rp2350)
+    add_executable(${STUB_NAME} stub/stub.c)
+    target_include_directories(${STUB_NAME} PRIVATE src)
+    target_compile_definitions(${STUB_NAME} PRIVATE PICO_NO_BINARY_INFO=1)
+    target_compile_options(${STUB_NAME} PRIVATE -Wall -Os)
+    target_link_libraries(${STUB_NAME} pico_stdlib hardware_i2c hardware_spi)
+    pico_minimize_runtime(${STUB_NAME})
+    pico_enable_stdio_uart(${STUB_NAME} 0)
+    pico_enable_stdio_usb(${STUB_NAME} 0)
+    file(READ ${PICO_SDK_PATH}/src/rp2_common/pico_crt0/rp2350/memmap_default.ld memmap)
+    string(REPLACE "INCLUDE \"pico_flash_region.ld\""
+        "FLASH(rx) : ORIGIN = 0x10000000, LENGTH = 0x1F00" memmap "${memmap}")
+    string(REPLACE "RAM(rwx) : ORIGIN =  0x20000000, LENGTH = 512k"
+        "RAM(rwx) : ORIGIN = 0x20080000, LENGTH = 3k" memmap "${memmap}")
+    string(REPLACE "SCRATCH_X(rwx) : ORIGIN = 0x20080000, LENGTH = 4k"
+        "SCRATCH_X(rwx) : ORIGIN = 0x20080C00, LENGTH = 1k" memmap "${memmap}")
+    if (NOT memmap MATCHES "0x20080C00" OR NOT memmap MATCHES "0x1F00")
+        message(FATAL_ERROR "Could not adapt memmap_default.ld for the stub")
+    endif()
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/memmap_stub.ld "${memmap}")
+    pico_set_linker_script(${STUB_NAME} ${CMAKE_CURRENT_BINARY_DIR}/memmap_stub.ld)
+    # Partition table: apps from 8 KB to the end of flash, like uf2loader
+    pico_embed_pt_in_binary(${STUB_NAME} ${CMAKE_CURRENT_LIST_DIR}/stub/pt.json)
+    # "absolute": BOOTSEL writes it to the start of flash whatever partition table is there
+    pico_set_uf2_family(${STUB_NAME} absolute)
+    target_link_options(${STUB_NAME} PRIVATE -Wl,--print-memory-usage)
+    pico_add_extra_outputs(${STUB_NAME})
+endif()
+
 pico_enable_stdio_uart(${LOADER_NAME} 1)
 pico_enable_stdio_usb(${LOADER_NAME} 0)
 target_link_options(${LOADER_NAME} PRIVATE -Wl,--print-memory-usage)

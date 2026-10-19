@@ -1,5 +1,4 @@
-// ui.c - on-screen file browser: pick a .uf2 on the SD card, confirm, flash it (or run it from RAM)
-// and boot it through the UF2 Loader's stage3.
+// ui.c - on-screen file browser: pick a .uf2 on the SD card, confirm, flash it and boot it.
 #include "ui.h"
 
 #include <stdio.h>
@@ -392,16 +391,14 @@ static void draw_browse(void)
     }
 
     char name[40], version[24], installed[80];
-    if (!uf2_bootloader_ok()) {
-        snprintf(installed, sizeof(installed), "UF2 Loader (stage3) not found - see Help");
-    } else if (uf2_installed(name, sizeof(name), version, sizeof(version))) {
+    if (uf2_installed(name, sizeof(name), version, sizeof(version))) {
         snprintf(installed, sizeof(installed), "Installed: %s %s", name, version);
     } else {
         snprintf(installed, sizeof(installed), "Installed: (none)");
     }
     char line[(LCD_W - 2 * MARGIN) / 6 + 1];
     fit(line, installed, (LCD_W - 2 * MARGIN) / 6);
-    draw_footer(line, uf2_bootloader_ok() ? C_DIM : C_WARN,
+    draw_footer(line, C_DIM,
 #if PICOMULTILOADER_WIFI
                 "Enter open  F1 Setup  F4 Web  F5 USB drive"
 #else
@@ -423,7 +420,7 @@ static void draw_confirm(void)
     draw_header();
     char buf[96];
     int y = LIST_Y + 4;
-    lcd_text(MARGIN, y, s_info.ram_app ? "Run this app?" : "Flash and run this app?", C_ACCENT, FONT_LARGE);
+    lcd_text(MARGIN, y, "Flash and run this app?", C_ACCENT, FONT_LARGE);
     y += 2 * ROW_H;
     draw_kv(y, "File", s_sel_name);
     y += ROW_H;
@@ -438,14 +435,10 @@ static void draw_confirm(void)
     y += ROW_H;
     draw_kv(y, "Target", uf2_family_name(s_info.family));
     y += ROW_H;
-    if (s_info.ram_app) {
-        draw_kv(y, "Type", "RAM app (runs without flashing)");
-    } else {
-        snprintf(buf, sizeof(buf), "flash, %u of %u KB", (unsigned)((s_info.addr_hi - s_info.addr_lo + 1023) / 1024),
-                 (unsigned)(uf2_flash_capacity() / 1024));
-        draw_kv(y, "Type", buf);
-    }
-    draw_footer(NULL, C_FG, s_info.ram_app ? "Enter: run    Esc: back" : "Enter: flash & run    Esc: back");
+    snprintf(buf, sizeof(buf), "flash, %u of %u KB", (unsigned)((s_info.addr_hi - s_info.addr_lo + 1023) / 1024),
+             (unsigned)(uf2_flash_capacity() / 1024));
+    draw_kv(y, "Type", buf);
+    draw_footer(NULL, C_FG, "Enter: flash & run    Esc: back");
 }
 
 static void draw_wrapped(int y, const char *text, lcd_color_t color)
@@ -725,24 +718,26 @@ static const char *const HELP_TEXT[] = {
     "No card? Insert a FAT32 card and press Enter.",
     "",
     "#Installing the loader",
-    "PicoMultiLoader runs on top of the PicoCalc UF2 Loader (pelrun/uf2loader): flash its bootloader once, then copy "
 #if PICO_RP2040
-    "BOOT2040.UF2"
+    "PicoMultiLoader is the Pico's own firmware, no other bootloader needed: hold BOOTSEL, plug in USB and copy "
+    "PicoMultiLoader-rp2040.uf2 to the drive that appears.",
 #else
-    "BOOT2350.UF2"
+    "PicoMultiLoader replaces uf2loader: hold BOOTSEL, plug in USB and copy PicoMultiLoader-rp2350.uf2 (an 8 KB boot "
+    "stub) to the drive that appears. Put pml2350.uf2 in the root of the SD card: the stub loads this menu from it.",
+    "Without that file the menu can't open; the stub then starts the app, or BOOTSEL if there is none.",
 #endif
-    " from this project to the root of the SD card.",
     "",
     "#Back to the loader",
-    "Hold Up, F1 or F5 while switching on: the UF2 Loader opens this menu instead of the app.",
+    "Hold Up, F1 or F5 while switching on: this menu opens instead of the app. "
+    "It also opens when no app is installed, and when an app asks for it (the uf2loader way).",
     "",
     "#Which files work",
 #if PICO_RP2040
-    "UF2 files for the RP2040, built to run from flash (the normal Pico SDK build) or from RAM (no_flash).",
+    "UF2 files for the RP2040 built to run from flash (the normal Pico SDK build), up to 1788 KB.",
 #else
-    "UF2 files for the RP2350 (ARM, secure), built to run from flash (the normal Pico SDK build) or from RAM (no_flash). RISC-V and RP2040 files are refused.",
+    "UF2 files for the RP2350 built to run from flash (the normal Pico SDK build), up to 4088 KB. RP2040 files are refused.",
 #endif
-    "Apps in flash keep working after a restart; RAM apps run once, without touching the installed app.",
+    "RAM-only (no_flash) apps are not supported. The installed app keeps working after a restart.",
     "Each file is checked before flashing; an unsuitable one shows why.",
     "",
     "#Setup (F1)",
@@ -1580,21 +1575,6 @@ static void flash_and_run(void)
     }
 #endif
     char err[96];
-    if (s_info.ram_app) {
-        save_setting("last_file", s_sel_name);
-        draw_header();
-        lcd_text(MARGIN, LIST_Y + 4, "Starting RAM app...", C_ACCENT, FONT_LARGE);
-        draw_kv(LIST_Y + 4 + 2 * ROW_H, "File", s_sel_name);
-        draw_footer(NULL, C_FG, "The UF2 Loader loads it from the card");
-        lcd_flush();
-        sleep_ms(200);
-        uf2_run_ram_app(s_sel_path, err, sizeof(err)); // reboots on success
-        snprintf(s_error, sizeof(s_error), "%s", err);
-        s_screen = SCREEN_ERROR;
-        ui_redraw();
-        return;
-    }
-
     draw_header();
     lcd_text(MARGIN, LIST_Y + 4, "Flashing...", C_ACCENT, FONT_LARGE);
     draw_kv(LIST_Y + 4 + 2 * ROW_H, "File", s_sel_name);

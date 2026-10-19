@@ -31,6 +31,12 @@ bool kbd_init(void);
 /** True if the last kbd_init() / kbd_poll() reached the keyboard. */
 bool kbd_present(void);
 
+/**
+ * At power-on: watch the keyboard for up to `window_ms` and return true as soon as Up, F1 or F5 is
+ * reported pressed or held (the "open the menu" keys).
+ */
+bool kbd_boot_key_held(uint32_t window_ms);
+
 /** Return the next pressed key (press and auto-repeat events), or KEY_NONE. */
 int kbd_poll(void);
 
