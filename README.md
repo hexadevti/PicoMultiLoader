@@ -1,9 +1,20 @@
-<p align="center"><img src="docs/esp32loader.png" width="320" alt="esp32loader logo"></p>
+<p align="center"><img src="docs/picomultiloader.png" width="320" alt="PicoMultiLoader logo"></p>
 
-An SD-card firmware loader for a **Waveshare ESP32-P4-WIFI6 fitted in a ClockworkPi PicoCalc**,
-in the spirit of [uf2loader](https://github.com/pelrun/uf2loader). Copy `.bin` files to the
-PicoCalc's microSD card, browse to one on the LCD with the keyboard, and the loader flashes and
-boots it. Hold **Up** (or F1/F5) while resetting to come back.
+**PicoMultiLoader** is an SD-card firmware loader for the **ClockworkPi PicoCalc**. Copy apps to
+the PicoCalc's microSD card, browse to one on the LCD with the keyboard, and the loader flashes and
+boots it. Hold **Up** (or F1/F5) while resetting to come back. It runs on three boards:
+
+| Board in the Pico socket | Apps | Wi-Fi web file manager | Source | Build output |
+|---|---|---|---|---|
+| Waveshare ESP32-P4-WIFI6 | `.bin` | yes (through the ESP32-C6) | [esp32p4/](esp32p4/) | flashed over USB |
+| Raspberry Pi Pico / Pico W (RP2040) | `.uf2` | no | [rp2xxx/](rp2xxx/) | `BOOT2040.UF2` on the SD card |
+| Raspberry Pi Pico 2 W (RP2350) | `.uf2` | yes (CYW43439) | [rp2xxx/](rp2xxx/) | `BOOT2350.UF2` on the SD card |
+
+All three have the same screens and keys: file list, app details, Setup (F1), web file manager
+(F4, Wi-Fi boards), USB drive mode (F5), on-screen help, and the serial console. The browser page
+is shared ([common/web/index.html](common/web/index.html)). Most of this README describes the
+ESP32-P4 build; the RP2040 / RP2350 build is described in
+[Raspberry Pi Pico / Pico 2 W build](#raspberry-pi-pico--pico-2-w-build-rp2040--rp2350).
 
 ## Screenshots
 
@@ -23,7 +34,7 @@ boots it. Hold **Up** (or F1/F5) while resetting to come back.
 ## How it works
 
 ```
-0x002000  bootloader   custom 2nd-stage bootloader (bootloader_components/main)
+0x002000  bootloader   custom 2nd-stage bootloader (esp32p4/bootloader_components/main)
 0x008000  partition table
 0x009000  nvs
 0x00F000  otadata      which app slot to boot
@@ -32,11 +43,11 @@ boots it. Hold **Up** (or F1/F5) while resetting to come back.
 0xC20000  storage ~20M FAT data partition, free for apps to use      (32 MB flash)
 ```
 
-* **Loader** (`main/`): draws a file browser on the PicoCalc LCD, lists folders and `*.bin`
+* **Loader** (`esp32p4/main/`): draws a file browser on the PicoCalc LCD, lists folders and `*.bin`
   files on the SD card, and checks the selected image (ESP32-P4 chip ID, chip revision, app
   descriptor). It then writes the image to `ota_0` with the ESP-IDF OTA API, which verifies
   the checksum and SHA256, marks it bootable and reboots.
-* **Bootloader** (`bootloader_components/main`): the stock ESP-IDF bootloader plus a check
+* **Bootloader** (`esp32p4/bootloader_components/main`): the stock ESP-IDF bootloader plus a check
   for 500 ms after reset. If a PicoCalc key (Up, F1 or F5) or the board's BOOT button is
   pressed in that window, or an app asked for the loader in software, it boots the `factory`
   loader instead of the app. The keyboard is read over bit-banged I2C.
@@ -110,11 +121,11 @@ How the P4 board compares with the chips on the Picos that the PicoCalc normally
 | SD card | SD 3.0 host controller (SDIO slot on the board) | SPI or PIO | SPI or PIO |
 | GPIO on the chip | 55 | 30 | 30 (QFN-60) / 48 (QFN-80) |
 | Security | Secure boot, flash encryption, crypto accelerators | — | Secure boot, TrustZone, OTP, glitch detectors |
-| PicoCalc firmware loader | **esp32loader** (`.bin` from SD) | [uf2loader](https://github.com/pelrun/uf2loader) (`.uf2` from SD) | [uf2loader](https://github.com/pelrun/uf2loader) (`.uf2` from SD) |
+| PicoCalc firmware loader | **PicoMultiLoader** (`.bin` from SD) | **PicoMultiLoader** menu on [uf2loader](https://github.com/pelrun/uf2loader) (`.uf2` from SD) | **PicoMultiLoader** menu on [uf2loader](https://github.com/pelrun/uf2loader) (`.uf2` from SD) |
 
 ### Pins used by the loader
 
-The pin map is in `main/board.h` (taken from emu8's `BOARD_PICOCALC_P4`):
+The pin map is in `esp32p4/main/board.h` (taken from emu8's `BOARD_PICOCALC_P4`):
 
 | Part | Bus | Pins |
 |---|---|---|
@@ -131,12 +142,13 @@ once the keyboard answers.
 
 ```powershell
 . $HOME\esp\esp-idf\export.ps1
+cd esp32p4
 idf.py set-target esp32p4
 idf.py build
 idf.py -p COMx flash monitor
 ```
 
-**Chip revision:** `sdkconfig.defaults` targets v3.x silicon. Run `esptool.py chip_id` to
+**Chip revision:** `esp32p4/sdkconfig.defaults` targets v3.x silicon. Run `esptool.py chip_id` to
 check your chip. On a v1.x board, uncomment `CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y`, delete
 `sdkconfig`, and rebuild. The app images you load must be built for the same revision
 family, and the loader rejects ones that aren't.
@@ -179,7 +191,7 @@ a USB drive. The screen shows *Waiting for the PC*, *Connected* or *Cable unplug
   the list by itself. Esc also leaves, but only press it after ejecting, or you may lose
   unsaved writes.
 * It uses the P4's high-speed USB port (TinyUSB, `espressif/esp_tinyusb`). The MSC callbacks
-  are in `main/usb_drive.c` and pass raw SD sectors through. esp_tinyusb's own storage layer is
+  are in `esp32p4/main/usb_drive.c` and pass raw SD sectors through. esp_tinyusb's own storage layer is
   deliberately not used, because it formats the card if it fails to mount it.
 
 ### Setup (F1)
@@ -212,7 +224,7 @@ Press **F4** in the file list to manage the SD card from a browser over Wi-Fi:
 1. If a network is set up (F1), the loader joins it and shows `http://<ip>/`. On most networks
    `http://picocalc.local/` works too.
 2. If no network is set up, or it can't join within 20 s, it starts its own access point
-   instead. The access point is called `PicoCalc-Loader-XXXX`, its password is shown on screen,
+   instead. The access point is called `PicoMultiLoader-XXXX`, its password is shown on screen,
    and you open `http://192.168.4.1/`. The password is random, made once, and kept, so a phone
    can remember the network. The screen says why joining failed (*not found* or *wrong
    password?*).
@@ -230,7 +242,7 @@ Press **F4** in the file list to manage the SD card from a browser over Wi-Fi:
 How it works: the P4 has no radio, so Wi-Fi goes through the board's ESP32-C6 over SDIO
 (`espressif/esp_wifi_remote` + `espressif/esp_hosted`). The pins are the ESP32-P4 Function EV
 board defaults: CLK 18, CMD 19, D0–D3 14–17, C6 reset 54. The server is `esp_http_server`, and
-the page is `main/web/index.html`, embedded in the firmware. There is **no login**, so anyone on
+the page is `common/web/index.html`, embedded in the firmware. There is **no login**, so anyone on
 the same network can change the card while F4 is on. Only use it on networks you trust, and stop
 it when you're done.
 
@@ -239,7 +251,8 @@ works with it in compatibility mode, and logs `major version mismatch`, which is
 
 ### Returning to the loader from your own app
 
-Copy `main/loader_api.h` into your project and call `binloader_reboot_to_menu()`. It writes
+Copy `esp32p4/main/loader_api.h` into your project and call `picomultiloader_reboot_to_menu()`
+(the old name `binloader_reboot_to_menu()` still works). It writes
 a magic value to `LP_SYSTEM_REG_LP_STORE15_REG`, which survives a software reset, and then
 restarts. This is the equivalent of the PicoCalc UF2 Loader's watchdog-scratch command.
 
@@ -251,7 +264,7 @@ Any ESP32-P4 app image works. The rules are the same for ESP-IDF and the Arduino
   [Build and flash the loader](#build-and-flash-the-loader-once-over-usb)). The loader
   checks this and shows why it rejects an image on its details screen.
 * **Partition table:** your app's own table, bootloader and partition settings are ignored.
-  The app runs from `ota_0` (up to 10 MB) with the loader's [partitions.csv](partitions.csv):
+  The app runs from `ota_0` (up to 10 MB) with the loader's [partitions.csv](esp32p4/partitions.csv):
   `nvs`, `phy_init` and a 20 MB FAT partition named `storage`.
 * **Flash size:** 32 MB. **Rollback:** not needed; the app doesn't have to confirm itself.
 * Copy the `.bin` to the SD card (F4 web upload or F5 USB drive mode work too), pick it, Enter.
@@ -266,7 +279,7 @@ idf.py build
 ```
 
 Copy `build/<project>.bin` to the SD card. `build/<project>.factory.bin` or any
-`esptool merge_bin` output works too. Copying [partitions.csv](partitions.csv) into your
+`esptool merge_bin` output works too. Copying [partitions.csv](esp32p4/partitions.csv) into your
 project (with `CONFIG_PARTITION_TABLE_CUSTOM=y`) keeps `esp_partition_find()` results the
 same as when the app runs under the loader.
 
@@ -295,20 +308,91 @@ Wi-Fi in sketches goes through the board's ESP32-C6, like the loader's web serve
 To go back to the loader from a sketch, put `loader_api.h` in the sketch folder (see
 [Returning to the loader](#returning-to-the-loader-from-your-own-app)).
 
-## Configuration (`idf.py menuconfig`)
+## Configuration (`idf.py menuconfig`, ESP32-P4)
 
-* *Bin loader: bootloader*: trigger window, BOOT button GPIO and debounce, keyboard
+* *PicoMultiLoader: bootloader*: trigger window, BOOT button GPIO and debounce, keyboard
   trigger on/off and its I2C pins.
-* *Bin loader*: the folder the browser starts in the very first time, before a folder has
+* *PicoMultiLoader*: the folder the browser starts in the very first time, before a folder has
   been remembered or set in Setup.
 
-## Limitations / notes
+## Limitations / notes (ESP32-P4)
 
 * Apps use the loader's partition table. Apps that expect `nvs`, `phy_init` or a FAT
   partition named `storage` will find them. Apps that need other data partitions
-  (e.g. `spiffs`) won't, so edit `partitions.csv` to suit. The table must stay at 0x8000.
+  (e.g. `spiffs`) won't, so edit `esp32p4/partitions.csv` to suit. The table must stay at 0x8000.
 * App rollback is disabled on purpose. Loaded apps don't know they need to confirm
   themselves, so with rollback on they would be reverted.
 * Secure boot and flash encryption are not supported.
 * The custom bootloader must fit in 0x2000–0x8000. With the keyboard trigger it only fits
   with `CONFIG_BOOTLOADER_LOG_LEVEL_WARN` (about 0x9E0 bytes free).
+
+## Raspberry Pi Pico / Pico 2 W build (RP2040 / RP2350)
+
+The [rp2xxx/](rp2xxx/) folder builds the same loader for a Raspberry Pi Pico (RP2040, no Wi-Fi)
+or a Pico 2 W (RP2350, with the web file manager) in the PicoCalc. It works as the menu of
+pelrun's [PicoCalc UF2 Loader](https://github.com/pelrun/uf2loader) and follows its conventions:
+
+* uf2loader's small **stage3** bootloader stays at the start of flash. At power-on it starts the
+  installed app, or, when you hold **Up, F1 or F5** (or no app is installed), loads
+  `BOOT2040.UF2` / `BOOT2350.UF2` from the root of the SD card **into RAM** and runs it.
+  PicoMultiLoader is that file.
+* PicoMultiLoader lists folders and `*.uf2` files, checks the selected file (UF2 family for the
+  chip, addresses, name/version from `binary_info`), writes it into the app area after stage3,
+  verifies every page, and reboots into it. RAM-only UF2s are handed to stage3 to run instead
+  of being flashed.
+* Apps return to the menu the uf2loader way (hold Up/F1/F5 at reset, or its watchdog-scratch
+  request), so apps made for uf2loader work unchanged.
+
+### Install
+
+1. Install the uf2loader bootloader (**stage3**) on the Pico once, as
+   [its README](https://github.com/pelrun/uf2loader) describes (hold BOOTSEL, plug in USB, and
+   copy its bootloader UF2 for your Pico).
+2. Copy `BOOT2040.UF2` (Pico) or `BOOT2350.UF2` (Pico 2 W) to the **root** of the SD card,
+   replacing uf2loader's own menu if it is there.
+3. Hold **Up** and switch the PicoCalc on.
+
+### Build
+
+Needs the [Pico SDK](https://github.com/raspberrypi/pico-sdk) 2.1 or later, the Arm GNU
+toolchain, CMake and Ninja.
+
+```sh
+cd rp2xxx
+export PICO_SDK_PATH=/path/to/pico-sdk
+cmake -B build-rp2040 -G Ninja -DPICO_BOARD=pico      # -> build-rp2040/BOOT2040.uf2
+cmake -B build-rp2350 -G Ninja -DPICO_BOARD=pico2_w   # -> build-rp2350/BOOT2350.uf2
+cmake --build build-rp2040
+cmake --build build-rp2350
+```
+
+If the SDK builds its own `picotool` and that crashes (it happens with very new host compilers),
+point the build at a working one with `-DPICOTOOL_EXE=/path/to/picotool`.
+
+### Differences from the ESP32-P4 build
+
+* **Settings** (Wi-Fi network, AP password, start folder, autostart, last folder) are kept in
+  `/picomultiloader.cfg` on the SD card instead of NVS.
+* **USB drive mode (F5)** uses the Pico's own micro-USB port (full speed, 12 Mbit/s). The serial
+  console is on the PicoCalc's USB-C port (UART0, 115200).
+* **Web file manager (F4)**, Pico 2 W only: lwIP and the CYW43439 driver from the Pico SDK, with
+  the same page, API, `picocalc.local` name, `PicoMultiLoader-XXXX` access point and DHCP server
+  at `192.168.4.1`. Up to 3 browser connections at a time.
+* The whole loader runs from RAM. On the Pico 2 W the radio firmware alone takes 225 KB of the
+  520 KB, so the browser page is stored gzipped.
+
+### Pins (PicoCalc mainboard)
+
+The pin map is in `rp2xxx/src/board.h`:
+
+| Part | Bus | Pins |
+|---|---|---|
+| LCD ST7365P 320x320 | SPI1 | SCK 10, MOSI 11, MISO 12, CS 13, DC 14, RST 15 |
+| Keyboard / battery / backlight (STM32 @ 0x1F) | I2C1 10 kHz | SDA 6, SCL 7 |
+| microSD | SPI0, 25 MHz | SCK 18, MOSI 19, MISO 16, CS 17, card detect 22 |
+| Serial console | UART0 | TX 0, RX 1 |
+
+### Licensing note
+
+PicoMultiLoader does not include uf2loader code. It runs as a separate program loaded by
+uf2loader's stage3 (GPL) and only follows its file names and boot-information format.

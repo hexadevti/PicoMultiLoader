@@ -1,4 +1,4 @@
-menu "Bin loader: bootloader"
+menu "PicoMultiLoader: bootloader"
 
     config LOADER_TRIGGER_WINDOW_MS
         int "Time window (ms) after reset to request the loader"

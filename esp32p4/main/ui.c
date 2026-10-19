@@ -309,7 +309,7 @@ static void draw_web_icon(int x, int y, uint16_t color)
 static void draw_header(void)
 {
     lcd_fill_rect(0, 0, LCD_W, LCD_H, C_BG);
-    lcd_text(MARGIN, TITLE_Y, "ESP32-P4 Bin Loader", C_FG, FONT_LARGE);
+    lcd_text(MARGIN, TITLE_Y, "PicoMultiLoader", C_FG, FONT_LARGE);
 
     int right = LCD_W - MARGIN; // where the next item to the left of the battery ends
     if (s_battery >= 0) {
@@ -409,7 +409,7 @@ static void draw_browse(void)
     } else {
         snprintf(installed, sizeof(installed), "Installed: (none)");
     }
-    char line[COLS + 1];
+    char line[(LCD_W - 2 * MARGIN) / 6 + 1];
     fit(line, installed, (LCD_W - 2 * MARGIN) / 6);
     draw_footer(line, C_DIM, "Enter open  F1 Setup  F4 Web  F5 USB drive");
 }
@@ -717,7 +717,7 @@ static const char *const HELP_TEXT[] = {
     "",
     "#Back to the loader",
     "Hold Up, F1 or F5 while pressing reset or switching on. The board's BOOT button also works: press it within 0.5 s after releasing RESET.",
-    "Your own apps can call binloader_reboot_to_menu() from loader_api.h.",
+    "Your own apps can call picomultiloader_reboot_to_menu() from loader_api.h.",
     "",
     "#Which files work",
     "App images for the ESP32-P4 (ESP-IDF, Arduino, MicroPython) built for this chip revision. Merged *.factory.bin images work too: only the app part is used, and the bootloader is never overwritten.",
@@ -733,7 +733,7 @@ static const char *const HELP_TEXT[] = {
     "",
     "#Web file manager (F4)",
     "Joins your saved network and shows the address to open in a browser. http://" WEB_HOSTNAME ".local/ often works too.",
-    "With no network saved, or if joining fails within 20 s, it makes its own network PicoCalc-Loader-XXXX. Its password and the address http://192.168.4.1/ are shown on screen.",
+    "With no network saved, or if joining fails within 20 s, it makes its own network PicoMultiLoader-XXXX. Its password and the address http://192.168.4.1/ are shown on screen.",
     "In the browser: upload (drag and drop works), download, rename, delete, new folder, and Flash a .bin straight away.",
     "There is no login: use it on trusted networks only.",
     "Esc goes back to the files and keeps the server running. A Wi-Fi icon at the top shows it is on: green ready, blue starting, amber reconnecting, red failed. The file list refreshes when the browser changes files.",
