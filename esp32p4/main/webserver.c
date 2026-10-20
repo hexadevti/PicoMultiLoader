@@ -300,7 +300,9 @@ static esp_err_t list_get(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 
-    char *buf = malloc(2048);
+    // entries are sent in chunks of a few KB: one chunk per entry is slow on big folders
+    const size_t cap = 4096, entry_max = 1024;
+    char *buf = malloc(cap);
     char *full = malloc(VFS_PATH_LEN + 260);
     if (!buf || !full) {
         free(buf);
@@ -308,14 +310,15 @@ static esp_err_t list_get(httpd_req_t *req)
         closedir(dir);
         return send_error(req, "500 Internal Server Error", "out of memory");
     }
-    snprintf(buf, 2048, "{\"path\":");
-    json_str(buf, 2048, card_path(vfs));
-    strlcat(buf, ",\"entries\":[", 2048);
-    httpd_resp_send_chunk(req, buf, HTTPD_RESP_USE_STRLEN);
+    snprintf(buf, cap, "{\"path\":");
+    json_str(buf, cap, card_path(vfs));
+    strlcat(buf, ",\"entries\":[", cap);
+    size_t used = strlen(buf);
 
     bool first = true;
+    esp_err_t err = ESP_OK;
     struct dirent *de;
-    while ((de = readdir(dir)) != NULL) {
+    while (err == ESP_OK && (de = readdir(dir)) != NULL) {
         if (de->d_name[0] == '.' && (de->d_name[1] == '\0' || (de->d_name[1] == '.' && de->d_name[2] == '\0'))) {
             continue;
         }
@@ -323,19 +326,27 @@ static esp_err_t list_get(httpd_req_t *req)
         struct stat st = { 0 };
         stat(full, &st);
         bool is_dir = de->d_type == DT_DIR || S_ISDIR(st.st_mode);
-        snprintf(buf, 2048, "%s{\"n\":", first ? "" : ",");
-        json_str(buf, 2048, de->d_name);
-        size_t o = strlen(buf);
-        snprintf(buf + o, 2048 - o, ",\"d\":%d,\"s\":%lu,\"t\":%lld}", is_dir ? 1 : 0,
+        if (used + entry_max > cap) {
+            err = httpd_resp_send_chunk(req, buf, used);
+            used = 0;
+        }
+        char *e = buf + used;
+        snprintf(e, entry_max, "%s{\"n\":", first ? "" : ",");
+        json_str(e, entry_max, de->d_name);
+        size_t o = strlen(e);
+        snprintf(e + o, entry_max - o, ",\"d\":%d,\"s\":%lu,\"t\":%lld}", is_dir ? 1 : 0,
                  is_dir ? 0UL : (unsigned long)st.st_size, (long long)st.st_mtime);
-        httpd_resp_send_chunk(req, buf, HTTPD_RESP_USE_STRLEN);
+        used += strlen(e);
         first = false;
     }
     closedir(dir);
-    httpd_resp_send_chunk(req, "]}", 2);
-    free(buf);
     free(full);
-    return httpd_resp_send_chunk(req, NULL, 0);
+    if (err == ESP_OK) {
+        strlcpy(buf + used, "]}", cap - used);
+        err = httpd_resp_send_chunk(req, buf, used + 2);
+    }
+    free(buf);
+    return err == ESP_OK ? httpd_resp_send_chunk(req, NULL, 0) : err;
 }
 
 static esp_err_t info_get(httpd_req_t *req)

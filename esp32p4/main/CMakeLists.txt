@@ -1,4 +1,4 @@
-idf_component_register(SRCS "loader_main.c" "sdcard.c" "image_flash.c" "keyboard.c" "lcd.c" "ui.c" "usb_drive.c"
+idf_component_register(SRCS "loader_main.c" "sdcard.c" "image_flash.c" "keyboard.c" "lcd.c" "ui.c" "usb_drive.c" "fileops.c"
                             "webserver.c"
                     INCLUDE_DIRS "." "../../common"
                     EMBED_TXTFILES "../../common/web/index.html"

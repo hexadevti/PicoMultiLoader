@@ -7,6 +7,7 @@
 #include <strings.h>
 #include "pico/stdlib.h"
 #include "config.h"
+#include "fileops.h"
 #include "keyboard.h"
 #include "lcd.h"
 #include "sdcard.h"
@@ -61,6 +62,8 @@ typedef enum {
     SCREEN_WIFI_SCAN, // pick a network from a scan
     SCREEN_HELP,      // how to use the loader (from F1)
     SCREEN_PICK,      // choose the start folder (from F1)
+    SCREEN_FILES,     // F2: copy / move / delete / paste
+    SCREEN_DELETE,    // confirm a delete
 } screen_t;
 
 static screen_t s_screen;
@@ -77,6 +80,11 @@ static char s_sel_name[64];
 static uf2_info_t s_info;
 static char s_error[128];
 static const char *s_path_override; // shown in the header instead of s_cwd
+
+static char s_clip[PATH_MAX_LEN + 64]; // file or folder marked with Copy or Cut, "" = none
+static bool s_clip_cut;                // Cut: Paste moves it instead of copying
+static char s_note[80];                // result of the last file operation, shown in the footer
+static lcd_color_t s_note_color;
 
 // ---- helpers ----------------------------------------------------------------------------------
 static bool at_root(void)
@@ -390,19 +398,27 @@ static void draw_browse(void)
         lcd_fill_rect(LCD_W - 3, y - 1, 2, h, C_DIM);
     }
 
-    char name[40], version[24], installed[80];
-    if (uf2_installed(name, sizeof(name), version, sizeof(version))) {
+    char name[40], version[24], installed[PATH_MAX_LEN + 96];
+    lcd_color_t color = C_DIM;
+    if (s_note[0]) {
+        strlcpy(installed, s_note, sizeof(installed));
+        color = s_note_color;
+    } else if (s_clip[0]) {
+        snprintf(installed, sizeof(installed), "%s %s - V pastes, Esc forgets", s_clip_cut ? "Cut" : "Copied",
+                 strrchr(s_clip, '/') + 1);
+        color = C_ACCENT;
+    } else if (uf2_installed(name, sizeof(name), version, sizeof(version))) {
         snprintf(installed, sizeof(installed), "Installed: %s %s", name, version);
     } else {
         snprintf(installed, sizeof(installed), "Installed: (none)");
     }
     char line[(LCD_W - 2 * MARGIN) / 6 + 1];
     fit(line, installed, (LCD_W - 2 * MARGIN) / 6);
-    draw_footer(line, C_DIM,
+    draw_footer(line, color,
 #if PICOMULTILOADER_WIFI
-                "Enter open  F1 Setup  F4 Web  F5 USB drive"
+                "Enter open  F1 Setup  F2 Files  F4 Web  F5 USB"
 #else
-                "Enter open  F1 Setup  F5 USB drive"
+                "Enter open  F1 Setup  F2 Files  F5 USB drive"
 #endif
     );
 }
@@ -709,13 +725,22 @@ static const char *const HELP_TEXT[] = {
     "The installed app starts after flashing, or on power-on.",
 #if PICOMULTILOADER_WIFI
     "F1: Setup (Wi-Fi network, start folder) and this help.",
-    "F4: web file manager. F5: USB drive mode.",
+    "F2: copy, move or delete. F4: web file manager. F5: USB drive mode.",
 #else
     "F1: Setup (start folder) and this help.",
-    "F5: USB drive mode.",
+    "F2: copy, move or delete. F5: USB drive mode.",
 #endif
     "Only folders and .uf2 files are listed. The last folder and file are remembered.",
     "No card? Insert a FAT32 card and press Enter.",
+    "",
+    "#Copy, move and delete (F2)",
+    "F2 opens a menu for the selected file or folder: Copy, Cut (to move it), Paste and Delete.",
+    "Shortcuts in the file list: C copy, X cut, V paste into the folder shown, Del delete. Esc forgets what was copied.",
+    "Copy or Cut, go to another folder, then Paste. Pasting a copy where the name is taken adds a number, e.g. app (2).uf2.",
+    "Deleting a folder deletes everything in it.",
+#if !PICO_RP2040
+    "pml2350.uf2 in the root (this menu) can't be deleted or moved from here.",
+#endif
     "",
     "#Installing the loader",
 #if PICO_RP2040
@@ -770,7 +795,7 @@ static const char *const HELP_TEXT[] = {
 #endif
     "",
     "#Serial console",
-    "115200 baud on the PicoCalc's USB-C port. Arrows, Enter, Backspace, Esc, F1, F4, F5 and typing work like the PicoCalc keyboard.",
+    "115200 baud on the PicoCalc's USB-C port. Arrows, Enter, Backspace, Del, Esc, F1, F2, F4, F5 and typing work like the PicoCalc keyboard.",
     "",
     "#This help",
     "Up/Down: scroll. PgUp/PgDn: page. Home/End: top/bottom. Esc: back.",
@@ -1412,9 +1437,11 @@ static bool wifi_scan_key(int key)
         return false;
     }
 }
+#endif
 
 static bool inspect_file(void);
 static void flash_and_run(void);
+static void draw_progress(size_t done, size_t total);
 
 // Rescan the current folder, keeping the selection where possible.
 static void rescan_dir(void)
@@ -1442,6 +1469,326 @@ static void rescan_dir(void)
     }
 }
 
+// ---- copy / move / delete (F2) ----------------------------------------------------------------
+enum { FA_COPY, FA_CUT, FA_PASTE, FA_DELETE, FA_FORGET };
+static int s_fa_items[5], s_fa_count, s_fa_sel;
+static char s_fa_path[PATH_MAX_LEN + 64]; // the file or folder the menu / delete screen is about
+static bool s_fa_is_dir;
+
+static void note(lcd_color_t color, const char *fmt, const char *arg)
+{
+    snprintf(s_note, sizeof(s_note), fmt, arg);
+    s_note_color = color;
+}
+
+// The selected file or folder (not ".."); fills s_fa_path.
+static entry_t *selected_entry(void)
+{
+    entry_t *e = item_count() ? item_entry(s_sel) : NULL;
+    if (e) {
+        snprintf(s_fa_path, sizeof(s_fa_path), "%s/%s", s_cwd, e->name);
+        s_fa_is_dir = e->is_dir;
+    }
+    return e;
+}
+
+// The loader itself on the RP2350: the boot stub loads this menu from it.
+static bool protected_path(const char *path)
+{
+#if PICO_RP2040
+    (void)path;
+    return false;
+#else
+    return strcasecmp(path, "/pml2350.uf2") == 0;
+#endif
+}
+
+static void select_name(const char *name)
+{
+    for (int i = 0; i < item_count(); i++) {
+        entry_t *e = item_entry(i);
+        if (e && strcmp(e->name, name) == 0) {
+            s_sel = i;
+            return;
+        }
+    }
+}
+
+static void mark(bool cut)
+{
+    entry_t *e = selected_entry();
+    if (!e) {
+        return;
+    }
+    if (cut && protected_path(s_fa_path)) {
+        note(C_ERR, "%s is the loader menu; it stays here.", e->name);
+        return;
+    }
+    strlcpy(s_clip, s_fa_path, sizeof(s_clip));
+    s_clip_cut = cut;
+}
+
+static void ask_delete(void)
+{
+    entry_t *e = selected_entry();
+    if (!e) {
+        return;
+    }
+    if (protected_path(s_fa_path)) {
+        note(C_ERR, "%s is the loader menu; delete it from a PC.", e->name);
+        s_screen = SCREEN_BROWSE;
+        return;
+    }
+    s_screen = SCREEN_DELETE;
+}
+
+static void draw_delete(void)
+{
+    draw_header();
+    int y = LIST_Y + 4;
+    lcd_text(MARGIN, y, s_fa_is_dir ? "Delete this folder?" : "Delete this file?", C_ERR, FONT_LARGE);
+    y += 2 * ROW_H;
+    draw_kv(y, s_fa_is_dir ? "Folder" : "File", strrchr(s_fa_path, '/') + 1);
+    y += 2 * ROW_H;
+    if (s_fa_is_dir) {
+        draw_wrapped(y, "Everything in it is deleted too. This can't be undone.", C_FG);
+    } else {
+        draw_wrapped(y, "This can't be undone.", C_FG);
+    }
+    draw_footer(NULL, C_FG, "Enter: delete    Esc: cancel");
+}
+
+static void do_delete(void)
+{
+    char err[96], name[64];
+    strlcpy(name, strrchr(s_fa_path, '/') + 1, sizeof(name));
+    lcd_fill_rect(0, FOOTER_Y + 1, LCD_W, LCD_H - FOOTER_Y - 1, C_BG);
+    lcd_text(MARGIN, FOOTER_Y + 19, "Deleting...", C_FG, FONT_SMALL);
+    lcd_flush();
+    if (fileops_delete(s_fa_path, err, sizeof(err))) {
+        note(C_OK, "Deleted %s", name);
+        if (strcasecmp(s_clip, s_fa_path) == 0) {
+            s_clip[0] = '\0';
+        }
+    } else {
+        note(C_ERR, "%s", err);
+    }
+    rescan_dir();
+    s_screen = SCREEN_BROWSE;
+}
+
+#define COPY_NAME_Y (LIST_Y + 4 + 5 * ROW_H)
+static char s_copy_shown[64];
+
+static void copy_progress(const char *name, uint64_t done, uint64_t total)
+{
+#if PICOMULTILOADER_WIFI
+    if (web_running()) {
+        webserver_poll(); // keep the browser's connections alive during a long copy
+    }
+#endif
+    if (strcmp(name, s_copy_shown) != 0) {
+        strlcpy(s_copy_shown, name, sizeof(s_copy_shown));
+        char line[COLS + 1];
+        fit(line, name, COLS);
+        lcd_fill_rect(0, COPY_NAME_Y, LCD_W, ROW_H, C_BG);
+        lcd_text(MARGIN, COPY_NAME_Y, line, C_FG, FONT_LARGE);
+        lcd_flush_rows(COPY_NAME_Y, ROW_H);
+    }
+    draw_progress((size_t)(done / 1024), (size_t)(total / 1024 ? total / 1024 : 1));
+}
+
+// "name (2).ext", "name (3).ext"... for a copy whose name is taken in the folder shown.
+static bool free_name(char *out, size_t len, const char *name, bool is_dir)
+{
+    snprintf(out, len, "%s/%s", s_cwd, name);
+    const char *dot = is_dir ? NULL : strrchr(name, '.');
+    int base = dot && dot != name ? (int)(dot - name) : (int)strlen(name);
+    for (int n = 2; fileops_exists(out); n++) {
+        if (n > 99) {
+            return false;
+        }
+        snprintf(out, len, "%s/%.*s (%d)%s", s_cwd, base, name, n, name + base);
+    }
+    return true;
+}
+
+static void paste(void)
+{
+    if (!s_clip[0]) {
+        note(C_DIM, "%sNothing to paste: copy (C) or cut (X) a file first.", "");
+        return;
+    }
+    const char *name = strrchr(s_clip, '/') + 1;
+    if (!fileops_exists(s_clip)) {
+        note(C_ERR, "%s is gone; nothing to paste.", name);
+        s_clip[0] = '\0';
+        return;
+    }
+    bool folder = is_dir(s_clip);
+    size_t src_len = strlen(s_clip);
+    if (folder && strncasecmp(s_cwd, s_clip, src_len) == 0 && (s_cwd[src_len] == '\0' || s_cwd[src_len] == '/')) {
+        note(C_ERR, "Can't put %s inside itself.", name);
+        return;
+    }
+    bool same_folder = (size_t)(name - 1 - s_clip) == strlen(s_cwd) && strncasecmp(s_clip, s_cwd, strlen(s_cwd)) == 0;
+    static char dst[PATH_MAX_LEN + 80], shown[PATH_MAX_LEN + 96]; // static: the main stack is small
+    char err[96];
+    if (s_clip_cut) {
+        if (same_folder) {
+            note(C_DIM, "%s is already in this folder.", name);
+            return;
+        }
+        snprintf(dst, sizeof(dst), "%s/%s", s_cwd, name);
+        if (fileops_exists(dst)) {
+            note(C_ERR, "There is already a %s here.", name);
+            return;
+        }
+        if (!fileops_move(s_clip, dst, err, sizeof(err))) {
+            note(C_ERR, "%s", err);
+            return;
+        }
+        note(C_OK, "Moved %s here", name);
+        s_clip[0] = '\0';
+    } else {
+        if (!free_name(dst, sizeof(dst), name, folder)) {
+            note(C_ERR, "Too many copies of %s here.", name);
+            return;
+        }
+        draw_header();
+        lcd_text(MARGIN, LIST_Y + 4, folder ? "Copying folder..." : "Copying...", C_ACCENT, FONT_LARGE);
+        sd_name(shown, sizeof(shown), s_clip);
+        draw_kv(LIST_Y + 4 + 2 * ROW_H, "From", shown);
+        sd_name(shown, sizeof(shown), dst);
+        draw_kv(LIST_Y + 4 + 3 * ROW_H, "To", shown);
+        draw_footer(NULL, C_FG, "Please wait");
+        lcd_flush();
+        s_copy_shown[0] = '\0';
+        draw_progress(0, 1);
+        if (!fileops_copy(s_clip, dst, copy_progress, err, sizeof(err))) {
+            note(C_ERR, "%s", err);
+            rescan_dir();
+            return;
+        }
+        note(C_OK, "Copied to %s", strrchr(dst, '/') + 1);
+    }
+    scan_dir();
+    select_name(strrchr(dst, '/') + 1);
+}
+
+static void enter_files(void)
+{
+    entry_t *e = selected_entry();
+    s_fa_count = 0;
+    if (e) {
+        s_fa_items[s_fa_count++] = FA_COPY;
+        s_fa_items[s_fa_count++] = FA_CUT;
+    }
+    if (s_clip[0]) {
+        s_fa_items[s_fa_count++] = FA_PASTE;
+    }
+    if (e) {
+        s_fa_items[s_fa_count++] = FA_DELETE;
+    }
+    if (s_clip[0]) {
+        s_fa_items[s_fa_count++] = FA_FORGET;
+    }
+    if (!s_fa_count) {
+        note(C_DIM, "%sSelect a file or folder first.", "");
+        return;
+    }
+    s_fa_sel = 0;
+    s_screen = SCREEN_FILES;
+}
+
+static void draw_files(void)
+{
+    draw_header();
+    int y = LIST_Y + 4;
+    entry_t *e = item_count() ? item_entry(s_sel) : NULL;
+    char buf[PATH_MAX_LEN + 80];
+    if (e) {
+        draw_kv(y, e->is_dir ? "Folder" : "File", e->name);
+    } else {
+        lcd_text(MARGIN, y, "This folder", C_DIM, FONT_LARGE);
+    }
+    y += 2 * ROW_H;
+    for (int i = 0; i < s_fa_count; i++, y += WF_ROW_H) {
+        char label[COLS + 1];
+        switch (s_fa_items[i]) {
+        case FA_COPY:
+            strlcpy(buf, "Copy  (C)", sizeof(buf));
+            break;
+        case FA_CUT:
+            strlcpy(buf, "Cut, to move it  (X)", sizeof(buf));
+            break;
+        case FA_PASTE:
+            snprintf(buf, sizeof(buf), "Paste %s here  (V)", strrchr(s_clip, '/') + 1);
+            break;
+        case FA_DELETE:
+            strlcpy(buf, "Delete  (Del)", sizeof(buf));
+            break;
+        default:
+            snprintf(buf, sizeof(buf), "Forget the %s item", s_clip_cut ? "cut" : "copied");
+            break;
+        }
+        fit(label, buf, COLS);
+        draw_option(y, label, i == s_fa_sel);
+    }
+    if (s_clip[0]) {
+        y += ROW_H;
+        char where[PATH_MAX_LEN + 72];
+        sd_name(where, sizeof(where), s_clip);
+        snprintf(buf, sizeof(buf), "%s: %s", s_clip_cut ? "Cut" : "Copied", where);
+        draw_wrapped(y, buf, C_DIM);
+    }
+    draw_footer(NULL, C_FG, "Up/Down move  Enter select  Esc back");
+}
+
+static bool files_key(int key)
+{
+    switch (key) {
+    case KEY_UP:
+        s_fa_sel = s_fa_sel > 0 ? s_fa_sel - 1 : s_fa_count - 1;
+        return true;
+    case KEY_DOWN:
+    case KEY_TAB:
+        s_fa_sel = s_fa_sel + 1 < s_fa_count ? s_fa_sel + 1 : 0;
+        return true;
+    case KEY_ESC:
+    case KEY_BACKSPACE:
+    case KEY_LEFT:
+    case KEY_F2:
+        s_screen = SCREEN_BROWSE;
+        return true;
+    case KEY_ENTER:
+    case KEY_RIGHT:
+        break;
+    default:
+        return false;
+    }
+    s_screen = SCREEN_BROWSE;
+    switch (s_fa_items[s_fa_sel]) {
+    case FA_COPY:
+        mark(false);
+        break;
+    case FA_CUT:
+        mark(true);
+        break;
+    case FA_PASTE:
+        paste();
+        break;
+    case FA_DELETE:
+        ask_delete();
+        break;
+    default:
+        s_clip[0] = '\0';
+        break;
+    }
+    return true;
+}
+
+#if PICOMULTILOADER_WIFI
 // Runs on every screen: the server keeps going in the background.
 static void web_tick(void)
 {
@@ -1526,6 +1873,12 @@ void ui_redraw(void)
         break;
     case SCREEN_PICK:
         draw_pick();
+        break;
+    case SCREEN_FILES:
+        draw_files();
+        break;
+    case SCREEN_DELETE:
+        draw_delete();
         break;
 #if PICOMULTILOADER_WIFI
     case SCREEN_WEB:
@@ -1647,6 +2000,8 @@ void ui_key(int key)
     switch (s_screen) {
     case SCREEN_BROWSE: {
         int n = item_count();
+        bool had_note = s_note[0];
+        s_note[0] = '\0';
         switch (key) {
         case KEY_UP:
             s_sel = s_sel > 0 ? s_sel - 1 : (n > 0 ? n - 1 : 0);
@@ -1689,8 +2044,35 @@ void ui_key(int key)
         case KEY_F5:
             enter_usb();
             break;
-        default: // Esc does nothing here: the installed app only starts after a flash or a restart
-            return;
+        case KEY_F2:
+            enter_files();
+            break;
+        case KEY_DEL:
+            ask_delete();
+            break;
+        case 'c':
+        case 'C':
+            mark(false);
+            break;
+        case 'x':
+        case 'X':
+            mark(true);
+            break;
+        case 'v':
+        case 'V':
+            paste();
+            break;
+        case KEY_ESC: // forget the copied item; otherwise nothing: the app only starts after a flash or a restart
+            if (!s_clip[0] && !had_note) {
+                return;
+            }
+            s_clip[0] = '\0';
+            break;
+        default:
+            if (!had_note) {
+                return;
+            }
+            break;
         }
         break;
     }
@@ -1725,6 +2107,21 @@ void ui_key(int key)
             return;
         }
         break;
+    case SCREEN_FILES:
+        if (!files_key(key)) {
+            return;
+        }
+        break;
+    case SCREEN_DELETE:
+        if (key == KEY_ENTER) {
+            do_delete();
+            break;
+        }
+        if (key == KEY_ESC || key == KEY_BACKSPACE || key == KEY_LEFT) {
+            s_screen = SCREEN_BROWSE;
+            break;
+        }
+        return;
 #if PICOMULTILOADER_WIFI
     case SCREEN_WIFI_SCAN:
         if (!wifi_scan_key(key)) {

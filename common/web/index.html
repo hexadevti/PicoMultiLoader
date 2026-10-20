@@ -25,6 +25,19 @@ button.danger:hover{border-color:var(--err);color:var(--err)}
 table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
 th,td{padding:7px 10px;text-align:left;border-bottom:1px solid var(--line);vertical-align:middle}
 th{font-size:12px;color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+th.sort{cursor:pointer;user-select:none}
+th.sort:hover{color:var(--fg)}
+th.sort[data-dir]::after{content:" \25B2";font-size:10px}
+th.sort[data-dir="-1"]::after{content:" \25BC"}
+th.chk,td.chk{width:1%;padding-right:0}
+td.chk input,th.chk input{width:16px;height:16px;margin:0;cursor:pointer;vertical-align:middle}
+tr.sel td{background:rgba(120,200,255,.12)}
+#loading{display:none;align-items:center;gap:10px;color:var(--dim);font-size:13px;margin-bottom:8px}
+#loading progress{flex:1;max-width:240px;height:8px}
+table.busy tbody{opacity:.45}
+#selBar{display:none;position:sticky;top:0;z-index:3;gap:8px;align-items:center;flex-wrap:wrap;background:var(--panel);border:1px solid var(--accent);border-radius:8px;padding:8px 10px;margin-bottom:10px}
+#selBar.on{display:flex}
+#selBar span{margin-right:auto;font-size:14px}
 tr:last-child td{border-bottom:0}
 td.name{word-break:break-all}
 td.name a{color:var(--fg);text-decoration:none;cursor:pointer}
@@ -35,7 +48,11 @@ td.act button{margin-left:4px}
 .empty{padding:24px;text-align:center;color:var(--dim)}
 #drop{position:fixed;inset:0;background:rgba(30,120,200,.25);border:3px dashed var(--accent);display:none;align-items:center;justify-content:center;font-size:22px;z-index:5;pointer-events:none}
 body.dragging #drop{display:flex}
-#queue{position:fixed;right:16px;bottom:16px;width:min(360px,calc(100vw - 32px));background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;display:none;box-shadow:0 4px 20px rgba(0,0,0,.3);z-index:4}
+#queue{position:fixed;right:16px;bottom:16px;width:min(360px,calc(100vw - 32px));max-height:min(320px,calc(100vh - 32px));background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;display:none;flex-direction:column;box-shadow:0 4px 20px rgba(0,0,0,.3);z-index:4}
+#queue.on{display:flex}
+#queue .head{font-size:13px;font-weight:600;display:flex;gap:8px;align-items:center}
+#queue .head span{flex:1}
+#queue .items{overflow-y:auto;min-height:0}
 #queue .item{font-size:13px;margin:6px 0}
 #queue .item .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #queue progress{width:100%;height:8px}
@@ -47,6 +64,13 @@ dialog label{display:block;font-size:13px;color:var(--dim);margin:10px 0 4px}
 dialog input{width:100%;font:inherit;padding:7px 9px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg)}
 dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
 dialog p{margin:6px 0 0;font-size:13px;color:var(--dim)}
+#moveList{margin-top:10px;border:1px solid var(--line);border-radius:6px;max-height:240px;overflow-y:auto}
+#moveList a{display:block;padding:6px 10px;color:var(--accent);cursor:pointer;border-bottom:1px solid var(--line);word-break:break-all}
+#moveList a:last-child{border-bottom:0}
+#moveList a:hover{background:var(--bg)}
+#moveList .empty{padding:10px}
+#moveCrumbs{margin-top:8px;font-size:14px;word-break:break-all}
+#moveCrumbs a{color:var(--accent);cursor:pointer}
 @media (max-width:600px){th.date,td.date{display:none}td.act button{padding:3px 6px}}
 </style>
 </head>
@@ -64,16 +88,32 @@ dialog p{margin:6px 0 0;font-size:13px;color:var(--dim)}
     <button id="mkdirBtn">New folder</button>
     <label class="btn primary" style="background:var(--accent);border-color:var(--accent);color:#000">Upload files<input id="fileInput" type="file" multiple hidden></label>
   </div>
-  <table>
-    <thead><tr><th>Name</th><th class="num">Size</th><th class="num date">Modified</th><th></th></tr></thead>
+  <div id="selBar"><span id="selCount"></span>
+    <button id="selDl" class="small">Download</button>
+    <button id="selMove" class="small">Move to…</button>
+    <button id="selDel" class="small danger">Delete</button>
+    <button id="selClear" class="small">Clear</button>
+  </div>
+  <div id="loading"><span id="loadTxt">Loading…</span><progress></progress></div>
+  <table id="table">
+    <thead><tr><th class="chk"><input type="checkbox" id="selAll" title="Select all"></th><th class="sort" data-key="n">Name</th><th class="num sort" data-key="s">Size</th><th class="num date sort" data-key="t">Modified</th><th></th></tr></thead>
     <tbody id="list"></tbody>
   </table>
-  <p style="color:var(--dim);font-size:13px">Drop files anywhere on the page to upload them to this folder.
+  <p style="color:var(--dim);font-size:13px">Drop files anywhere on the page, or paste them with Ctrl+V, to upload them to this folder.
   <b>Flash</b> writes an app (.bin on the ESP32-P4, .uf2 on the Pico 2 W) to the PicoCalc and starts it (this stops the web server).</p>
 </main>
 <div id="drop">Drop to upload</div>
 <div id="queue"></div>
 <div id="msg"></div>
+
+<dialog id="moveDlg">
+  <form method="dialog">
+    <b id="moveTitle">Move to…</b>
+    <div id="moveCrumbs"></div>
+    <div id="moveList"></div>
+    <div class="row"><button value="cancel">Cancel</button><button value="ok" class="primary">Move here</button></div>
+  </form>
+</dialog>
 
 <dialog id="wifiDlg">
   <form method="dialog" id="wifiForm">
@@ -90,7 +130,10 @@ dialog p{margin:6px 0 0;font-size:13px;color:var(--dim)}
 "use strict";
 const $ = id => document.getElementById(id);
 let cwd = "/", entries = [];
+let sortKey = "n", sortDir = 1;
+const selected = new Set();
 try { cwd = sessionStorage.getItem("cwd") || "/"; } catch (e) {}
+try { const s = JSON.parse(localStorage.getItem("sort")); if (s && "nst".includes(s.k)) { sortKey = s.k; sortDir = s.d === -1 ? -1 : 1; } } catch (e) {}
 
 const join = (dir, name) => (dir === "/" ? "" : dir) + "/" + name;
 const parent = p => p === "/" ? "/" : (p.slice(0, p.lastIndexOf("/")) || "/");
@@ -117,13 +160,47 @@ async function api(method, url, body) {
   return r.headers.get("content-type")?.includes("json") ? r.json() : r.text();
 }
 
+// Big folders take a while on the SD card: stream the listing and show how many items have arrived.
+let loadCtl = null;
+async function fetchList(path) {
+  if (loadCtl) loadCtl.abort(); // a newer folder wins
+  const ctl = loadCtl = new AbortController();
+  const timer = setTimeout(() => { $("loading").style.display = "flex"; $("table").classList.add("busy"); }, 300);
+  try {
+    const r = await fetch("/api/list?path=" + enc(path), {signal: ctl.signal});
+    if (!r.ok) throw new Error((await r.text()) || r.statusText);
+    if (!r.body || !window.TextDecoder) return await r.json();
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let text = "", count = 0, scanned = 0;
+    for (;;) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      text += dec.decode(value, {stream: true});
+      for (let i; (i = text.indexOf('{"n":', scanned)) >= 0; scanned = i + 5) count++;
+      scanned = Math.max(scanned, text.length - 4);
+      $("loadTxt").textContent = "Loading… " + count + " item" + (count === 1 ? "" : "s");
+    }
+    return JSON.parse(text + dec.decode());
+  } finally {
+    clearTimeout(timer);
+    if (loadCtl === ctl) {
+      loadCtl = null;
+      $("loading").style.display = "none"; $("table").classList.remove("busy"); $("loadTxt").textContent = "Loading…";
+    }
+  }
+}
+
 async function load(path) {
   try {
-    const d = await api("GET", "/api/list?path=" + enc(path));
+    const d = await fetchList(path);
+    if (d.path !== cwd) selected.clear();
     cwd = d.path; entries = d.entries;
+    const names = new Set(entries.map(e => e.n));
+    for (const n of selected) if (!names.has(n)) selected.delete(n);
     try { sessionStorage.setItem("cwd", cwd); } catch (e) {}
     render();
   } catch (e) {
+    if (e.name === "AbortError") return; // another folder was opened meanwhile
     if (path !== "/") { load("/"); } else { toast(e.message, true); }
   }
   info();
@@ -152,8 +229,13 @@ function render() {
   $("upBtn").disabled = cwd === "/";
 
   const list = $("list"); list.innerHTML = "";
-  entries.sort((a, b) => (b.d - a.d) || a.n.localeCompare(b.n, undefined, {numeric: true, sensitivity: "base"}));
-  if (!entries.length) list.append(el("tr", {}, el("td", {colspan: 4, class: "empty"}, "This folder is empty")));
+  const byName = (a, b) => a.n.localeCompare(b.n, undefined, {numeric: true, sensitivity: "base"});
+  entries.sort((a, b) => (b.d - a.d) ||
+    sortDir * ((sortKey === "s" ? (a.d ? 0 : a.s - b.s) : sortKey === "t" ? (a.t || 0) - (b.t || 0) : 0) || byName(a, b)));
+  for (const th of document.querySelectorAll("th.sort")) {
+    if (th.dataset.key === sortKey) th.dataset.dir = sortDir; else delete th.dataset.dir;
+  }
+  if (!entries.length) list.append(el("tr", {}, el("td", {colspan: 5, class: "empty"}, "This folder is empty")));
   for (const e of entries) {
     const path = join(cwd, e.n);
     const name = e.d ? el("a", {class: "dir", onclick: () => load(path)}, "\u{1F4C1} " + e.n)
@@ -163,10 +245,23 @@ function render() {
     if (!e.d) act.append(el("button", {class: "small", onclick: () => { location.href = "/api/file?dl=1&path=" + enc(path); }}, "Download"));
     act.append(el("button", {class: "small", onclick: () => rename(e)}, "Rename"),
                el("button", {class: "small danger", onclick: () => del(e)}, "Delete"));
-    list.append(el("tr", {}, el("td", {class: "name"}, name), el("td", {class: "num"}, e.d ? "" : fmtSize(e.s)),
-                   el("td", {class: "num date"}, fmtDate(e.t)), act));
+    const box = el("input", {type: "checkbox", onchange: () => { box.checked ? selected.add(e.n) : selected.delete(e.n); updateSel(); }});
+    const tr = el("tr", {}, el("td", {class: "chk"}, box), el("td", {class: "name"}, name), el("td", {class: "num"}, e.d ? "" : fmtSize(e.s)),
+                  el("td", {class: "num date"}, fmtDate(e.t)), act);
+    e.row = tr; e.box = box;
+    list.append(tr);
   }
+  updateSel();
 }
+function updateSel() {
+  for (const e of entries) if (e.row) { e.box.checked = selected.has(e.n); e.row.classList.toggle("sel", e.box.checked); }
+  const n = selected.size, all = $("selAll");
+  all.checked = n > 0 && n === entries.length; all.indeterminate = n > 0 && n < entries.length;
+  $("selBar").classList.toggle("on", n > 0);
+  $("selCount").textContent = n + " selected";
+  $("selDl").disabled = !entries.some(e => selected.has(e.n) && !e.d);
+}
+const selEntries = () => entries.filter(e => selected.has(e.n));
 
 const badName = n => !n || /[\\/:*?"<>|]/.test(n) || n === "." || n === "..";
 async function mkdir() {
@@ -193,6 +288,120 @@ async function flash(path) {
   catch (e) { toast(e.message, true); }
 }
 
+async function delSelected() {
+  const sel = selEntries(); if (!sel.length) return;
+  const dirs = sel.filter(e => e.d).length;
+  if (!confirm("Delete " + (sel.length === 1 ? "“" + sel[0].n + "”" : sel.length + " items") +
+               (dirs ? " (folders with everything in them)" : "") + "?")) return;
+  let ok = 0;
+  for (const e of sel) {
+    try { await api("POST", "/api/delete?path=" + enc(join(cwd, e.n))); ok++; selected.delete(e.n); }
+    catch (err) { toast(e.n + ": " + err.message, true); }
+  }
+  if (ok) toast("Deleted " + ok + (ok === 1 ? " item" : " items"));
+  load(cwd);
+}
+
+// Downloads go one at a time through fetch, so they don't use up the device's few connections.
+async function dlSelected() {
+  const files = selEntries().filter(e => !e.d);
+  if (!files.length) return;
+  if (files.length < selected.size) toast("Folders are skipped — only files can be downloaded");
+  dlBusy = true;
+  for (const e of files) {
+    const job = addJob(e.n + " (" + fmtSize(e.s) + ")");
+    try {
+      const r = await fetch("/api/file?dl=1&path=" + enc(join(cwd, e.n)));
+      if (!r.ok) throw new Error((await r.text()) || r.statusText);
+      const total = +r.headers.get("content-length") || e.s, parts = [], rd = r.body.getReader();
+      let got = 0;
+      for (;;) {
+        const {done, value} = await rd.read(); if (done) break;
+        parts.push(value); got += value.length; if (total) job.bar.value = got * 100 / total;
+      }
+      const url = URL.createObjectURL(new Blob(parts));
+      const a = el("a", {href: url, download: e.n}); document.body.append(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      finishJob(job, true);
+    } catch (err) { finishJob(job, false, err.message); }
+  }
+  dlBusy = false;
+  jobsIdle();
+}
+
+// ---- move dialog: browse to a folder, then rename each selected item into it ----
+let moveDir = "/";
+async function moveBrowse(dir) {
+  let d;
+  try { d = await api("GET", "/api/list?path=" + enc(dir)); } catch (e) { return toast(e.message, true); }
+  moveDir = d.path;
+  const c = $("moveCrumbs"); c.innerHTML = "";
+  c.append(el("a", {onclick: () => moveBrowse("/")}, "SD"));
+  let acc = "";
+  for (const part of moveDir.split("/").filter(Boolean)) {
+    acc += "/" + part; const p = acc;
+    c.append(" / ", el("a", {onclick: () => moveBrowse(p)}, part));
+  }
+  const l = $("moveList"); l.innerHTML = "";
+  if (moveDir !== "/") l.append(el("a", {onclick: () => moveBrowse(parent(moveDir))}, "\u2191 .."));
+  const moving = new Set(selEntries().filter(e => e.d).map(e => join(cwd, e.n)));
+  const dirs = d.entries.filter(e => e.d && !moving.has(join(moveDir, e.n)))
+                        .sort((a, b) => a.n.localeCompare(b.n, undefined, {numeric: true, sensitivity: "base"}));
+  for (const e of dirs) l.append(el("a", {onclick: () => moveBrowse(join(moveDir, e.n))}, "\u{1F4C1} " + e.n));
+  if (!dirs.length && moveDir === "/") l.append(el("div", {class: "empty"}, "No folders"));
+}
+function moveSelected() {
+  const n = selected.size; if (!n) return;
+  $("moveTitle").textContent = "Move " + (n === 1 ? "“" + [...selected][0] + "”" : n + " items") + " to…";
+  moveBrowse(cwd);
+  $("moveDlg").showModal();
+}
+$("moveDlg").addEventListener("close", async () => {
+  if ($("moveDlg").returnValue !== "ok") return;
+  const dest = moveDir;
+  if (dest === cwd) return toast("They're already in this folder", true);
+  let ok = 0;
+  for (const e of selEntries()) {
+    const from = join(cwd, e.n);
+    if (e.d && dest.startsWith(from + "/")) { toast("Can't move “" + e.n + "” into itself", true); continue; }
+    try { await api("POST", "/api/rename?from=" + enc(from) + "&to=" + enc(join(dest, e.n))); ok++; selected.delete(e.n); }
+    catch (err) { toast(e.n + ": " + err.message, true); }
+  }
+  if (ok) toast("Moved " + ok + (ok === 1 ? " item" : " items") + " to " + dest);
+  load(cwd);
+});
+
+// ---- transfer panel (uploads and downloads): scrolls, with a running count at the top ----
+const jobs = {total: 0, done: 0, failed: 0};
+let dlBusy = false;
+function addJob(label) {
+  const q = $("queue");
+  if (!q.firstChild) {
+    q.append(el("div", {class: "head"}, el("span", {}), el("button", {class: "small", onclick: clearJobs}, "Hide")), el("div", {class: "items"}));
+  }
+  const row = el("div", {class: "item"}, el("div", {class: "nm"}, label), el("progress", {max: 100, value: 0}));
+  q.querySelector(".items").append(row); q.classList.add("on");
+  jobs.total++; jobHead();
+  return {row, bar: row.querySelector("progress")};
+}
+function finishJob(job, ok, why) {
+  const nm = job.row.firstChild;
+  nm.textContent = nm.textContent.replace(/ — .*$/, "") + (ok ? " ✓" : " ✗ " + (why || "failed"));
+  if (ok) { job.bar.value = 100; jobs.done++; } else jobs.failed++;
+  jobHead();
+  if (ok) setTimeout(() => job.row.remove(), 1500); // finished rows go away so the list stays short; failures stay
+}
+function jobHead() {
+  const h = $("queue").querySelector(".head span"); if (!h) return;
+  const fin = jobs.done + jobs.failed;
+  h.textContent = (fin < jobs.total ? "Transferring " + (fin + 1) + " of " + jobs.total : "Done: " + jobs.done + " of " + jobs.total) +
+                  (jobs.failed ? " · " + jobs.failed + " failed" : "");
+}
+function clearJobs() { const q = $("queue"); q.classList.remove("on"); q.innerHTML = ""; jobs.total = jobs.done = jobs.failed = 0; }
+function jobsIdle() {
+  setTimeout(() => { if (!busy && !dlBusy && !queue.length && jobs.done + jobs.failed >= jobs.total && !jobs.failed) clearJobs(); }, 2500);
+}
+
 // ---- uploads: one at a time, raw body, with progress ----
 const queue = []; let busy = false;
 function enqueue(files) {
@@ -204,21 +413,16 @@ function enqueue(files) {
   }
   for (const f of files) {
     if (dirs.has(f.name) || badName(f.name)) { toast("Skipped " + f.name, true); continue; }
-    const row = el("div", {class: "item"}, el("div", {class: "nm"}, f.name + " (" + fmtSize(f.size) + ")"), el("progress", {max: 100, value: 0}));
-    $("queue").append(row); $("queue").style.display = "block";
-    queue.push({file: f, dir: cwd, row});
+    queue.push({file: f, dir: cwd, job: addJob(f.name + " (" + fmtSize(f.size) + ")")});
   }
   pump();
 }
 function pump() {
   if (busy) return;
   const job = queue.shift();
-  if (!job) {
-    setTimeout(() => { if (!busy && !queue.length) { $("queue").style.display = "none"; $("queue").innerHTML = ""; } }, 1500);
-    return;
-  }
+  if (!job) { jobsIdle(); return; }
   busy = true;
-  const bar = job.row.querySelector("progress");
+  const bar = job.job.bar, nm = job.job.row.firstChild;
   const xhr = new XMLHttpRequest();
   const t0 = Date.now();
   xhr.open("POST", "/api/upload?path=" + enc(join(job.dir, job.file.name)) + "&mtime=" + Math.floor(job.file.lastModified / 1000));
@@ -226,12 +430,11 @@ function pump() {
     if (!ev.lengthComputable) return;
     bar.value = ev.loaded * 100 / ev.total;
     const s = (Date.now() - t0) / 1000;
-    if (s > 1) job.row.firstChild.textContent = job.file.name + " — " + fmtSize(ev.loaded / s) + "/s";
+    if (s > 1) nm.textContent = job.file.name + " — " + fmtSize(ev.loaded / s) + "/s";
   };
   const done = ok => {
     busy = false;
-    job.row.firstChild.textContent = job.file.name + (ok ? " ✓" : " ✗ " + (xhr.responseText || "failed"));
-    if (ok) bar.value = 100;
+    finishJob(job.job, ok, xhr.responseText);
     if (job.dir === cwd && (!queue.length || !queue.some(q => q.dir === cwd))) load(cwd);
     pump();
   };
@@ -244,6 +447,28 @@ $("fileInput").onchange = e => { enqueue(e.target.files); e.target.value = ""; }
 $("mkdirBtn").onclick = mkdir;
 $("refreshBtn").onclick = () => load(cwd);
 $("upBtn").onclick = () => load(parent(cwd));
+$("selAll").onchange = e => { selected.clear(); if (e.target.checked) for (const x of entries) selected.add(x.n); updateSel(); };
+$("selClear").onclick = () => { selected.clear(); updateSel(); };
+$("selDel").onclick = delSelected;
+$("selDl").onclick = dlSelected;
+$("selMove").onclick = moveSelected;
+for (const th of document.querySelectorAll("th.sort")) th.onclick = () => {
+  if (sortKey === th.dataset.key) sortDir = -sortDir; else { sortKey = th.dataset.key; sortDir = sortKey === "n" ? 1 : -1; }
+  try { localStorage.setItem("sort", JSON.stringify({k: sortKey, d: sortDir})); } catch (e) {}
+  render();
+};
+// Ctrl+V uploads files from the clipboard (copied in a file manager, or a screenshot) into this folder.
+addEventListener("paste", e => {
+  if (e.target.closest && e.target.closest("input,textarea,dialog")) return;
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
+  const files = [...(e.clipboardData?.files || [])].map((f, i) => {
+    if (f.name && !/^image\.\w+$/i.test(f.name)) return f;
+    const ext = (f.type.split("/")[1] || "bin").replace("jpeg", "jpg").replace(/\W.*/, "");
+    return new File([f], "pasted-" + stamp + (i ? "-" + i : "") + "." + ext, {type: f.type, lastModified: Date.now()});
+  });
+  if (!files.length) return;
+  e.preventDefault(); enqueue(files);
+});
 let dragDepth = 0;
 addEventListener("dragenter", e => { if ([...e.dataTransfer.types].includes("Files")) { e.preventDefault(); dragDepth++; document.body.classList.add("dragging"); } });
 addEventListener("dragleave", () => { if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove("dragging"); } });
