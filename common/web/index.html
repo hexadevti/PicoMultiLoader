@@ -439,7 +439,12 @@ function pump() {
     pump();
   };
   xhr.onload = () => done(xhr.status === 200);
-  xhr.onerror = () => done(false);
+  xhr.onerror = () => {
+    // The device refuses connections when it is short of memory: try once more after a moment.
+    if (job.retried) { done(false); return; }
+    job.retried = true; bar.value = 0; nm.textContent = job.file.name + " — retrying";
+    setTimeout(() => { busy = false; queue.unshift(job); pump(); }, 1000);
+  };
   xhr.send(job.file);
 }
 
@@ -461,13 +466,19 @@ for (const th of document.querySelectorAll("th.sort")) th.onclick = () => {
 addEventListener("paste", e => {
   if (e.target.closest && e.target.closest("input,textarea,dialog")) return;
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
-  const files = [...(e.clipboardData?.files || [])].map((f, i) => {
+  // Copied folders show up as empty placeholder files: upload them as folders instead.
+  const folders = [...(e.clipboardData?.items || [])].filter(it => it.kind === "file" && it.webkitGetAsEntry)
+                  .map(it => it.webkitGetAsEntry()).filter(en => en && en.isDirectory);
+  const folderNames = new Set(folders.map(en => en.name));
+  const files = [...(e.clipboardData?.files || [])].filter(f => !folderNames.has(f.name)).map((f, i) => {
     if (f.name && !/^image\.\w+$/i.test(f.name)) return f;
     const ext = (f.type.split("/")[1] || "bin").replace("jpeg", "jpg").replace(/\W.*/, "");
     return new File([f], "pasted-" + stamp + (i ? "-" + i : "") + "." + ext, {type: f.type, lastModified: Date.now()});
   });
-  if (!files.length) return;
-  e.preventDefault(); enqueue(files);
+  if (!files.length && !folders.length) return;
+  e.preventDefault();
+  if (files.length) enqueue(files);
+  if (folders.length) enqueueFolders(folders, cwd);
 });
 let dragDepth = 0;
 addEventListener("dragenter", e => { if ([...e.dataTransfer.types].includes("Files")) { e.preventDefault(); dragDepth++; document.body.classList.add("dragging"); } });
@@ -475,9 +486,62 @@ addEventListener("dragleave", () => { if (--dragDepth <= 0) { dragDepth = 0; doc
 addEventListener("dragover", e => e.preventDefault());
 addEventListener("drop", e => {
   e.preventDefault(); dragDepth = 0; document.body.classList.remove("dragging");
-  const files = [...e.dataTransfer.files].filter(f => f.size > 0 || f.type);
+  // Entries must be taken now: the DataTransfer is emptied once this handler returns.
+  const items = [...(e.dataTransfer.items || [])].filter(it => it.kind === "file");
+  if (!items.length || !items[0].webkitGetAsEntry) {
+    const files = [...e.dataTransfer.files].filter(f => f.size > 0 || f.type);
+    if (files.length) enqueue(files);
+    return;
+  }
+  const files = [], folders = [];
+  for (const it of items) {
+    const entry = it.webkitGetAsEntry();
+    if (entry && entry.isDirectory) folders.push(entry);
+    else { const f = it.getAsFile(); if (f) files.push(f); }
+  }
   if (files.length) enqueue(files);
+  if (folders.length) enqueueFolders(folders, cwd);
 });
+
+// ---- dropped folders: walk them, create each folder on the card, then queue their files ----
+function readAll(reader) {
+  return new Promise((res, rej) => {
+    const out = [];
+    const next = () => reader.readEntries(b => { if (!b.length) res(out); else { out.push(...b); next(); } }, rej);
+    next();
+  });
+}
+async function walk(entry, dir, dirs, files) {
+  if (badName(entry.name)) { toast("Skipped " + entry.name, true); return; }
+  if (entry.isFile) {
+    files.push({file: await new Promise((res, rej) => entry.file(res, rej)), dir});
+  } else if (entry.isDirectory) {
+    const sub = join(dir, entry.name);
+    dirs.push(sub);
+    for (const e of await readAll(entry.createReader())) await walk(e, sub, dirs, files);
+  }
+}
+async function enqueueFolders(roots, base) {
+  const fileNames = new Set(entries.filter(e => !e.d).map(e => e.n));
+  const dirNames = new Set(entries.filter(e => e.d).map(e => e.n));
+  roots = roots.filter(r => {
+    if (fileNames.has(r.name)) { toast("Skipped " + r.name + " — a file with that name exists", true); return false; }
+    return !dirNames.has(r.name) || confirm("Folder “" + r.name + "” already exists. Merge into it, replacing files with the same name?");
+  });
+  if (!roots.length) return;
+  const dirs = [], files = [];
+  try { for (const r of roots) await walk(r, base, dirs, files); }
+  catch (e) { toast("Can't read the dropped folder: " + e.message, true); return; }
+  for (const d of dirs) {
+    // An existing folder is fine; a real failure shows up as failed uploads for its files.
+    try { await api("POST", "/api/mkdir?path=" + enc(d)); } catch (e) {}
+  }
+  if (base === cwd) load(cwd);
+  for (const {file, dir} of files) {
+    queue.push({file, dir, job: addJob(dir.slice(base === "/" ? 1 : base.length + 1) + "/" + file.name + " (" + fmtSize(file.size) + ")")});
+  }
+  pump();
+}
 
 $("wifiBtn").onclick = () => { $("wifiDlg").showModal(); $("ssid").focus(); };
 $("wifiDlg").addEventListener("close", async () => {

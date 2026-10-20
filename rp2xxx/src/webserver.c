@@ -36,7 +36,7 @@
 #define HTTP_PORT          80
 #define MAX_CONNS          3 // each takes ~5 KB of heap, and the heap is small next to the radio firmware
 #define HDR_MAX            2048
-#define OUT_MAX            2048
+#define OUT_MAX            1460 // one TCP segment; keeps two connections within the small heap
 #define PATH_LEN           256
 #define PARAM_LEN          (3 * PATH_LEN)
 #define BODY_MAX           160
@@ -303,8 +303,16 @@ typedef struct conn {
     char body[BODY_MAX];
     size_t body_len;
 
+    // A connection either reads/writes one file or lists one folder, never both.
+    union {
+        FIL file;
+        struct {
+            DIR dir;
+            FILINFO fi;
+        };
+    };
+
     // upload
-    FIL file;
     bool file_open;
     bool uploading;
     const char *upload_err; // why the upload failed: answered once the body is drained
@@ -319,10 +327,9 @@ typedef struct conn {
     bool src_done;
     const char *mem;
     size_t mem_len;
-    DIR dir;
     bool dir_open, first_entry;
-    FILINFO fi;
 } conn_t;
+_Static_assert(sizeof(conn_t) <= 4700, "two connections must fit in the heap");
 
 static conn_t *s_conns;
 static int s_conn_count;

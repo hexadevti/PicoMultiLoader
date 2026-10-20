@@ -78,6 +78,8 @@ target_compile_definitions(${LOADER_NAME} PRIVATE
     PICO_STDIO_UART=1
     PICO_PRINTF_SUPPORT_FLOAT=0
     PICO_PRINTF_SUPPORT_EXPONENTIAL=0
+    # The heap is only ~10 KB: a failed malloc must return NULL (callers handle it), not panic.
+    PICO_MALLOC_PANIC=0
 )
 
 target_compile_options(${LOADER_NAME} PRIVATE -Wall -Wno-unused-function)
