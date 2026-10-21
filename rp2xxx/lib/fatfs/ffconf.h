@@ -1,3 +1,5 @@
+/* PicoMultiLoader: FatFs R0.16 ffconf.h with this project's settings (see THIRD-PARTY.md). */
+
 /*---------------------------------------------------------------------------/
 /  Configurations of FatFs Module
 /---------------------------------------------------------------------------*/

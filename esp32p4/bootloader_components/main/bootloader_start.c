@@ -1,5 +1,8 @@
 /*
- * Custom second-stage bootloader for PicoMultiLoader.
+ * SPDX-FileCopyrightText: 2015-2021 Espressif Systems (Shanghai) CO LTD
+ *
+ * Custom second-stage bootloader for PicoMultiLoader. Taken from ESP-IDF v5.5's
+ * examples/custom_bootloader/bootloader_override (see THIRD-PARTY.md).
  *
  * Identical to the stock ESP-IDF bootloader, except that before booting the installed app it
  * checks whether the loader ("factory" partition) was requested:

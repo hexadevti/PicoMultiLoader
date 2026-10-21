@@ -1,4 +1,5 @@
-// usb_descriptors.c - USB device, configuration and string descriptors for USB drive mode
+// usb_descriptors.c - USB device, configuration and string descriptors for USB drive mode.
+// Laid out like TinyUSB's examples/device/cdc_msc/src/usb_descriptors.c (MIT, Ha Thach; see THIRD-PARTY.md).
 #include <string.h>
 #include "pico/unique_id.h"
 #include "tusb.h"

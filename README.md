@@ -418,6 +418,10 @@ The pin map is in `rp2xxx/src/board.h`:
 
 The Pico and Pico 2 W builds are inspired by [uf2loader](https://github.com/pelrun/uf2loader) by
 pelrun, the SD-card UF2 loader many PicoCalc owners already use. Many thanks to pelrun for making
-it and sharing it. PicoMultiLoader does not include uf2loader code.
+it and sharing it. PicoMultiLoader does not include uf2loader code; it follows the same app
+interface so apps made for uf2loader work, and its FatFs `ffconf.h` started from uf2loader's.
 
 The RP2040 boot2 is the Pico SDK's W25Q080 boot2 (BSD-3-Clause) with a different jump target.
+
+[`THIRD-PARTY.md`](THIRD-PARTY.md) lists every file taken from elsewhere (FatFs, the Pico SDK,
+ESP-IDF, TinyUSB) with its licence and what was changed.
