@@ -15,6 +15,7 @@
 #include "esp_timer.h"
 #include "nvs.h"
 #include "sdkconfig.h"
+#include "hal/psram_ctrlr_ll.h"
 #include "keyboard.h"
 #include "lcd.h"
 #include "sdcard.h"
@@ -134,6 +135,11 @@ static void boot_installed(void)
     if (p && esp_ota_set_boot_partition(p) == ESP_OK) {
         ESP_LOGI(TAG, "Booting %s", p->label);
         sdcard_unmount();
+        // The loader has no PSRAM, so at power-on IDF gates the PSRAM controller clocks, and
+        // esp_restart() (a CPU reset) leaves them gated. An app that uses PSRAM then faults while
+        // starting up. Turn them back on first.
+        _psram_ctrlr_ll_enable_core_clock(PSRAM_CTRLR_LL_MSPI_ID_2, true);
+        _psram_ctrlr_ll_enable_module_clock(PSRAM_CTRLR_LL_MSPI_ID_2, true);
         esp_restart();
     }
 }
