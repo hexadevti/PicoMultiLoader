@@ -22,6 +22,14 @@ bool lcd_init(void);
 /** Set palette entry `index` (0..15) to an RGB565 colour. */
 void lcd_set_palette(lcd_color_t index, uint16_t rgb565);
 
+/** Palette entry `index` as RGB565. */
+uint16_t lcd_get_palette(lcd_color_t index);
+
+/** One framebuffer row: LCD_W / 2 bytes, two pixels per byte, the low nibble is the even x. */
+const uint8_t *lcd_row(int y);
+
+void lcd_pixel(int x, int y, lcd_color_t color);
+
 /** Copy the framebuffer to the panel. */
 void lcd_flush(void);
 

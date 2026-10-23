@@ -15,6 +15,12 @@ enum {
     KEY_F3        = 0x83,
     KEY_F4        = 0x84,
     KEY_F5        = 0x85,
+    KEY_F6        = 0x86, // F6..F10: Shift + F1..F5
+    KEY_F7        = 0x87,
+    KEY_F8        = 0x88,
+    KEY_F9        = 0x89,
+    KEY_F10       = 0x90, // not 0x8A
+    KEY_F10_ALT   = 0x8A, // in case a keyboard firmware sends this instead
     KEY_ESC       = 0xB1,
     KEY_LEFT      = 0xB4,
     KEY_UP        = 0xB5,

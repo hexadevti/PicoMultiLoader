@@ -100,6 +100,16 @@ void lcd_set_palette(lcd_color_t index, uint16_t rgb565)
     s_palette[index & 15] = rgb565;
 }
 
+uint16_t lcd_get_palette(lcd_color_t index)
+{
+    return s_palette[index & 15];
+}
+
+const uint8_t *lcd_row(int y)
+{
+    return &s_fb[y * (LCD_W / 2)];
+}
+
 static void expand_rows(uint16_t *out, int y, int rows)
 {
     const uint8_t *src = &s_fb[y * (LCD_W / 2)];
@@ -166,6 +176,13 @@ static inline void put_pixel(int x, int y, lcd_color_t c)
 {
     uint8_t *p = &s_fb[y * (LCD_W / 2) + (x >> 1)];
     *p = (x & 1) ? (uint8_t)((*p & 0x0F) | (c << 4)) : (uint8_t)((*p & 0xF0) | (c & 15));
+}
+
+void lcd_pixel(int x, int y, lcd_color_t color)
+{
+    if (x >= 0 && x < LCD_W && y >= 0 && y < LCD_H) {
+        put_pixel(x, y, color);
+    }
 }
 
 void lcd_fill_rect(int x, int y, int w, int h, lcd_color_t color)

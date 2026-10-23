@@ -5,7 +5,7 @@
  * menu when Up, F1 or F5 is held, an app asked for it, or no app is installed.
  *
  * The serial console (PicoCalc USB-C, UART0) works as a second keyboard: arrows, PgUp/PgDn, Enter,
- * Backspace, Esc, F1, F4, F5.
+ * Backspace, Esc, F1-F5 and typing (the terminal, F5).
  */
 #include <stdio.h>
 #include "pico/stdlib.h"
@@ -22,7 +22,6 @@
 #define POLL_US          20000
 #define BATTERY_EVERY_US (10 * 1000 * 1000)
 #define REPROBE_EVERY_US (1000 * 1000)
-#define BACKLIGHT        200
 
 // Read one console byte if one is waiting, else -1.
 static int console_getc(void)
@@ -128,7 +127,7 @@ int main(void)
     ui_boot(sd_ok);
     bool kbd_ok = kbd_init();
     if (kbd_ok) {
-        kbd_set_lcd_backlight(BACKLIGHT);
+        kbd_set_lcd_backlight(ui_backlight());
     } else {
         printf("loader: no keyboard - is the PicoCalc switched on? Serial input still works.\n");
     }
@@ -169,7 +168,7 @@ int main(void)
             if (kbd_init()) {
                 printf("loader: keyboard found\n");
                 lcd_init();
-                kbd_set_lcd_backlight(BACKLIGHT);
+                kbd_set_lcd_backlight(ui_backlight());
                 ui_redraw();
                 update_battery();
             }

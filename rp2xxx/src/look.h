@@ -38,6 +38,9 @@ enum {
  */
 bool theme_load(const char *name);
 
+/** Put the loaded theme's colours back in the palette (after a screen that used its own). */
+void theme_apply(void);
+
 /** Name of the loaded theme. */
 const char *theme_name(void);
 

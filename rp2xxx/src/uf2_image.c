@@ -31,7 +31,9 @@
 #define APP_SIZE      RECORD_OFFSET
 #else
 #define APP_OFFSET    0x002000u // the stub's partition; the bootrom maps it to XIP_BASE
-#define APP_SIZE      (PICO_FLASH_SIZE_BYTES - APP_OFFSET)
+#define RES_SIZE      0x40000u  // the loader's resources (Wi-Fi firmware, web page), at the end
+#define RES_OFFSET    (PICO_FLASH_SIZE_BYTES - RES_SIZE)
+#define APP_SIZE      (RES_OFFSET - APP_OFFSET)
 #define APP_CONFIG_KEY "app"    // file name of the installed app, in the settings file
 #endif
 #define APP_END       (XIP_BASE + APP_SIZE) // end of the app's own address range
@@ -62,6 +64,16 @@ typedef struct {
 #define BI_ID_PROGRAM_DATE     0x9da22254
 #define BI_MARKER_START        0x7188ebf2
 #define BI_MARKER_END          0xe71aa390
+
+bool uf2_exit_code(int32_t *code)
+{
+    if (watchdog_hw->scratch[2] != PML_EXIT_MAGIC) {
+        return false;
+    }
+    watchdog_hw->scratch[2] = 0;
+    *code = (int32_t)watchdog_hw->scratch[3];
+    return true;
+}
 
 // ---- platform ---------------------------------------------------------------------------------
 uint32_t uf2_flash_capacity(void)
@@ -112,7 +124,6 @@ static bool in_ram(uint32_t addr)
     return addr >= SRAM_BASE && addr + 256 <= SRAM_END;
 }
 
-#if PICO_RP2040
 static uint32_t crc32(const uint8_t *p, size_t n)
 {
     uint32_t crc = 0xffffffffu;
@@ -125,6 +136,7 @@ static uint32_t crc32(const uint8_t *p, size_t n)
     return ~crc;
 }
 
+#if PICO_RP2040
 static uint32_t first_sector_crc(uint32_t size)
 {
     return crc32((const uint8_t *)(XIP_BASE + APP_OFFSET), size < FLASH_SECTOR_SIZE ? size : FLASH_SECTOR_SIZE);
@@ -669,6 +681,180 @@ static bool write_first_sector(const char *path, uf2_walk_t *w, char *err, size_
     f_close(&w->f);
     if (ok && left) {
         snprintf(err, err_len, "The first sector changed while flashing.");
+        ok = false;
+    }
+    return ok;
+}
+#endif
+
+#if !PICO_RP2040
+// ---- resources in flash -----------------------------------------------------------------------
+// The Wi-Fi firmware and the web page are linked into the last 256 KB of flash (.pml_res, see
+// CMakeLists.txt) to leave RAM for the loader. pml2350.uf2 carries them as blocks of RES_FAMILY
+// after its RAM blocks (add_res.py); the stub skips those, and uf2_res_install() copies them here.
+#define RES_MAGIC  0x52574d50u // "PMWR"
+#define RES_FAMILY 0x504d4c52u
+#define LOADER_FILE "/pml2350.uf2"
+
+typedef struct {
+    uint32_t magic;
+    uint32_t size;  // bytes after the header
+    uint32_t crc;   // CRC-32 of those bytes
+    uint32_t check; // magic ^ size ^ crc ^ 0xffffffff; 0xffffffff while being installed
+} res_hdr_t;
+
+_Static_assert(PML_RES_BASE == XIP_BASE + RES_OFFSET, "PML_RES_BASE must be the last 256 KB of flash");
+
+// The start of .pml_res; add_res.py fills it in.
+__attribute__((section(".pml_res.0hdr"), used)) const res_hdr_t s_res_hdr = {RES_MAGIC, 0, 0, 0};
+
+// The header of the resources this build was linked with. add_res.py finds the marker in the RAM
+// image and writes the header over it.
+static const volatile res_hdr_t s_res_want __attribute__((aligned(16))) = {
+    0x4d4c4d50u, 0x57534552u, 0x5f544e41u, 0x52444448u};
+
+#define RES_FLASH ((const res_hdr_t *)(XIP_BASE + RES_OFFSET))
+
+static bool res_hdr_valid(const res_hdr_t *h)
+{
+    return h->magic == RES_MAGIC && h->size <= RES_SIZE - sizeof(*h) &&
+           h->check == (h->magic ^ h->size ^ h->crc ^ 0xffffffffu);
+}
+
+static bool res_payload_ok(const res_hdr_t *h)
+{
+    return crc32((const uint8_t *)(h + 1), h->size) == h->crc;
+}
+
+static int s_res_state = -1; // cached uf2_res_check(); -1 until the first check
+
+res_state_t uf2_res_check(void)
+{
+    if (s_res_state >= 0) {
+        return (res_state_t)s_res_state;
+    }
+    const res_hdr_t *f = RES_FLASH;
+    res_state_t st;
+    if (s_res_want.magic != RES_MAGIC) {
+        st = RES_NO_FILE; // built without add_res.py
+    } else if (f->magic == s_res_want.magic && f->size == s_res_want.size && f->crc == s_res_want.crc &&
+               f->check == s_res_want.check && res_payload_ok(f)) {
+        st = RES_OK;
+    } else {
+        const uint32_t *p = (const uint32_t *)f;
+        unsigned i = 0;
+        while (i < RES_SIZE / 4 && p[i] == 0xffffffffu) {
+            i++;
+        }
+        if (i == RES_SIZE / 4) {
+            st = RES_BLANK;
+        } else if (f->magic == RES_MAGIC && ((res_hdr_valid(f) && res_payload_ok(f)) || f->check == 0xffffffffu)) {
+            st = RES_OLD; // another loader version's, or an interrupted install
+        } else {
+            st = RES_USED; // an app keeps its data there
+        }
+    }
+    s_res_state = st;
+    return st;
+}
+
+bool uf2_res_ready(void)
+{
+    return uf2_res_check() == RES_OK;
+}
+
+bool uf2_res_install(uf2_progress_cb_t progress, char *err, size_t err_len)
+{
+    FIL f;
+    if (s_res_want.magic != RES_MAGIC) {
+        snprintf(err, err_len, "This loader was built without its resources (add_res.py).");
+        return false;
+    }
+    if (f_open(&f, sd_path(LOADER_FILE), FA_READ) != FR_OK) {
+        snprintf(err, err_len, "Cannot open " LOADER_FILE ".");
+        return false;
+    }
+    s_res_state = -1;
+    UINT n = 0;
+    struct uf2_block *b = &s_chunk[0];
+    uint32_t total_blocks = (uint32_t)(f_size(&f) / 512), idx = 0;
+    // The loader's own blocks come first: skip them in one go
+    if (f_read(&f, b, 512, &n) == FR_OK && n == 512 && b->magic_start0 == UF2_MAGIC_START0 &&
+        b->num_blocks < total_blocks && f_lseek(&f, (FSIZE_t)b->num_blocks * 512) == FR_OK) {
+        idx = b->num_blocks;
+    } else {
+        f_close(&f);
+        snprintf(err, err_len, LOADER_FILE " is not a UF2 file.");
+        return false;
+    }
+    uint64_t erased = 0; // one bit per 4 KB sector of the area
+    uint32_t done = 0, want_pages = (sizeof(res_hdr_t) + s_res_want.size + 255) / 256;
+    bool ok = true, got_hdr = false;
+    for (; ok && idx < total_blocks;) {
+        uint32_t chunk = total_blocks - idx < CHUNK_BLOCKS ? total_blocks - idx : CHUNK_BLOCKS;
+        if (f_read(&f, s_chunk, chunk * 512, &n) != FR_OK || n != chunk * 512) {
+            snprintf(err, err_len, "Read error on the SD card.");
+            ok = false;
+            break;
+        }
+        for (uint32_t i = 0; ok && i < chunk; i++, idx++) {
+            b = &s_chunk[i];
+            uint32_t off = b->target_addr - PML_RES_BASE;
+            if (b->magic_start0 != UF2_MAGIC_START0 || b->magic_start1 != UF2_MAGIC_START1 ||
+                b->magic_end != UF2_MAGIC_END || !(b->flags & UF2_FLAG_FAMILY_ID_PRESENT) ||
+                b->file_size != RES_FAMILY) {
+                continue;
+            }
+            if (b->payload_size != 256 || off >= RES_SIZE || (off & 0xFF)) {
+                snprintf(err, err_len, "Bad resource block at 0x%08lx.", (unsigned long)b->target_addr);
+                ok = false;
+                break;
+            }
+            memcpy(s_page, b->data, 256);
+            if (off == 0) { // the header: it must be the one this loader was linked with
+                const res_hdr_t *h = (const res_hdr_t *)s_page;
+                if (h->magic != s_res_want.magic || h->size != s_res_want.size || h->crc != s_res_want.crc ||
+                    h->check != s_res_want.check) {
+                    snprintf(err, err_len, LOADER_FILE " on the card is not the loader that is running.");
+                    ok = false;
+                    break;
+                }
+                ((res_hdr_t *)s_page)->check = 0xffffffffu; // written at the end
+                got_hdr = true;
+            }
+            uint32_t sector = off / FLASH_SECTOR_SIZE;
+            if (!(erased & (1ull << sector))) {
+                erase_sector(RES_OFFSET + sector * FLASH_SECTOR_SIZE);
+                erased |= 1ull << sector;
+            }
+            if (!program_page(RES_OFFSET + off, s_page)) {
+                snprintf(err, err_len, "Flash write failed at 0x%08lx.", (unsigned long)b->target_addr);
+                ok = false;
+                break;
+            }
+            done++;
+            if (progress) {
+                progress(done, want_pages);
+            }
+        }
+    }
+    f_close(&f);
+    if (ok && (!got_hdr || done != want_pages)) {
+        snprintf(err, err_len, LOADER_FILE " has %lu of %lu resource blocks.", (unsigned long)done,
+                 (unsigned long)want_pages);
+        ok = false;
+    }
+    if (ok) { // complete: now the header's check (programming only clears bits, so this works)
+        memcpy(s_page, (const void *)RES_FLASH, 256);
+        ((res_hdr_t *)s_page)->check = s_res_want.check;
+        if (!program_page(RES_OFFSET, s_page)) {
+            snprintf(err, err_len, "Could not finish the resource header.");
+            ok = false;
+        }
+    }
+    s_res_state = -1;
+    if (ok && uf2_res_check() != RES_OK) {
+        snprintf(err, err_len, "The resources in flash failed their check.");
         ok = false;
     }
     return ok;

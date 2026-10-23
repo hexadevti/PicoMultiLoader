@@ -55,12 +55,15 @@ endif()
 add_executable(${LOADER_NAME}
     src/main.c
     src/apps.c
+    src/clock.c
     src/config.c
     src/fileops.c
     src/keyboard.c
     src/lcd.c
     src/look.c
     src/sdcard.c
+    src/shell.c
+    src/viewer.c
     src/uf2_image.c
     src/ui.c
     src/usb_descriptors.c
@@ -108,7 +111,7 @@ if (LOADER_WIFI)
         COMMAND ${CMAKE_COMMAND} -DIN=${INDEX_HTML} -DOUT=${INDEX_H} -P ${CMAKE_CURRENT_LIST_DIR}/embed.cmake
         DEPENDS ${INDEX_HTML} ${CMAKE_CURRENT_LIST_DIR}/embed.cmake
     )
-    target_sources(${LOADER_NAME} PRIVATE src/webserver.c src/dhcpserver.c ${INDEX_H})
+    target_sources(${LOADER_NAME} PRIVATE src/webserver.c src/dhcpserver.c src/timesync.c ${INDEX_H})
     target_include_directories(${LOADER_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_compile_definitions(${LOADER_NAME} PRIVATE CYW43_HOST_NAME="picocalc")
     target_link_libraries(${LOADER_NAME}
@@ -141,6 +144,27 @@ if (PICO_PLATFORM MATCHES "rp2040")
 else()
     # The loader runs from RAM; the boot stub loads it from the SD card.
     pico_set_binary_type(${LOADER_NAME} no_flash)
+
+    # Resources in flash: the Wi-Fi firmware and the web page are linked into the last 256 KB of
+    # flash instead of RAM. The section isn't loaded (INFO); add_res.py appends it to the .uf2 as
+    # blocks the stub skips, and the loader copies them into flash (uf2_image.c).
+    set(RES_BASE 0x103C0000) # the last 256 KB of the Pico 2 W's 4 MB
+    file(READ ${PICO_SDK_PATH}/src/rp2_common/pico_crt0/rp2350/memmap_no_flash.ld memmap)
+    string(REPLACE "SCRATCH_Y(rwx) : ORIGIN = 0x20081000, LENGTH = 4k"
+        "SCRATCH_Y(rwx) : ORIGIN = 0x20081000, LENGTH = 4k\n    PMLRES(r) : ORIGIN = ${RES_BASE}, LENGTH = 256k"
+        memmap "${memmap}")
+    string(REPLACE "SECTIONS\n{"
+        "SECTIONS\n{\n    .pml_res (INFO) : { KEEP(*(.pml_res.0hdr)) KEEP(*(.pml_res*)) } > PMLRES\n"
+        memmap "${memmap}")
+    if (NOT memmap MATCHES "PMLRES[(]r[)]" OR NOT memmap MATCHES "> PMLRES")
+        message(FATAL_ERROR "Could not add the resource section to memmap_no_flash.ld")
+    endif()
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/memmap_pml.ld "${memmap}")
+    pico_set_linker_script(${LOADER_NAME} ${CMAKE_CURRENT_BINARY_DIR}/memmap_pml.ld)
+    target_compile_definitions(${LOADER_NAME} PRIVATE
+        PML_RES_BASE=${RES_BASE}
+        "PML_RES_ATTR=__attribute__((section(\".pml_res.data\"),aligned(4)))"
+        "CYW43_RESOURCE_ATTRIBUTE=__attribute__((section(\".pml_res.fw\"),aligned(4)))")
 
     # Boot stub: the first 8 KB of flash. Its RAM is the scratch banks, so it can load the loader
     # into main RAM.
@@ -208,3 +232,14 @@ pico_enable_stdio_uart(${LOADER_NAME} 1)
 pico_enable_stdio_usb(${LOADER_NAME} 0)
 target_link_options(${LOADER_NAME} PRIVATE -Wl,--print-memory-usage)
 pico_add_extra_outputs(${LOADER_NAME})
+if (NOT PICO_PLATFORM MATCHES "rp2040")
+    # after pico_add_extra_outputs' own POST_BUILD steps, which write the .uf2
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(RES_BIN ${CMAKE_CURRENT_BINARY_DIR}/pml_res.bin)
+    add_custom_command(TARGET ${LOADER_NAME} POST_BUILD
+        COMMAND ${CMAKE_OBJCOPY} --dump-section .pml_res=${RES_BIN} $<TARGET_FILE:${LOADER_NAME}>
+            ${CMAKE_CURRENT_BINARY_DIR}/pml_res_dump.elf
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/add_res.py ${RES_BIN} ${RES_BASE}
+            $<TARGET_FILE_DIR:${LOADER_NAME}>/${LOADER_NAME}.uf2
+        VERBATIM)
+endif()

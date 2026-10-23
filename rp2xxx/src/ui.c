@@ -8,14 +8,17 @@
 #include <strings.h>
 #include "pico/stdlib.h"
 #include "apps.h"
+#include "clock.h"
 #include "config.h"
 #include "fileops.h"
 #include "keyboard.h"
 #include "lcd.h"
 #include "look.h"
 #include "sdcard.h"
+#include "shell.h"
 #include "uf2_image.h"
 #include "usb_drive.h"
+#include "viewer.h"
 #if PICOMULTILOADER_WIFI
 #include "webserver.h"
 #endif
@@ -50,13 +53,25 @@ typedef enum {
     SCREEN_ERROR,
     SCREEN_USB,
     SCREEN_WEB,
-    SCREEN_WIFI,      // F1: Setup (the Wi-Fi network the web server joins, start folder, help)
+    SCREEN_WIFI,      // Setup, from the control center (the Wi-Fi network, start folder, help)
     SCREEN_WIFI_SCAN, // pick a network from a scan
-    SCREEN_HELP,      // how to use the loader (from F1)
-    SCREEN_PICK,      // choose the start folder (from F1)
+    SCREEN_HELP,      // how to use the loader (from Setup)
+    SCREEN_PICK,      // choose the start folder (from Setup)
     SCREEN_FILES,     // Tab: copy / move / delete / paste
     SCREEN_DELETE,    // confirm a delete
+    SCREEN_RES,       // RP2350: confirm installing the Wi-Fi files over an app's data
+    SCREEN_CTL,       // F1: the control center (Wi-Fi, USB drive, backlight, theme, battery)
+    SCREEN_TERM,      // F5: the terminal
+    SCREEN_TEXT,      // the text reader (.txt, .md, ...)
+    SCREEN_IMAGE,     // the BMP viewer
 } screen_t;
+
+// RP2350: the Wi-Fi firmware and the web page live in the last 256 KB of flash (uf2_image.h)
+#if PICOMULTILOADER_WIFI && !PICO_RP2040
+#define PML_RES 1
+#else
+#define PML_RES 0
+#endif
 
 static screen_t s_screen;
 static screen_t s_base; // SCREEN_HOME or SCREEN_BROWSE: where Esc goes back to
@@ -193,7 +208,7 @@ static void scan_dir(void)
     FILINFO fi;
     while (s_count < MAX_ENTRIES && f_readdir(&dir, &fi) == FR_OK && fi.fname[0]) {
         bool dir_entry = (fi.fattrib & AM_DIR) != 0;
-        if (hidden(&fi) || (!dir_entry && !has_uf2_ext(fi.fname))) {
+        if (hidden(&fi) || (!dir_entry && !has_uf2_ext(fi.fname) && view_kind(fi.fname) == VIEW_NONE)) {
             continue;
         }
         entry_t *e = &s_entries[s_count];
@@ -335,9 +350,9 @@ static void draw_header(void)
     lcd_hline(MARGIN - 4, PATH_Y + 16, LCD_W - 2 * (MARGIN - 4), C_LINE);
 }
 
-static const char *const KEY_NAMES[] = {"Enter", "Esc", "Left", "Del", "Tab", "R", "Up/Down", "PgUp/PgDn"};
+static const char *const KEY_NAMES[] = {"Enter", "Esc", "Left", "Del", "Tab", "R", "Up/Down", "Left/Right", "PgUp/PgDn", "Home/End"};
 
-// `keys` is "Enter Open  F1 Setup  Esc Back": items two spaces apart, each a key and what it does.
+// `keys` is "Enter Open  F1 Control  Esc Back": items two spaces apart, each a key and what it does.
 // Function keys get a raised cap; an item that doesn't start with a key is shown as it is.
 static void draw_footer(const char *line1, lcd_color_t line1_color, const char *keys)
 {
@@ -424,7 +439,7 @@ static void draw_browse(void)
         lcd_text(MARGIN, LIST_Y + 4 * ROW_H, "Insert a FAT32 card and press", C_DIM, FONT_LARGE);
         lcd_text(MARGIN, LIST_Y + 5 * ROW_H, "Enter to retry.", C_DIM, FONT_LARGE);
     } else if (n == 0) {
-        lcd_text(MARGIN, LIST_Y + 2 * ROW_H, "No .uf2 files here.", C_DIM, FONT_LARGE);
+        lcd_text(MARGIN, LIST_Y + 2 * ROW_H, "Nothing to open here.", C_DIM, FONT_LARGE);
     }
 
     if (s_sel < s_top) {
@@ -456,7 +471,7 @@ static void draw_browse(void)
             format_size(size, sizeof(size), e->size);
             size_cols = (int)strlen(size) + 1;
             fit(label, e->name, COLS - size_cols - 2);
-            lcd_text(MARGIN, y, label, fg, FONT_LARGE);
+            lcd_text(MARGIN, y, label, sel || has_uf2_ext(e->name) ? fg : C_ACC2, FONT_LARGE); // documents in colour
             lcd_text(LCD_W - MARGIN - 7 * (size_cols - 1), y, size, sel ? C_SEL_FG : C_DIM, FONT_LARGE);
         }
         if (e && e->fav) {
@@ -490,9 +505,9 @@ static void draw_browse(void)
     fit(line, installed, (LCD_W - 2 * MARGIN) / 6);
     draw_footer(line, color,
 #if PICOMULTILOADER_WIFI
-                "Enter Open  Tab Actions  F2 Fav  F3 Home  F4 Web  F5 USB"
+                "Enter Open  Tab Actions  F2 Fav  F3 Home  F4 Web  F5 Term"
 #else
-                "Enter Open  Tab Actions  F2 Fav  F3 Home  F5 USB drive"
+                "Enter Open  Tab Actions  F2 Fav  F3 Home  F5 Terminal"
 #endif
     );
 }
@@ -708,7 +723,7 @@ static void draw_web(void)
             }
         }
         if (st.ap_mode) {
-            draw_wrapped(FOOTER_Y - 3 * ROW_H, "Join this network, or save your own Wi-Fi in Setup (F1) to use that instead.", C_DIM);
+            draw_wrapped(FOOTER_Y - 3 * ROW_H, "Join this network, or save your own Wi-Fi in Setup (F1 > Setup) to use that instead.", C_DIM);
         }
         break;
     case WEB_FAILED:
@@ -737,30 +752,123 @@ static void stop_web(void)
     s_screen = s_base;
 }
 
-static void enter_web(void)
+#if PML_RES
+// ---- the Wi-Fi files --------------------------------------------------------------------------
+static bool s_res_scan; // installing for a network scan (F1), not for the web server (F4)
+
+static void draw_res(void)
+{
+    draw_dialog(128);
+    int y = LIST_Y + 4;
+    lcd_text(MARGIN, y, "Install the Wi-Fi files?", C_WARN, FONT_LARGE);
+    draw_wrapped(y + 2 * ROW_H, "Wi-Fi needs the last 256 KB of flash. The installed app keeps its data there: "
+                 "installing erases it.", C_FG);
+    draw_footer(NULL, C_FG, "Enter Install  Esc Back");
+}
+
+static void draw_progress(size_t done, size_t total);
+
+// Copies the Wi-Fi files from pml2350.uf2 into flash. On failure, shows the error screen.
+static bool res_install(void)
+{
+    char err[80];
+    draw_header();
+    lcd_text(MARGIN, LIST_Y + 4, "Installing the Wi-Fi files...", C_ACCENT, FONT_LARGE);
+    draw_footer(NULL, C_FG, "Do not switch off");
+    lcd_flush();
+    draw_progress(0, 1);
+    if (!uf2_res_install(draw_progress, err, sizeof(err))) {
+        snprintf(s_error, sizeof(s_error), "Could not install the Wi-Fi files: %s", err);
+        strlcpy(s_sel_name, "(Wi-Fi files)", sizeof(s_sel_name));
+        s_screen = SCREEN_ERROR;
+        return false;
+    }
+    return true;
+}
+
+// True if Wi-Fi can start. If not, installs the files when nothing is lost, or asks first.
+static bool res_ensure(bool for_scan)
+{
+    switch (uf2_res_check()) {
+    case RES_OK:
+        return true;
+    case RES_BLANK:
+    case RES_OLD:
+        return res_install();
+    case RES_USED:
+        s_res_scan = for_scan;
+        s_screen = SCREEN_RES;
+        return false;
+    default:
+        snprintf(s_error, sizeof(s_error), "This pml2350.uf2 was built without the Wi-Fi files. "
+                 "Copy a release build to the SD card.");
+        strlcpy(s_sel_name, "(Wi-Fi files)", sizeof(s_sel_name));
+        s_screen = SCREEN_ERROR;
+        return false;
+    }
+}
+
+static void wifi_scan(void);
+static void enter_web(void);
+
+static bool res_key(int key)
+{
+    if (key == KEY_ENTER) {
+        if (res_install()) {
+            if (s_res_scan) {
+                s_screen = SCREEN_WIFI;
+                wifi_scan();
+            } else {
+                enter_web();
+            }
+        }
+        return true;
+    }
+    if (key == KEY_ESC || key == KEY_BACKSPACE || key == KEY_LEFT) {
+        s_screen = s_res_scan ? SCREEN_WIFI : s_base;
+        return true;
+    }
+    return false;
+}
+#endif
+
+// Start the web server in the background. False if it can't (an error or install screen is shown).
+static bool web_start(void)
 {
     if (!s_sd_ok) {
         snprintf(s_error, sizeof(s_error), "Insert an SD card first.");
         strlcpy(s_sel_name, "(SD card)", sizeof(s_sel_name));
         s_screen = SCREEN_ERROR;
-        return;
+        return false;
     }
+#if PML_RES
+    if (!res_ensure(false)) {
+        return false;
+    }
+#endif
     s_web_changes_seen = webserver_changes();
     if (!webserver_start()) {
         snprintf(s_error, sizeof(s_error), "Could not start the web server: the Wi-Fi chip did not start.");
         strlcpy(s_sel_name, "(web server)", sizeof(s_sel_name));
         s_screen = SCREEN_ERROR;
-        return;
+        return false;
     }
-    s_screen = SCREEN_WEB;
+    return true;
+}
+
+static void enter_web(void)
+{
+    if (web_start()) {
+        s_screen = SCREEN_WEB;
+    }
 }
 #endif
 
-// ---- Setup (F1) -------------------------------------------------------------------------------
+// ---- Setup (F1 > Setup) -------------------------------------------------------------------------------
 #if PICOMULTILOADER_WIFI
-enum { WF_SSID, WF_PASS, WF_SHOW, WF_SCAN, WF_SAVE, WF_FORGET, WF_AUTO, WF_START, WF_THEME, WF_HELP, WF_ROWS };
+enum { WF_SSID, WF_PASS, WF_SHOW, WF_SCAN, WF_SAVE, WF_FORGET, WF_AUTO, WF_START, WF_TZ, WF_HELP, WF_ROWS };
 #else
-enum { WF_START, WF_THEME, WF_HELP, WF_ROWS };
+enum { WF_START, WF_HELP, WF_ROWS };
 #endif
 #define WF_ROW_H   17
 #define WF_FIELD_X (MARGIN + 74)
@@ -801,9 +909,9 @@ static const char *const HELP_TEXT[] = {
     "Enter: run the app. The installed one (green dot) starts at once; any other is flashed first.",
     "F2: add to or remove from Favourites (yellow star). F3: Files.",
 #if PICOMULTILOADER_WIFI
-    "F1: Setup and this help. F4: web file manager. F5: USB drive mode.",
+    "F1: control center (Wi-Fi, USB drive, backlight, theme, Setup and this help). F4: web file manager. F5: terminal.",
 #else
-    "F1: Setup and this help. F5: USB drive mode.",
+    "F1: control center (USB drive, backlight, theme, Setup and this help). F5: terminal.",
 #endif
     "No card? Insert a FAT32 card and press Enter.",
     "",
@@ -816,7 +924,15 @@ static const char *const HELP_TEXT[] = {
     "Up/Down, PgUp/PgDn, Home/End: move. Enter or Right: open a folder, or show a .uf2 file's details; Enter there "
     "flashes and runs it (or just runs it if it is installed; R reflashes).",
     "Backspace or Left: parent folder; at the top, back to Home. Esc or F3: Home. F2: favourite.",
-    "Only folders and .uf2 files are listed. The last folder and file are remembered.",
+    "Folders, .uf2 files and files the viewers open are listed (those in another colour). The last folder and file are remembered.",
+    "",
+    "#Text reader and image viewer",
+    "Enter on a .txt, .md, .log, .ini, .csv, .py or .bas file reads it in pages: Up/Down or PgUp/PgDn turn them, "
+    "Home/End go to the first and last. Markdown headings are shown in colour.",
+    "Enter on a .bmp shows it on the whole screen, scaled to fit (uncompressed 1, 4, 8, 16, 24 or 32 bits). "
+    "Pictures with up to 16 colours are shown as they are; others are dithered. G: grey. Left/Right: the previous "
+    "or next picture in the folder. Esc: back.",
+    "In the terminal, view <file> opens them too.",
     "",
     "#Copy, move and delete (Tab)",
     "Tab opens a menu for the selected file or folder: Copy, Cut (to move it), Paste and Delete.",
@@ -850,7 +966,31 @@ static const char *const HELP_TEXT[] = {
     "RAM-only (no_flash) apps are not supported. The installed app keeps working after a restart.",
     "Each file is checked before flashing; an unsuitable one shows why.",
     "",
-    "#Setup (F1)",
+    "#Control center (F1)",
+#if PICOMULTILOADER_WIFI
+    "Wi-Fi: Enter turns Wi-Fi and the web server on or off; the address is shown below it.",
+#endif
+    "USB drive: Enter starts USB drive mode. Backlight: Left/Right. Theme: Left/Right or Enter; your own .pal files go in " THEME_DIR ".",
+    "Idle screen: after that long without a key, the clock and date over a moving pattern, with the backlight dimmed. "
+    "Any key wakes it up, and does nothing else. Until the time is known it shows how long the loader has been on.",
+    "Setup: the settings below. The battery charge is at the bottom. Esc or F1 closes it.",
+    "",
+#if PICOMULTILOADER_WIFI
+    "#Date and time",
+    "There is no clock chip: while Wi-Fi is on and joined to your network, the loader asks ip-api.com for the time and "
+    "the time zone of your connection (summer time included), then every 6 hours. It is lost when an app runs or the power goes off.",
+    "Terminal: date shows it. tz +01:00 sets the time zone by hand; tz auto goes back to the one from the web.",
+    "Files the loader writes (uploads, screenshots) get the date once it is known.",
+    "",
+#endif
+    "#Screenshots (F10)",
+    "Shift+F5 (F10) saves the screen as a picture in " SHOT_DIR " on the SD card: shot-001.bmp, shot-002.bmp, ...",
+    "",
+    "#Messages from apps",
+    "An app can leave a message for the loader: the first line of " PML_DIR "/exit.txt is shown when the menu opens, then the "
+    "file is deleted. Or set watchdog scratch[2] to 0x504D4C58 and scratch[3] to an exit code before rebooting.",
+    "",
+    "#Setup (F1 > Setup)",
 #if PICOMULTILOADER_WIFI
     "Type the network name and password, or choose Scan for networks and pick one.",
     "Up/Down or Tab: move. Backspace: delete. Enter: select.",
@@ -861,6 +1001,9 @@ static const char *const HELP_TEXT[] = {
     "Up/Down: move. Enter: select. Settings are kept in picomultiloader.cfg on the SD card.",
 #endif
     "Start folder: the folder Files (F3) opens in at switch-on. Choose one, or Remember the last folder (the default).",
+#if PICOMULTILOADER_WIFI
+    "Time zone: Left/Right. auto (the default) takes it from the web with the time; or pick an offset from UTC (no summer time change then).",
+#endif
     "",
 #if PICOMULTILOADER_WIFI
     "#Web file manager (F4)",
@@ -872,7 +1015,17 @@ static const char *const HELP_TEXT[] = {
     "F4 shows the server screen again; F4 there stops it. Flashing a file or USB drive mode stops it too.",
     "",
 #endif
-    "#USB drive mode (F5)",
+    "#Terminal (F5)",
+    "Type commands, Enter runs them: help lists them all. ls, cd, cat and pwd work on the SD card; run starts an app or a .uf2; "
+    "apps, recent, fav, theme, date, tz, battery, free, df, about and more.",
+#if PICOMULTILOADER_WIFI
+    "wifi on / wifi off start and stop the web server; ip shows its address.",
+#endif
+    "Tab completes a command or a file name. Up/Down: earlier commands. PgUp/PgDn: scroll. Esc clears the line; "
+    "Esc on an empty line, F5 or exit closes the terminal.",
+    "Everything it prints also goes to the serial console, and you can type the commands there too.",
+    "",
+    "#USB drive mode (F1 > USB drive)",
     "Shows the SD card on a PC as a USB drive. Needs a cable on the Pico's micro-USB port; the PicoCalc's USB-C port is serial only.",
     "Eject the drive on the PC when done: the loader takes the card back by itself. Esc also leaves, but only press it after ejecting.",
 #if PICOMULTILOADER_WIFI
@@ -880,7 +1033,7 @@ static const char *const HELP_TEXT[] = {
 #endif
     "",
     "#Serial console",
-    "115200 baud on the PicoCalc's USB-C port. Arrows, Enter, Tab, Backspace, Del, Esc, F1-F5 and typing work like the PicoCalc keyboard.",
+    "115200 baud on the PicoCalc's USB-C port. Arrows, Enter, Tab, Backspace, Del, Esc, F1-F5 and typing work like the PicoCalc keyboard. Ctrl+P dumps the screen.",
     "",
     "#This help",
     "Up/Down: scroll. PgUp/PgDn: page. Home/End: top/bottom. Esc: back.",
@@ -1238,16 +1391,48 @@ static void draw_start_option(int y)
     draw_option(y, start, s_wf_row == WF_START);
 }
 
-#define THEME_HINT "Enter: the next colour theme. Your own .pal files go in " THEME_DIR "."
+#if PICOMULTILOADER_WIFI
+// Time zone choices: auto (from the web), then the UTC offsets in use
+static const char *const TZ_OPTS[] = {
+    "auto", "-12:00", "-11:00", "-10:00", "-09:30", "-09:00", "-08:00", "-07:00", "-06:00", "-05:00", "-04:00",
+    "-03:30", "-03:00", "-02:00", "-01:00", "+00:00", "+01:00", "+02:00", "+03:00", "+03:30", "+04:00", "+04:30",
+    "+05:00", "+05:30", "+05:45", "+06:00", "+06:30", "+07:00", "+08:00", "+08:45", "+09:00", "+09:30", "+10:00",
+    "+10:30", "+11:00", "+12:00", "+12:45", "+13:00", "+14:00",
+};
+#define TZ_COUNT ((int)(sizeof(TZ_OPTS) / sizeof(TZ_OPTS[0])))
 
-static void draw_theme_option(int y)
+static int tz_opt(void)
 {
-    char buf[40];
-    snprintf(buf, sizeof(buf), "Theme: %s", theme_name());
-    draw_option(y, buf, s_wf_row == WF_THEME);
+    char v[16];
+    if (load_setting("tz", v, sizeof(v)) && v[0]) {
+        for (int i = 1; i < TZ_COUNT; i++) {
+            if (strcmp(v, TZ_OPTS[i]) == 0) {
+                return i;
+            }
+        }
+    }
+    return 0;
 }
 
-#if PICOMULTILOADER_WIFI
+static void set_tz(int step)
+{
+    int i = (tz_opt() + step + TZ_COUNT) % TZ_COUNT;
+    clock_set_setting(TZ_OPTS[i]);
+}
+
+static void draw_tz_option(int y)
+{
+    char text[COLS + 1], buf[80];
+    if (tz_opt() == 0) {
+        snprintf(buf, sizeof(buf), "Time zone: < auto%s%s%s >", clock_known() ? " (" : "",
+                 clock_known() ? clock_zone_name() : "", clock_known() ? ")" : "");
+    } else {
+        snprintf(buf, sizeof(buf), "Time zone: < %s >", clock_zone_name());
+    }
+    fit(text, buf, COLS);
+    draw_option(y, text, s_wf_row == WF_TZ);
+}
+
 static void draw_field(int y, const char *label, const char *text, bool masked, bool sel)
 {
     lcd_text(MARGIN, y, label, sel ? C_ACCENT : C_DIM, FONT_LARGE);
@@ -1291,19 +1476,21 @@ static void draw_wifi(void)
     y += WF_ROW_H;
     draw_start_option(y);
     y += WF_ROW_H;
-    draw_theme_option(y);
+    draw_tz_option(y);
     y += WF_ROW_H;
     draw_option(y, "Help: how to use the loader", s_wf_row == WF_HELP);
     y += WF_ROW_H + 4;
-    lcd_text(MARGIN, y, s_wf_msg, s_wf_msg_color, FONT_LARGE);
-    y += ROW_H + 2;
-    draw_wrapped(y, s_wf_row <= WF_PASS    ? "Type to edit, Backspace deletes. 2.4 GHz networks only."
-                    : s_wf_row == WF_HELP ? "Keys, flashing, Wi-Fi, web and USB drive mode explained."
-                    : s_wf_row == WF_START ? "The folder Files (F3) opens in when you switch on."
-                    : s_wf_row == WF_AUTO  ? "ON: the web file manager starts by itself at switch-on."
-                    : s_wf_row == WF_THEME ? THEME_HINT
-                                          : "F4 joins this network and starts the web file manager.",
-                 C_DIM);
+    if (s_wf_msg[0]) { // the last result, else a hint for the row (no room for both)
+        lcd_text(MARGIN, y, s_wf_msg, s_wf_msg_color, FONT_LARGE);
+    } else {
+        draw_wrapped(y, s_wf_row <= WF_PASS    ? "Type to edit, Backspace deletes. 2.4 GHz networks only."
+                        : s_wf_row == WF_HELP ? "Keys, flashing, Wi-Fi, web and USB drive mode explained."
+                        : s_wf_row == WF_START ? "The folder Files (F3) opens in when you switch on."
+                        : s_wf_row == WF_TZ    ? "Left/Right: auto takes it from the web (summer time included), or pick an offset from UTC."
+                        : s_wf_row == WF_AUTO  ? "ON: the web file manager starts by itself at switch-on."
+                                              : "F4 joins this network and starts the web file manager.",
+                     C_DIM);
+    }
     draw_footer(NULL, C_FG, s_wf_dirty ? "Up/Down Move  Enter Select  Esc Discard"
                                        : "Up/Down Move  Enter Select  Esc Back");
 }
@@ -1350,6 +1537,12 @@ static void wifi_scan(void)
         wf_message("Stop the web server (F4) to scan.", C_ERR);
         return;
     }
+#if PML_RES
+    if (!res_ensure(true)) {
+        return;
+    }
+    s_screen = SCREEN_WIFI; // an install may have shown its progress
+#endif
     wf_message("Scanning...", C_FG);
     draw_wifi();
     lcd_flush();
@@ -1388,14 +1581,11 @@ static void draw_wifi(void)
     y += WF_ROW_H + 3;
     draw_start_option(y);
     y += WF_ROW_H;
-    draw_theme_option(y);
-    y += WF_ROW_H;
     draw_option(y, "Help: how to use the loader", s_wf_row == WF_HELP);
     y += WF_ROW_H + 4;
     lcd_text(MARGIN, y, s_wf_msg, s_wf_msg_color, FONT_LARGE);
     y += ROW_H + 2;
     draw_wrapped(y, s_wf_row == WF_HELP    ? "Keys, flashing and USB drive mode explained."
-                    : s_wf_row == WF_THEME ? THEME_HINT
                                            : "The folder Files (F3) opens in when you switch on.",
                  C_DIM);
     draw_footer(NULL, C_FG, "Up/Down Move  Enter Select  Esc Back");
@@ -1421,11 +1611,22 @@ static bool wifi_key(int key)
     switch (key) {
     case KEY_UP:
         s_wf_row = (s_wf_row + WF_ROWS - 1) % WF_ROWS;
+        s_wf_msg[0] = '\0';
         return true;
     case KEY_DOWN:
     case KEY_TAB:
         s_wf_row = (s_wf_row + 1) % WF_ROWS;
+        s_wf_msg[0] = '\0';
         return true;
+#if PICOMULTILOADER_WIFI
+    case KEY_LEFT:
+    case KEY_RIGHT:
+        if (s_wf_row != WF_TZ) {
+            return false;
+        }
+        set_tz(key == KEY_RIGHT ? 1 : -1);
+        return true;
+#endif
     case KEY_HOME:
         s_wf_row = 0;
         return true;
@@ -1442,6 +1643,8 @@ static bool wifi_key(int key)
         return true;
 #endif
     case KEY_ESC:
+        s_screen = SCREEN_CTL;
+        return true;
     case KEY_F1:
         s_screen = s_base;
         return true;
@@ -1484,13 +1687,11 @@ static bool wifi_key(int key)
     case WF_START:
         enter_pick();
         break;
-    case WF_THEME: {
-        char next[24];
-        theme_next(next, sizeof(next));
-        theme_load(next);
-        save_setting("theme", theme_name());
+#if PICOMULTILOADER_WIFI
+    case WF_TZ:
+        set_tz(1);
         break;
-    }
+#endif
     case WF_HELP:
         enter_help();
         break;
@@ -2164,9 +2365,9 @@ static void draw_home(void)
     fit(line, buf, (LCD_W - 2 * MARGIN) / 6);
     draw_footer(line, color,
 #if PICOMULTILOADER_WIFI
-                "Enter Run  F1 Setup  F2 Fav  F3 Files  F4 Web  F5 USB"
+                "Enter Run  F1 Control  F2 Fav  F3 Files  F4 Web  F5 Term"
 #else
-                "Enter Run  F1 Setup  F2 Fav  F3 Files  F5 USB drive"
+                "Enter Run  F1 Control  F2 Fav  F3 Files  F5 Terminal"
 #endif
     );
 }
@@ -2243,7 +2444,9 @@ static void home_fav(void)
 static void browse_fav(void)
 {
     entry_t *e = selected_entry(); // fills s_fa_path
-    if (e) {
+    if (e && !e->is_dir && !has_uf2_ext(e->name)) {
+        toast("Only apps can be favourites");
+    } else if (e) {
         int r = apps_toggle_fav(s_fa_path);
         fav_toast(r);
         e->fav = apps_is_fav(s_fa_path);
@@ -2253,6 +2456,15 @@ static void browse_fav(void)
 #if PICOMULTILOADER_WIFI
 static void web_key(void) // F4
 {
+#if PML_RES
+    if (!uf2_res_ready()) { // the Wi-Fi files first: install them, or ask
+        if (web_running()) {
+            stop_web(); // it failed for the lack of them
+        }
+        enter_web();
+        return;
+    }
+#endif
     if (web_running()) {
         s_screen = SCREEN_WEB; // already on in the background
     } else {
@@ -2260,6 +2472,1004 @@ static void web_key(void) // F4
     }
 }
 #endif
+
+// ---- control center (F1) ----------------------------------------------------------------------
+// A panel over the dimmed Home or file list: one row per setting, the battery at the bottom.
+enum { CC_WIFI, CC_USB, CC_LIGHT, CC_IDLE, CC_THEME, CC_SETUP, CC_ROWS };
+#define CC_FIRST   (PICOMULTILOADER_WIFI ? CC_WIFI : CC_USB)
+#define CC_X       26
+#define CC_Y       34
+#define CC_W       (LCD_W - 2 * CC_X)
+#define CC_H       (FOOTER_Y - 4 - CC_Y)
+#define CC_ROW     22
+#define CC_VAL_X   (CC_X + 110)
+#define CC_BAR_W   70
+#define LIGHT_STEP 25
+#define LIGHT_MAX  250
+#define LIGHT_DEF  200
+
+static int s_cc_row = CC_FIRST;
+static int s_light; // backlight level, 0 = not read from the settings yet
+
+static const uint8_t IDLE_MINUTES[] = {0, 1, 2, 5, 10, 30}; // 0 = never
+#define IDLE_OPTS ((int)sizeof(IDLE_MINUTES))
+#define IDLE_DEF  3 // 5 minutes
+static int s_idle_opt = -1; // index into IDLE_MINUTES, -1 = not read from the settings yet
+
+static int idle_opt(void)
+{
+    if (s_idle_opt < 0) {
+        char buf[8];
+        int minutes = load_setting("idle", buf, sizeof(buf)) ? atoi(buf) : IDLE_MINUTES[IDLE_DEF];
+        s_idle_opt = IDLE_DEF;
+        for (int i = 0; i < IDLE_OPTS; i++) {
+            if (IDLE_MINUTES[i] == minutes) {
+                s_idle_opt = i;
+            }
+        }
+    }
+    return s_idle_opt;
+}
+
+static void set_idle(int opt)
+{
+    s_idle_opt = (opt + IDLE_OPTS) % IDLE_OPTS;
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d", IDLE_MINUTES[s_idle_opt]);
+    save_setting("idle", buf);
+}
+
+uint8_t ui_backlight(void)
+{
+    if (!s_light) {
+        char buf[8];
+        s_light = load_setting("backlight", buf, sizeof(buf)) ? atoi(buf) : LIGHT_DEF;
+        s_light = s_light < LIGHT_STEP ? LIGHT_STEP : s_light > LIGHT_MAX ? LIGHT_MAX : s_light;
+    }
+    return (uint8_t)s_light;
+}
+
+static void set_backlight(int level)
+{
+    s_light = level < LIGHT_STEP ? LIGHT_STEP : level > LIGHT_MAX ? LIGHT_MAX : level;
+    if (kbd_present()) {
+        kbd_set_lcd_backlight((uint8_t)s_light);
+    }
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d", s_light);
+    save_setting("backlight", buf);
+}
+
+static void next_theme(void)
+{
+    char next[24];
+    theme_next(next, sizeof(next));
+    theme_load(next);
+    save_setting("theme", theme_name());
+}
+
+static void enter_ctl(void)
+{
+    ui_backlight();
+    s_screen = SCREEN_CTL;
+}
+
+static void draw_meter(int x, int y, int pct, lcd_color_t color)
+{
+    look_frame(x, y + 2, CC_BAR_W, 9, C_LINE);
+    lcd_fill_rect(x + 2, y + 4, (CC_BAR_W - 4) * pct / 100, 5, color);
+}
+
+static void draw_ctl(void)
+{
+    if (s_base == SCREEN_HOME) {
+        draw_home();
+    } else {
+        draw_browse();
+    }
+    look_dither(BAR_H + 1, LCD_H - BAR_H - 1);
+    lcd_fill_rect(CC_X, CC_Y, CC_W, CC_H, C_PANEL);
+    look_frame(CC_X, CC_Y, CC_W, CC_H, C_LINE);
+    look_stripes(CC_X + 1, CC_Y + 1, CC_W - 2, 3);
+    lcd_text(CC_X + 12, CC_Y + 12, "Control center", C_ACCENT, FONT_LARGE);
+
+    char hint[(CC_W - 24) / 6 + 1] = "", buf[64];
+#if PICOMULTILOADER_WIFI
+    web_status_t st;
+    s_web_rev_shown = webserver_status(&st); // web_tick() redraws when it changes
+    s_web_drawn_us = time_us_64();
+#endif
+    int y = CC_Y + 40;
+    for (int r = CC_FIRST; r < CC_ROWS; r++, y += CC_ROW) {
+        bool sel = r == s_cc_row;
+        if (sel) {
+            lcd_fill_rect(CC_X + 6, y - 4, CC_W - 12, CC_ROW - 2, C_SEL_BG);
+        }
+        lcd_color_t fg = sel ? C_SEL_FG : C_FG, dim = sel ? C_SEL_FG : C_DIM;
+        static const char *const LABELS[CC_ROWS] = {"Wi-Fi", "USB drive", "Backlight", "Idle screen", "Theme", "Setup"};
+        lcd_text(CC_X + 14, y, LABELS[r], fg, FONT_LARGE);
+        const char *h = "";
+        switch (r) {
+#if PICOMULTILOADER_WIFI
+        case CC_WIFI: {
+            const char *state = "Off";
+            lcd_color_t color = dim;
+            h = "Enter: Wi-Fi and the web server on";
+            switch (st.state) {
+            case WEB_OFF:
+                break;
+            case WEB_STARTING:
+            case WEB_CONNECTING:
+                state = "Starting...";
+                color = sel ? fg : C_ACCENT;
+                h = st.ssid[0] ? st.ssid : "Starting Wi-Fi...";
+                break;
+            case WEB_RUNNING:
+                state = st.ip[0] ? "On" : "Reconnecting";
+                color = sel ? fg : st.ip[0] ? C_OK : C_WARN;
+                snprintf(buf, sizeof(buf), "http://%s/  %s", st.ip, st.ssid);
+                h = st.ip[0] ? buf : st.ssid;
+                break;
+            default:
+                state = "Failed";
+                color = sel ? fg : C_ERR;
+                h = st.error;
+                break;
+            }
+            lcd_text(CC_VAL_X, y, state, color, FONT_LARGE);
+            break;
+        }
+#endif
+        case CC_USB:
+            lcd_text(CC_VAL_X, y, "Off  >", dim, FONT_LARGE);
+            h = "Enter: the SD card as a drive on a PC";
+            break;
+        case CC_LIGHT:
+            draw_meter(CC_VAL_X, y, s_light * 100 / LIGHT_MAX, sel ? C_SEL_FG : C_ACCENT);
+            snprintf(buf, sizeof(buf), "%d%%", s_light * 100 / LIGHT_MAX);
+            lcd_text(CC_VAL_X + CC_BAR_W + 6, y, buf, fg, FONT_LARGE);
+            h = "Left/Right: dimmer or brighter";
+            break;
+        case CC_IDLE:
+            if (IDLE_MINUTES[idle_opt()]) {
+                snprintf(buf, sizeof(buf), "< %d min >", IDLE_MINUTES[idle_opt()]);
+            } else {
+                strlcpy(buf, "< Never >", sizeof(buf));
+            }
+            lcd_text(CC_VAL_X, y, buf, fg, FONT_LARGE);
+            h = "A clock, and the backlight dimmed";
+            break;
+        case CC_THEME: {
+            char name[(CC_W - 110 - 14 - 28) / 7 + 1];
+            fit(name, theme_name(), sizeof(name) - 1);
+            snprintf(buf, sizeof(buf), "< %s >", name);
+            lcd_text(CC_VAL_X, y, buf, fg, FONT_LARGE);
+            h = "Own .pal files go in " THEME_DIR;
+            break;
+        }
+        case CC_SETUP:
+            lcd_text(CC_VAL_X, y, ">", dim, FONT_LARGE);
+#if PICOMULTILOADER_WIFI
+            h = "Wi-Fi network, start folder, help";
+#else
+            h = "Start folder, help";
+#endif
+            break;
+        }
+        if (sel) {
+            fit(hint, h, sizeof(hint) - 1);
+        }
+    }
+
+    y += 6;
+    lcd_hline(CC_X + 6, y, CC_W - 12, C_LINE);
+    y += 10;
+    lcd_text(CC_X + 14, y, "Battery", C_FG, FONT_LARGE);
+    if (s_battery >= 0) {
+        draw_meter(CC_VAL_X, y, s_battery, s_charging ? C_OK : s_battery < 15 ? C_ERR : C_FG);
+        snprintf(buf, sizeof(buf), s_charging ? "%d%% +" : "%d%%", s_battery);
+        lcd_text(CC_VAL_X + CC_BAR_W + 6, y, buf, C_FG, FONT_LARGE);
+    } else {
+        lcd_text(CC_VAL_X, y, "unknown", C_DIM, FONT_LARGE);
+    }
+    lcd_text(CC_X + 12, CC_Y + CC_H - 16, hint, C_DIM, FONT_SMALL);
+    draw_footer(NULL, C_FG, "Up/Down Move  Left/Right Change  Esc Close");
+}
+
+#if PICOMULTILOADER_WIFI
+static void ctl_wifi(void)
+{
+    if (web_running()) {
+        draw_footer(NULL, C_FG, "Stopping...");
+        lcd_flush();
+        stop_web();
+        s_screen = SCREEN_CTL;
+    } else if (web_start()) {
+        s_screen = SCREEN_CTL; // it starts in the background: the row shows how it goes
+    }
+}
+#endif
+
+static void enter_term(void);
+
+static bool ctl_key(int key)
+{
+    int dir = key == KEY_LEFT ? -1 : key == KEY_RIGHT || key == KEY_ENTER ? 1 : 0;
+    switch (key) {
+    case KEY_UP:
+        s_cc_row = s_cc_row > CC_FIRST ? s_cc_row - 1 : CC_ROWS - 1;
+        return true;
+    case KEY_DOWN:
+    case KEY_TAB:
+        s_cc_row = s_cc_row + 1 < CC_ROWS ? s_cc_row + 1 : CC_FIRST;
+        return true;
+    case KEY_ESC:
+    case KEY_BACKSPACE:
+    case KEY_F1:
+        s_screen = s_base;
+        return true;
+    case KEY_F5:
+        enter_term();
+        return true;
+    case KEY_LEFT:
+    case KEY_RIGHT:
+    case KEY_ENTER:
+        break;
+    default:
+        return false;
+    }
+    switch (s_cc_row) {
+#if PICOMULTILOADER_WIFI
+    case CC_WIFI:
+        if (key == KEY_ENTER || (dir > 0) != web_running()) {
+            ctl_wifi();
+        }
+        break;
+#endif
+    case CC_USB:
+        if (key == KEY_ENTER) {
+            enter_usb();
+        }
+        break;
+    case CC_LIGHT:
+        if (key == KEY_ENTER) { // steps up, then round to the dimmest
+            set_backlight(s_light >= LIGHT_MAX ? LIGHT_STEP : s_light + LIGHT_STEP);
+        } else {
+            set_backlight(s_light + dir * LIGHT_STEP);
+        }
+        break;
+    case CC_IDLE:
+        set_idle(idle_opt() + dir);
+        break;
+    case CC_THEME:
+        next_theme();
+        break;
+    case CC_SETUP:
+        if (key != KEY_LEFT) {
+            enter_wifi();
+        }
+        break;
+    }
+    return true;
+}
+
+// ---- terminal (F5) ----------------------------------------------------------------------------
+// Output scrolls up from the bottom; the line being typed is in the footer. Everything printed also
+// goes to the serial console, and the console's typing reaches here as keys.
+#define TERM_X     4
+#define TERM_COLS  ((LCD_W - 2 * TERM_X) / 6)
+#define TERM_Y     (BAR_H + 4)
+#define TERM_LH    10
+#define TERM_ROWS  ((FOOTER_Y - 2 - TERM_Y) / TERM_LH)
+#define TERM_LINES 80 // kept for scrolling back
+#define TERM_IN    96
+#define TERM_HIST  8
+
+static char s_term[TERM_LINES][TERM_COLS + 1]; // a ring: line i is s_term[i % TERM_LINES]
+static uint8_t s_term_err[TERM_LINES];
+static int s_term_n, s_term_back; // lines written; lines scrolled back
+static char s_term_in[TERM_IN];
+static char s_hist[TERM_HIST][TERM_IN];
+static int s_hist_n, s_hist_at; // commands kept; the one recalled (s_hist_n = the new line)
+static bool s_term_started;
+
+static void term_line(const char *text, size_t n, uint8_t kind)
+{
+    int i = s_term_n++ % TERM_LINES;
+    memcpy(s_term[i], text, n);
+    s_term[i][n] = '\0';
+    s_term_err[i] = kind;
+}
+
+// kind: 0 output, 1 error, 2 the command typed
+static void term_put(const char *text, uint8_t kind)
+{
+    printf("%s\n", text);
+    s_term_back = 0;
+    size_t len = strlen(text);
+    do { // wrap at the last space that fits
+        size_t n = len > TERM_COLS ? TERM_COLS : len;
+        if (n < len) {
+            size_t sp = n;
+            while (sp > 0 && text[sp] != ' ') {
+                sp--;
+            }
+            n = sp > 0 ? sp : n;
+        }
+        term_line(text, n, kind);
+        text += n;
+        len -= n;
+        while (*text == ' ') {
+            text++;
+            len--;
+        }
+    } while (len);
+}
+
+static void term_out(const char *text, bool error)
+{
+    term_put(text, error);
+}
+
+static void term_prompt(char *out, size_t len)
+{
+    snprintf(out, len, "SD%s> ", sd_path(shell_cwd()));
+}
+
+static void enter_term(void)
+{
+    if (!s_term_started) {
+        s_term_started = true;
+        term_put("PicoMultiLoader terminal. help lists the commands; F5 or exit closes it.", 0);
+    }
+    s_hist_at = s_hist_n;
+    s_screen = SCREEN_TERM;
+}
+
+static void draw_term(void)
+{
+    draw_bar();
+    int rows = TERM_ROWS, kept = s_term_n < TERM_LINES ? s_term_n : TERM_LINES;
+    int max_back = kept > rows ? kept - rows : 0;
+    s_term_back = s_term_back > max_back ? max_back : s_term_back;
+    int last = s_term_n - s_term_back; // one past the bottom line shown
+    for (int r = 0; r < rows; r++) {
+        int k = last - rows + r;
+        if (k < 0 || k < s_term_n - kept) {
+            continue;
+        }
+        int i = k % TERM_LINES;
+        lcd_color_t color = s_term_err[i] == 1 ? C_ERR : s_term_err[i] == 2 ? C_ACCENT : C_FG;
+        lcd_text(TERM_X, TERM_Y + r * TERM_LH, s_term[i], color, FONT_SMALL);
+    }
+    if (s_term_back) {
+        lcd_fill_rect(LCD_W - 3, TERM_Y + (rows * TERM_LH) * (max_back - s_term_back) / (max_back + 1), 2, 8, C_DIM);
+    }
+    char line[TERM_IN + PATH_MAX_LEN + 8], shown[TERM_COLS + 1];
+    term_prompt(line, sizeof(line));
+    strlcat(line, s_term_in, sizeof(line));
+    strlcat(line, "_", sizeof(line));
+    size_t n = strlen(line), cols = (LCD_W - 2 * MARGIN) / 6;
+    strlcpy(shown, n > cols ? line + n - cols : line, sizeof(shown)); // keep the end in view
+    draw_footer(shown, C_BRIGHT, "Enter Run  Tab Complete  Up/Down History  Esc Clear");
+}
+
+static void term_history(void)
+{
+    for (int i = 0; i < s_hist_n; i++) {
+        char buf[TERM_IN + 16];
+        snprintf(buf, sizeof(buf), "%3d  %.*s", i + 1, TERM_IN - 1, s_hist[i]);
+        term_put(buf, 0);
+    }
+}
+
+static void term_remember(const char *cmd)
+{
+    if (!cmd[0] || (s_hist_n && strcmp(s_hist[s_hist_n - 1], cmd) == 0)) {
+        return;
+    }
+    if (s_hist_n == TERM_HIST) {
+        memmove(s_hist[0], s_hist[1], sizeof(s_hist[0]) * (TERM_HIST - 1));
+        s_hist_n--;
+    }
+    strlcpy(s_hist[s_hist_n++], cmd, sizeof(s_hist[0]));
+}
+
+// Home's apps (Home shows them from now on, if the file list was under the terminal).
+static void term_apps(void)
+{
+    if (s_base != SCREEN_HOME) {
+        go_home();
+        s_screen = SCREEN_TERM;
+    }
+}
+
+static void term_list_apps(void)
+{
+    term_apps();
+    for (int i = 0; i < s_apps.count; i++) {
+        const app_t *e = &s_apps.list[i];
+        char buf[TERM_COLS + 1];
+        snprintf(buf, sizeof(buf), "%-20.20s %s%s", apps_str(&s_apps, e->title), apps_str(&s_apps, e->path),
+                 i == s_running ? "  (installed)" : "");
+        term_put(buf, 0);
+    }
+    if (!s_apps.count) {
+        term_put(s_sd_ok ? "No apps on the card." : "No SD card.", !s_sd_ok);
+    }
+}
+
+// run <app>: an app's name from Home, or a .uf2 file. Goes to the confirm screen.
+static void term_run(const char *what)
+{
+    term_apps();
+    const app_t *found = NULL;
+    for (int i = 0; i < s_apps.count && !found; i++) {
+        if (strcasecmp(apps_str(&s_apps, s_apps.list[i].title), what) == 0) {
+            found = &s_apps.list[i];
+        }
+    }
+    if (found && apps_binary_path(&s_apps, found, s_sel_path, sizeof(s_sel_path))) {
+        // the app's .uf2
+    } else if (!shell_resolve(s_sel_path, sizeof(s_sel_path), what) || !has_uf2_ext(s_sel_path) ||
+               !fileops_exists(s_sel_path)) {
+        char buf[TERM_IN + 40];
+        snprintf(buf, sizeof(buf), found ? "run: %s has no single .uf2 to run" : "run: no app or .uf2 called %s", what);
+        term_put(buf, 1);
+        return;
+    }
+    strlcpy(s_sel_name, strrchr(s_sel_path, '/') + 1, sizeof(s_sel_name));
+    inspect_file(); // the confirm screen (Enter runs), or the error screen
+}
+
+#if PICOMULTILOADER_WIFI
+static void term_wifi(int argc, char **argv)
+{
+    char *ip[] = {"ip"};
+    if (argc < 2) {
+        shell_run(1, ip, term_out);
+    } else if (strcasecmp(argv[1], "on") == 0) {
+        if (web_running()) {
+            term_put("Wi-Fi is on already.", 0);
+        } else if (web_start()) {
+            s_screen = SCREEN_TERM;
+            term_put("Starting Wi-Fi and the web server: ip shows the address.", 0);
+        }
+    } else if (strcasecmp(argv[1], "off") == 0) {
+        if (web_running()) {
+            stop_web();
+            s_screen = SCREEN_TERM;
+        }
+        term_put("Wi-Fi is off.", 0);
+    } else {
+        term_put("wifi: on or off?", 1);
+    }
+}
+#endif
+
+static bool open_viewer(screen_t from);
+static void screenshot(void);
+
+// view <file>: the text reader or the image viewer; Esc comes back here
+static void term_view(int argc, char **argv)
+{
+    if (argc < 2) {
+        term_put("view: which file?", 1);
+    } else if (!shell_resolve(s_sel_path, sizeof(s_sel_path), argv[1]) || !fileops_exists(s_sel_path)) {
+        term_put("view: no such file", 1);
+    } else {
+        strlcpy(s_sel_name, strrchr(s_sel_path, '/') + 1, sizeof(s_sel_name));
+        if (!open_viewer(SCREEN_TERM)) {
+            term_put("view: text files (.txt, .md, ...) and .bmp images only", 1);
+        }
+    }
+}
+
+static void term_exec(void)
+{
+    char cmd[TERM_IN], line[TERM_IN + PATH_MAX_LEN + 8];
+    strlcpy(cmd, s_term_in, sizeof(cmd));
+    s_term_in[0] = '\0';
+    term_prompt(line, sizeof(line));
+    strlcat(line, cmd, sizeof(line));
+    term_put(line, 2);
+    term_remember(cmd);
+    s_hist_at = s_hist_n;
+
+    char *argv[SHELL_ARGS];
+    int argc = shell_split(cmd, argv, SHELL_ARGS);
+    if (!argc) {
+        return;
+    }
+    const char *c = argv[0];
+    if (strcasecmp(c, "clear") == 0) {
+        s_term_n = s_term_back = 0;
+    } else if (strcasecmp(c, "history") == 0) {
+        term_history();
+    } else if (strcasecmp(c, "exit") == 0) {
+        s_screen = s_base;
+    } else if (strcasecmp(c, "home") == 0) {
+        go_home();
+    } else if (strcasecmp(c, "files") == 0) {
+        strlcpy(s_cwd, shell_cwd(), sizeof(s_cwd));
+        go_files();
+    } else if (strcasecmp(c, "ctl") == 0) {
+        enter_ctl();
+    } else if (strcasecmp(c, "usb") == 0) {
+        enter_usb();
+    } else if (strcasecmp(c, "apps") == 0) {
+        term_list_apps();
+    } else if (strcasecmp(c, "view") == 0) {
+        term_view(argc, argv);
+    } else if (strcasecmp(c, "shot") == 0) {
+        screenshot();
+    } else if (strcasecmp(c, "run") == 0) {
+        if (argc < 2) {
+            term_put("run: which app?", 1);
+        } else {
+            term_run(argv[1]);
+        }
+#if PICOMULTILOADER_WIFI
+    } else if (strcasecmp(c, "wifi") == 0) {
+        term_wifi(argc, argv);
+#endif
+    } else if (!shell_run(argc, argv, term_out)) {
+        snprintf(line, sizeof(line), "%s: no such command. help lists them.", c);
+        term_put(line, 1);
+    }
+}
+
+static bool term_key(int key)
+{
+    size_t len = strlen(s_term_in);
+    switch (key) {
+    case KEY_ENTER:
+        term_exec();
+        return true;
+    case KEY_BACKSPACE:
+    case KEY_DEL:
+        if (len) {
+            s_term_in[len - 1] = '\0';
+        }
+        return true;
+    case KEY_TAB:
+        shell_complete(s_term_in, sizeof(s_term_in), term_out);
+        return true;
+    case KEY_UP:
+        if (s_hist_at > 0) {
+            strlcpy(s_term_in, s_hist[--s_hist_at], sizeof(s_term_in));
+        }
+        return true;
+    case KEY_DOWN:
+        if (s_hist_at < s_hist_n) {
+            s_hist_at++;
+            strlcpy(s_term_in, s_hist_at < s_hist_n ? s_hist[s_hist_at] : "", sizeof(s_term_in));
+        }
+        return true;
+    case KEY_PAGE_UP:
+        s_term_back += TERM_ROWS - 1; // clamped when drawing
+        return true;
+    case KEY_PAGE_DOWN:
+        s_term_back = s_term_back > TERM_ROWS - 1 ? s_term_back - (TERM_ROWS - 1) : 0;
+        return true;
+    case KEY_ESC:
+        if (len) {
+            s_term_in[0] = '\0';
+            s_hist_at = s_hist_n;
+        } else {
+            s_screen = s_base;
+        }
+        return true;
+    case KEY_F5:
+        s_screen = s_base;
+        return true;
+    case KEY_F1:
+        enter_ctl();
+        return true;
+    default:
+        if (key >= 0x20 && key < 0x7F && len + 1 < sizeof(s_term_in)) {
+            s_term_in[len] = (char)key;
+            s_term_in[len + 1] = '\0';
+            return true;
+        }
+        return false;
+    }
+}
+
+// ---- text reader and image viewer (from Files, or view in the terminal) -----------------------
+#define TEXT_X    4
+#define TEXT_Y    (PATH_Y + 18)
+#define TEXT_LH   10
+#define TEXT_COLS ((LCD_W - 2 * TEXT_X) / 6)
+#define TEXT_ROWS ((FOOTER_Y - 2 - TEXT_Y) / TEXT_LH)
+
+static screen_t s_view_from; // where Esc goes back to
+static bool s_image_drawn;   // the image is on screen (redraws would decode it again)
+static bool s_image_grey;
+
+// Open s_sel_path in its viewer. False if there is none for it.
+static bool open_viewer(screen_t from)
+{
+    view_kind_t kind = view_kind(s_sel_path);
+    if (kind == VIEW_NONE) {
+        return false;
+    }
+    s_view_from = from;
+    if (kind == VIEW_IMAGE) {
+        s_image_drawn = false;
+        s_screen = SCREEN_IMAGE;
+        return true;
+    }
+    char err[64];
+    if (!text_open(s_sel_path, kind == VIEW_MARKDOWN, TEXT_COLS, TEXT_ROWS, err, sizeof(err))) {
+        snprintf(s_error, sizeof(s_error), "%.60s: %s", s_sel_name, err);
+        s_screen = SCREEN_ERROR;
+        return true;
+    }
+    s_screen = SCREEN_TEXT;
+    return true;
+}
+
+static void close_viewer(void)
+{
+    text_close();
+    if (s_screen == SCREEN_IMAGE) {
+        theme_apply();
+    }
+    s_screen = s_view_from;
+}
+
+static void draw_text(void)
+{
+    draw_bar();
+    char title[COLS + 1];
+    fit(title, s_sel_name, COLS);
+    lcd_text(MARGIN, PATH_Y, title, C_ACCENT, FONT_LARGE);
+    lcd_hline(MARGIN - 4, PATH_Y + 16, LCD_W - 2 * (MARGIN - 4), C_LINE);
+    text_draw(TEXT_X, TEXT_Y, TEXT_LH);
+    char line[40];
+    if (text_at_end()) {
+        snprintf(line, sizeof(line), "Page %d (end)", text_page() + 1);
+    } else {
+        snprintf(line, sizeof(line), "Page %d  %d%%", text_page() + 1, text_percent());
+    }
+    draw_footer(line, C_DIM, "Up/Down Page  Home/End  Esc Close");
+}
+
+static bool text_key(int key)
+{
+    switch (key) {
+    case KEY_DOWN:
+    case KEY_RIGHT:
+    case KEY_PAGE_DOWN:
+    case KEY_ENTER:
+    case ' ':
+        return text_go(text_page() + 1);
+    case KEY_UP:
+    case KEY_LEFT:
+    case KEY_PAGE_UP:
+        return text_go(text_page() - 1);
+    case KEY_HOME:
+        return text_go(0);
+    case KEY_END:
+        draw_footer("Finding the end...", C_DIM, "");
+        lcd_flush();
+        text_end();
+        return true;
+    case KEY_ESC:
+    case KEY_BACKSPACE:
+        close_viewer();
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void draw_image(void)
+{
+    if (s_image_drawn) {
+        return;
+    }
+    look_anim_reset(); // the palette is the image's now
+    char err[64];
+    s_image_drawn = true;
+    if (!image_show(s_sel_path, s_image_grey, err, sizeof(err))) {
+        theme_apply();
+        snprintf(s_error, sizeof(s_error), "%.60s: %s", s_sel_name, err);
+        s_screen = SCREEN_ERROR;
+        ui_redraw();
+    }
+}
+
+// Left/Right in an image opened from Files: the image before or after it in the folder.
+static void image_step(int dir)
+{
+    if (s_view_from != SCREEN_BROWSE || !s_count) {
+        return;
+    }
+    int at = -1;
+    for (int i = 0; i < s_count; i++) {
+        if (strcmp(s_entries[i].name, s_sel_name) == 0) {
+            at = i;
+        }
+    }
+    for (int k = 1; k < s_count; k++) {
+        int i = ((at + dir * k) % s_count + s_count) % s_count;
+        const entry_t *e = &s_entries[i];
+        if (!e->is_dir && view_kind(e->name) == VIEW_IMAGE) {
+            snprintf(s_sel_path, sizeof(s_sel_path), "%s/%s", s_cwd, e->name);
+            strlcpy(s_sel_name, e->name, sizeof(s_sel_name));
+            s_sel = i + (at_root() ? 0 : 1);
+            s_image_drawn = false;
+            return;
+        }
+    }
+}
+
+static bool image_key(int key)
+{
+    switch (key) {
+    case KEY_LEFT:
+    case KEY_UP:
+        image_step(-1);
+        return !s_image_drawn;
+    case KEY_RIGHT:
+    case KEY_DOWN:
+    case ' ':
+        image_step(1);
+        return !s_image_drawn;
+    case 'g':
+    case 'G':
+        s_image_grey = !s_image_grey;
+        s_image_drawn = false;
+        return true;
+    case KEY_ESC:
+    case KEY_BACKSPACE:
+    case KEY_ENTER:
+        close_viewer();
+        return true;
+    default:
+        return false;
+    }
+}
+
+// ---- idle screen ------------------------------------------------------------------------------
+// After the idle time without a key: a plasma whose colours rotate (nothing is redrawn but the
+// clock), how long the loader has been on, and the backlight dimmed. A key wakes it and does
+// nothing else.
+#define IDLE_FRAME_US 60000
+#define DIGIT_W       34
+#define DIGIT_H       62
+#define SEG           7
+
+static bool s_idle;
+static uint64_t s_last_key_us, s_idle_frame_us;
+static int s_idle_phase, s_idle_minute;
+
+// sin() over a period of 64 steps, times 127 (whole numbers: no float library in RAM)
+static const int8_t SINE[64] = {
+    0,   12,   25,   37,   49,   60,   71,   81,   90,   98,   106,  112,  117,  122,  125,  126,
+    127, 126,  125,  122,  117,  112,  106,  98,   90,   81,   71,   60,   49,   37,   25,   12,
+    0,   -12,  -25,  -37,  -49,  -60,  -71,  -81,  -90,  -98,  -106, -112, -117, -122, -125, -126,
+    -127, -126, -125, -122, -117, -112, -106, -98, -90,  -81,  -71,  -60,  -49,  -37,  -25,  -12,
+};
+
+static int isin(int a)
+{
+    return SINE[a & 63];
+}
+
+static int isqrt(int n)
+{
+    int r = 0;
+    while ((r + 1) * (r + 1) <= n) {
+        r++;
+    }
+    return r;
+}
+
+static void idle_plasma(void)
+{
+    for (int y = 0; y < LCD_H; y += 4) {
+        for (int x = 0; x < LCD_W; x += 4) {
+            int dx = x - 160, dy = y - 120;
+            int v = isin(x * 64 / 144) + isin(y * 64 / 107) + isin((x + y) * 64 / 195) +
+                    isin(isqrt(dx * dx + dy * dy) * 64 / 82); // -508..508
+            int c = 1 + (v + 508) * 14 / 1017;                 // 1..14
+            lcd_fill_rect(x, y, 4, 4, (lcd_color_t)c);
+        }
+    }
+}
+
+// One 7-segment digit (or the colon, d = 10) with its top-left at x, y. Returns the next x.
+#define SEG_M ((DIGIT_H - SEG) / 2)
+static int idle_digit(int x, int y, int d, lcd_color_t color)
+{
+    // segments a..g: top, top right, bottom right, bottom, bottom left, top left, middle
+    static const uint8_t SEGS[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
+    static const uint8_t RECT[7][4] = {
+        {0, 0, DIGIT_W, SEG},           {DIGIT_W - SEG, 0, SEG, SEG_M + SEG}, {DIGIT_W - SEG, SEG_M, SEG, DIGIT_H - SEG_M},
+        {0, DIGIT_H - SEG, DIGIT_W, SEG}, {0, SEG_M, SEG, DIGIT_H - SEG_M},     {0, 0, SEG, SEG_M + SEG},
+        {0, SEG_M, DIGIT_W, SEG},
+    };
+    if (d == 10) {
+        lcd_fill_rect(x + 2, y + DIGIT_H / 3 - SEG / 2, SEG, SEG, color);
+        lcd_fill_rect(x + 2, y + 2 * DIGIT_H / 3 - SEG / 2, SEG, SEG, color);
+        return x + SEG + 10;
+    }
+    for (int k = 0; k < 7; k++) {
+        if (SEGS[d] & (1 << k)) {
+            lcd_fill_rect(x + RECT[k][0], y + RECT[k][1], RECT[k][2], RECT[k][3], color);
+        }
+    }
+    return x + DIGIT_W + 8;
+}
+
+// The minute the idle clock shows: of the day once the time is known, else since power-on
+static int idle_minute(void)
+{
+    if (clock_known()) {
+        int64_t t = clock_utc() + clock_offset();
+        return (int)(t / 60 % 1440);
+    }
+    return (int)(time_us_64() / 60000000u);
+}
+
+static void idle_draw(void)
+{
+    idle_plasma();
+    clock_tm_t tm;
+    bool known = clock_local(&tm);
+    int minutes = idle_minute();
+    s_idle_minute = minutes;
+    char clock[8], date[24], zone[48];
+    if (known) {
+        snprintf(clock, sizeof(clock), "%02d:%02d", tm.hour, tm.min);
+        clock_date_text(&tm, date, sizeof(date));
+        strlcpy(zone, clock_zone_name(), sizeof(zone));
+    } else { // no time from the web yet: show how long we have been on
+        snprintf(clock, sizeof(clock), "%d:%02d", minutes / 60 % 100, minutes % 60);
+        strlcpy(date, "on for (h:mm)", sizeof(date));
+        strlcpy(zone, PICOMULTILOADER_WIFI ? "Wi-Fi on sets the clock" : "", sizeof(zone));
+    }
+    int w = 0;
+    for (const char *c = clock; *c; c++) {
+        w += *c == ':' ? SEG + 10 : DIGIT_W + 8;
+    }
+    int x = (LCD_W - w + 8) / 2, y = 96;
+    for (int pass = 0; pass < 2; pass++) { // a shadow, then the digits
+        int cx = x + (pass ? 0 : 3), cy = y + (pass ? 0 : 3);
+        for (const char *c = clock; *c; c++) {
+            cx = idle_digit(cx, cy, *c == ':' ? 10 : *c - '0', pass ? 15 : 0);
+        }
+    }
+    char battery[24] = "";
+    if (s_battery >= 0) {
+        snprintf(battery, sizeof(battery), s_charging ? "battery %d%% charging" : "battery %d%%", s_battery);
+    }
+    const char *lines[] = {date, zone, battery, "PicoMultiLoader - press a key"};
+    for (int i = 0; i < 4; i++) {
+        int lx = (LCD_W - 7 * (int)strlen(lines[i])) / 2, ly = y + DIGIT_H + 18 + i * 18 + (i == 3 ? 30 : 0);
+        lcd_text(lx + 1, ly + 1, lines[i], 0, FONT_LARGE);
+        lcd_text(lx, ly, lines[i], 15, FONT_LARGE);
+    }
+}
+
+// One channel of a rainbow at hue h (0..255): up, full, down, off
+static int rainbow(int h)
+{
+    h &= 255;
+    return h < 43 ? h * 6 : h < 128 ? 255 : h < 171 ? (170 - h) * 6 : 0;
+}
+
+// The plasma's colours: a rainbow, kept dim, turning a little each frame
+static void idle_colors(void)
+{
+    for (int i = 1; i <= 14; i++) {
+        int h = (i - 1) * 256 / 14 + s_idle_phase;
+        lcd_set_palette((lcd_color_t)i, RGB565(rainbow(h + 85) * 3 / 5, rainbow(h) * 3 / 5, rainbow(h - 85) * 3 / 5));
+    }
+    lcd_set_palette(0, RGB565(0, 0, 0));
+    lcd_set_palette(15, RGB565(255, 255, 255));
+}
+
+static void idle_start(void)
+{
+    s_idle = true;
+    look_anim_reset();
+    int dim = ui_backlight() / 5;
+    if (kbd_present()) {
+        kbd_set_lcd_backlight((uint8_t)(dim < 10 ? 10 : dim));
+    }
+    idle_colors();
+    idle_draw();
+    lcd_flush();
+    s_idle_frame_us = time_us_64();
+}
+
+static void idle_wake(void)
+{
+    if (!s_idle) {
+        return;
+    }
+    s_idle = false;
+    if (kbd_present()) {
+        kbd_set_lcd_backlight(ui_backlight());
+    }
+    if (s_screen == SCREEN_IMAGE) {
+        s_image_drawn = false; // decode it again, with its palette
+    } else {
+        theme_apply();
+    }
+    ui_redraw();
+}
+
+static void idle_tick(void)
+{
+    uint64_t now = time_us_64();
+    if (!s_idle) {
+        int minutes = IDLE_MINUTES[idle_opt()];
+        if (minutes && s_screen != SCREEN_USB && now - s_last_key_us > (uint64_t)minutes * 60000000u) {
+            idle_start();
+        }
+        return;
+    }
+    if (now - s_idle_frame_us < IDLE_FRAME_US) {
+        return;
+    }
+    s_idle_frame_us = now;
+    s_idle_phase = (s_idle_phase + 1) & 255;
+    idle_colors();
+    if (idle_minute() != s_idle_minute) {
+        idle_draw();
+    }
+    lcd_flush();
+}
+
+// ---- screenshots (F10, Shift+F5) and exit messages ---------------------------------------------
+static void screenshot(void)
+{
+    char path[40], msg[sizeof(s_toast)];
+    if (!s_sd_ok || s_screen == SCREEN_USB) {
+        toast("Screenshots need the SD card");
+    } else if (shot_save(path, sizeof(path))) {
+        printf("ui: saved %s\n", path);
+        snprintf(msg, sizeof(msg), "Saved %s", path);
+        toast(msg);
+    } else {
+        toast("Could not save the screenshot");
+    }
+}
+
+#define EXIT_FILE PML_DIR "/exit.txt"
+
+// What the app that ran last left for us: /pml/exit.txt (its first line), else its exit code in
+// the watchdog scratch registers. Shown for a few seconds over the first screen.
+static void exit_message(void)
+{
+    char text[sizeof(s_toast)] = "";
+    int32_t code;
+    bool coded = uf2_exit_code(&code);
+    FIL *f = s_sd_ok ? malloc(sizeof(FIL)) : NULL;
+    if (f && f_open(f, EXIT_FILE, FA_READ) == FR_OK) {
+        char line[96];
+        if (f_gets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            fit(text, line, sizeof(text) - 1);
+        }
+        f_close(f);
+        f_unlink(EXIT_FILE);
+    }
+    free(f);
+    if (!text[0] && coded) {
+        snprintf(text, sizeof(text), "The app ended with code %ld", (long)code);
+    }
+    if (text[0]) {
+        printf("ui: the app says: %s\n", text);
+        toast(text);
+        s_toast_until = time_us_64() + 5000000;
+    }
+}
 
 // Returns false if the key isn't used here.
 static bool home_key(int key)
@@ -2316,7 +3526,7 @@ static bool home_key(int key)
         home_open();
         return true;
     case KEY_F1:
-        enter_wifi();
+        enter_ctl();
         return true;
     case KEY_F2:
         home_fav();
@@ -2330,7 +3540,7 @@ static bool home_key(int key)
         return true;
 #endif
     case KEY_F5:
-        enter_usb();
+        enter_term();
         return true;
     default:
         if ((key > ' ' && key < 0x7F) || (key == ' ' && s_filter[0])) {
@@ -2363,6 +3573,7 @@ static void web_tick(void)
             webserver_poll();
         }
         stop_web();
+        idle_wake();
         strlcpy(s_sel_path, path, sizeof(s_sel_path));
         strlcpy(s_sel_name, strrchr(path, '/') + 1, sizeof(s_sel_name));
         if (inspect_file()) {
@@ -2372,7 +3583,7 @@ static void web_tick(void)
         }
         return;
     }
-    if (s_screen == SCREEN_WEB) {
+    if (s_screen == SCREEN_WEB || s_screen == SCREEN_CTL) {
         web_status_t st;
         // redraw on changes, at most 4 times a second (uploads update the progress a lot)
         if (webserver_status(&st) != s_web_rev_shown && time_us_64() - s_web_drawn_us > 250000) {
@@ -2406,7 +3617,10 @@ void ui_tick(void)
         s_toast[0] = '\0';
         ui_redraw();
     }
-    look_tick();
+    idle_tick();
+    if (!s_idle) {
+        look_tick();
+    }
 #if PICOMULTILOADER_WIFI
     web_tick();
 #endif
@@ -2424,6 +3638,9 @@ void ui_tick(void)
 
 void ui_redraw(void)
 {
+    if (s_idle) {
+        return; // idle_tick() draws
+    }
     switch (s_screen) {
     case SCREEN_HOME:
         draw_home();
@@ -2455,6 +3672,23 @@ void ui_redraw(void)
     case SCREEN_DELETE:
         draw_delete();
         break;
+    case SCREEN_CTL:
+        draw_ctl();
+        break;
+    case SCREEN_TERM:
+        draw_term();
+        break;
+    case SCREEN_TEXT:
+        draw_text();
+        break;
+    case SCREEN_IMAGE:
+        draw_image(); // it flushes, and nothing goes over it
+        return;
+#if PML_RES
+    case SCREEN_RES:
+        draw_res();
+        break;
+#endif
 #if PICOMULTILOADER_WIFI
     case SCREEN_WEB:
         draw_web();
@@ -2572,11 +3806,23 @@ static void open_selected(void)
 
     snprintf(s_sel_path, sizeof(s_sel_path), "%s/%s", s_cwd, e->name);
     strlcpy(s_sel_name, e->name, sizeof(s_sel_name));
-    inspect_file();
+    if (!open_viewer(SCREEN_BROWSE)) {
+        inspect_file();
+    }
 }
 
 void ui_key(int key)
 {
+    s_last_key_us = time_us_64();
+    if (s_idle) {
+        idle_wake(); // the key only wakes it
+        return;
+    }
+    if (key == KEY_F10 || key == KEY_F10_ALT) {
+        screenshot();
+        ui_redraw();
+        return;
+    }
     switch (s_screen) {
     case SCREEN_HOME:
         if (!home_key(key)) {
@@ -2619,7 +3865,7 @@ void ui_key(int key)
             }
             break;
         case KEY_F1:
-            enter_wifi();
+            enter_ctl();
             break;
         case KEY_F2:
             browse_fav();
@@ -2633,7 +3879,7 @@ void ui_key(int key)
             break;
 #endif
         case KEY_F5:
-            enter_usb();
+            enter_term();
             break;
         case KEY_TAB:
             enter_files();
@@ -2708,6 +3954,26 @@ void ui_key(int key)
             return;
         }
         break;
+    case SCREEN_CTL:
+        if (!ctl_key(key)) {
+            return;
+        }
+        break;
+    case SCREEN_TERM:
+        if (!term_key(key)) {
+            return;
+        }
+        break;
+    case SCREEN_TEXT:
+        if (!text_key(key)) {
+            return;
+        }
+        break;
+    case SCREEN_IMAGE:
+        if (!image_key(key)) {
+            return;
+        }
+        break;
     case SCREEN_DELETE:
         if (key == KEY_ENTER) {
             do_delete();
@@ -2718,6 +3984,17 @@ void ui_key(int key)
             break;
         }
         return;
+#if PML_RES
+    case SCREEN_RES:
+        if (!res_key(key)) {
+            return;
+        }
+        break;
+#else
+    case SCREEN_RES:
+        s_screen = s_base;
+        break;
+#endif
 #if PICOMULTILOADER_WIFI
     case SCREEN_WIFI_SCAN:
         if (!wifi_scan_key(key)) {
@@ -2765,9 +4042,9 @@ void ui_set_battery(int percent, bool charging)
 }
 
 // ---- boot screen ------------------------------------------------------------------------------
-#define BOOT_LINES (4 + PICOMULTILOADER_WIFI)
+#define BOOT_LINES (4 + PICOMULTILOADER_WIFI + PML_RES)
 #define BOOT_Y     144
-#define BOOT_BAR_Y (BOOT_Y + 15 * 5 + 5)
+#define BOOT_BAR_Y (BOOT_Y + 15 * BOOT_LINES + 5)
 
 // "PML", 5x7 cells per letter, each row's bits from the left
 static const uint8_t LOGO[3][7] = {
@@ -2823,6 +4100,51 @@ void ui_boot_check(const char *what, const char *result, bool ok)
     lcd_flush();
 }
 
+#if PML_RES
+static int s_boot_res_y;
+
+static void boot_res_progress(size_t done, size_t total)
+{
+    static int last = -1;
+    int pct = total ? (int)(done * 100 / total) : 0;
+    if (pct == last) {
+        return;
+    }
+    last = pct;
+    char txt[8];
+    snprintf(txt, sizeof(txt), "%d%%", pct);
+    lcd_fill_rect(200, s_boot_res_y, LCD_W - 200, 10, C_BG);
+    lcd_text(200, s_boot_res_y, txt, C_FG, FONT_SMALL);
+    lcd_flush_rows(s_boot_res_y, 10);
+}
+
+// The Wi-Fi files: installed at switch-on when nothing is lost (the first boot of a new loader)
+static void boot_res(bool sd_ok)
+{
+    res_state_t st = uf2_res_check();
+    if ((st == RES_BLANK || st == RES_OLD) && sd_ok) {
+        bool shown = s_boot_line >= 0 && s_boot_line < BOOT_LINES;
+        if (shown) {
+            s_boot_res_y = BOOT_Y + 15 * s_boot_line;
+            lcd_text(48, s_boot_res_y, "Wi-Fi files", C_FG, FONT_SMALL);
+            lcd_flush();
+        }
+        char err[96];
+        bool ok = uf2_res_install(shown ? boot_res_progress : NULL, err, sizeof(err));
+        if (!ok) {
+            printf("ui: Wi-Fi files: %s\n", err);
+        }
+        if (shown) {
+            lcd_fill_rect(200, s_boot_res_y, LCD_W - 200, 10, C_BG);
+        }
+        ui_boot_check("Wi-Fi files", ok ? "installed" : "failed", ok);
+        return;
+    }
+    ui_boot_check("Wi-Fi files", st == RES_OK ? "OK" : st == RES_USED ? "F4 installs" : st == RES_NO_FILE ? "missing" : "no SD card",
+                  st == RES_OK);
+}
+#endif
+
 void ui_init(bool sd_ok)
 {
     s_sd_ok = sd_ok;
@@ -2841,25 +4163,37 @@ void ui_init(bool sd_ok)
     } else if (load_setting("last_dir", last, sizeof(last)) && last[0] == '/' && is_dir(last)) {
         copy_dir(s_cwd, sizeof(s_cwd), last);
     }
+    clock_load_setting();
     go_home();
+    s_last_key_us = time_us_64();
+    exit_message();
     for (int i = 0; i < s_shown_n; i++) { // select the app run last
         if (s_apps.list[s_shown[i]].recent == 0) {
             s_hsel = i;
         }
     }
 
+#if PML_RES
+    boot_res(sd_ok);
+#endif
 #if PICOMULTILOADER_WIFI
     // Wi-Fi autostart: bring the web server up in the background (the top icon shows its state)
     char web_auto[4];
     s_web_auto = load_setting("web_auto", web_auto, sizeof(web_auto)) && web_auto[0] == '1';
-    bool web_ok = true;
-    if (s_web_auto && sd_ok) {
+    bool web_ok = true, autostart = s_web_auto && sd_ok;
+#if PML_RES
+    bool files = uf2_res_ready(); // else F4 installs them first
+#else
+    bool files = true;
+#endif
+    if (autostart && files) {
         s_web_changes_seen = webserver_changes();
         if (!(web_ok = webserver_start())) {
             printf("ui: Wi-Fi autostart failed\n");
         }
     }
-    ui_boot_check("Wi-Fi", !(s_web_auto && sd_ok) ? "off" : web_ok ? "starting" : "failed", web_ok);
+    ui_boot_check("Wi-Fi", !autostart ? "off" : !files ? "press F4" : web_ok ? "starting" : "failed",
+                  web_ok && files);
 #endif
     char found[16];
     snprintf(found, sizeof(found), "%d found", s_apps.count);

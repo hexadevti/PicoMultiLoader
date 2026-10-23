@@ -39,6 +39,7 @@ static const theme_t THEMES[] = {
 static char s_name[NAME_MAX];
 static uint16_t s_ramp[3]; // accent, between, dark accent
 static int s_phase;
+static uint16_t s_pal[THEME_COLS]; // the loaded theme
 static int s_y0 = LCD_H, s_y1; // rows s_y0..s_y1-1 use the cycled colours
 static uint64_t s_next_us;
 
@@ -109,6 +110,14 @@ bool theme_load(const char *name)
         memcpy(pal, THEMES[i].c, sizeof(pal));
         strlcpy(s_name, THEMES[i].name, sizeof(s_name));
     }
+    memcpy(s_pal, pal, sizeof(s_pal));
+    theme_apply();
+    return ok;
+}
+
+void theme_apply(void)
+{
+    const uint16_t *pal = s_pal;
     for (int k = 0; k < THEME_COLS; k++) {
         lcd_set_palette(k, pal[k]);
     }
@@ -118,7 +127,6 @@ bool theme_load(const char *name)
     for (int k = 0; k < 3; k++) {
         lcd_set_palette(C_CYC0 + k, s_ramp[(k + s_phase) % 3]);
     }
-    return ok;
 }
 
 const char *theme_name(void)

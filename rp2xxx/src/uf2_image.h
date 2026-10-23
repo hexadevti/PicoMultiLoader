@@ -4,7 +4,8 @@
 // whether to show the menu or start the installed app, and flashes apps behind itself:
 //
 //   RP2040 (2 MB):  0x000000 boot2 (ours) + app ... 0x1BF000 app record | 0x1C0000 loader (256 KB)
-//   RP2350 (4 MB):  0x000000 boot stub (stub/stub.c) | 0x002000 app (mapped to 0x10000000);
+//   RP2350 (4 MB):  0x000000 boot stub (stub/stub.c) | 0x002000 app (mapped to 0x10000000) ...
+//                   0x3C0000 loader resources (256 KB: Wi-Fi firmware, web page);
 //                   the loader itself runs from RAM (pml2350.uf2 on the SD card)
 #pragma once
 
@@ -33,6 +34,13 @@ typedef void (*uf2_progress_cb_t)(size_t done, size_t total);
  */
 void uf2_boot_or_menu(void);
 
+/**
+ * An app can leave an exit code for the loader: watchdog scratch[2] = PML_EXIT_MAGIC, scratch[3] =
+ * the code, then reboot. True (once) if the app that ran last did.
+ */
+#define PML_EXIT_MAGIC 0x504d4c58u // "PMLX"
+bool uf2_exit_code(int32_t *code);
+
 /** Size of the app area in flash, in bytes. */
 uint32_t uf2_flash_capacity(void);
 
@@ -56,6 +64,26 @@ void uf2_boot_installed(void);
 
 /** The file walk's read buffer (2 KB), free to borrow while no UF2 is inspected or flashed. */
 void *uf2_scratch(size_t *len);
+
+#if !PICO_RP2040
+/** The loader's resources in the last 256 KB of flash (RP2350; Wi-Fi needs them). */
+typedef enum {
+    RES_OK,      // installed, and the ones this loader was built with
+    RES_BLANK,   // the area is erased: install them
+    RES_OLD,     // another loader version's, or an interrupted install: install them
+    RES_USED,    // something else is there (an app's data): installing erases it, ask first
+    RES_NO_FILE, // this build has no resources (add_res.py did not run)
+} res_state_t;
+
+/** The state of the resource area (checked once, then cached). */
+res_state_t uf2_res_check(void);
+
+/** uf2_res_check() == RES_OK. */
+bool uf2_res_ready(void);
+
+/** Copy the resources from /pml2350.uf2 into flash (a few seconds). On failure, writes `err`. */
+bool uf2_res_install(uf2_progress_cb_t progress, char *err, size_t err_len);
+#endif
 
 /** Name (and version) of the app currently in flash; false if there is none. */
 bool uf2_installed(char *name, size_t name_len, char *version, size_t version_len);
