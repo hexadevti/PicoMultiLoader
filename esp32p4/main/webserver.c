@@ -45,6 +45,7 @@ static const char *TAG = "web";
 #define CONNECT_TIMEOUT_MS 20000
 #define AP_SSID_PREFIX     "PicoMultiLoader"
 #define AP_CHANNEL         6
+#define WIFI_TX_POWER      52 // in 0.25 dBm steps: 13 dBm, down from the ~20 dBm default
 #define NVS_NS             "loader"
 #define IO_BUF_SIZE        (16 * 1024)
 #define PARAM_LEN          512
@@ -756,12 +757,24 @@ static int cmp_rssi(const void *a, const void *b)
     return ((const web_ap_t *)b)->rssi - ((const web_ap_t *)a)->rssi;
 }
 
+// Start the radio at reduced transmit power: full-power bursts draw current spikes that the
+// PicoCalc's batteries can't always supply, freezing or resetting the board. The PicoCalc sits
+// near the browser, so the shorter range doesn't matter.
+static esp_err_t wifi_start(void)
+{
+    esp_err_t err = esp_wifi_start();
+    if (err == ESP_OK) {
+        esp_wifi_set_max_tx_power(WIFI_TX_POWER);
+    }
+    return err;
+}
+
 int web_wifi_scan(web_ap_t *out, int max)
 {
     if (s_status.state != WEB_OFF || wifi_init_once() != ESP_OK) {
         return -1;
     }
-    if (esp_wifi_set_mode(WIFI_MODE_STA) != ESP_OK || esp_wifi_start() != ESP_OK) {
+    if (esp_wifi_set_mode(WIFI_MODE_STA) != ESP_OK || wifi_start() != ESP_OK) {
         return -1;
     }
     int count = -1;
@@ -819,7 +832,7 @@ static bool try_station(const char *ssid, const char *pass)
     s_last_reason = 0;
     s_want_sta = true;
     if (esp_wifi_set_mode(WIFI_MODE_STA) != ESP_OK || esp_wifi_set_config(WIFI_IF_STA, &wc) != ESP_OK ||
-        esp_wifi_start() != ESP_OK) {
+        wifi_start() != ESP_OK) {
         s_want_sta = false;
         return false;
     }
@@ -891,7 +904,7 @@ static esp_err_t start_access_point(void)
     wc.ap.max_connection = 4;
     wc.ap.authmode = WIFI_AUTH_WPA2_PSK;
 
-    if ((err = esp_wifi_set_config(WIFI_IF_AP, &wc)) != ESP_OK || (err = esp_wifi_start()) != ESP_OK) {
+    if ((err = esp_wifi_set_config(WIFI_IF_AP, &wc)) != ESP_OK || (err = wifi_start()) != ESP_OK) {
         return err;
     }
     esp_netif_ip_info_t ip = { 0 };

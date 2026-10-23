@@ -153,12 +153,12 @@ else()
     pico_enable_stdio_usb(${STUB_NAME} 0)
     file(READ ${PICO_SDK_PATH}/src/rp2_common/pico_crt0/rp2350/memmap_default.ld memmap)
     string(REPLACE "INCLUDE \"pico_flash_region.ld\""
-        "FLASH(rx) : ORIGIN = 0x10000000, LENGTH = 0x1F00" memmap "${memmap}")
+        "FLASH(rx) : ORIGIN = 0x10000000, LENGTH = 0x1E00" memmap "${memmap}")
     string(REPLACE "RAM(rwx) : ORIGIN =  0x20000000, LENGTH = 512k"
         "RAM(rwx) : ORIGIN = 0x20080000, LENGTH = 3k" memmap "${memmap}")
     string(REPLACE "SCRATCH_X(rwx) : ORIGIN = 0x20080000, LENGTH = 4k"
         "SCRATCH_X(rwx) : ORIGIN = 0x20080C00, LENGTH = 1k" memmap "${memmap}")
-    if (NOT memmap MATCHES "0x20080C00" OR NOT memmap MATCHES "0x1F00")
+    if (NOT memmap MATCHES "0x20080C00" OR NOT memmap MATCHES "0x1E00")
         message(FATAL_ERROR "Could not adapt memmap_default.ld for the stub")
     endif()
     file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/memmap_stub.ld "${memmap}")
@@ -169,6 +169,37 @@ else()
     pico_set_uf2_family(${STUB_NAME} absolute)
     target_link_options(${STUB_NAME} PRIVATE -Wl,--print-memory-usage)
     pico_add_extra_outputs(${STUB_NAME})
+
+    # The stub's RISC-V half (stub/stub_riscv.c) in its last 512 bytes, so RISC-V apps start too:
+    # add_riscv_twin.py links it into the ARM stub's block loop and rewrites the .bin and .uf2.
+    set(STUB_TWIN_OFFSET 0x1E00)
+    file(GLOB RISCV_GCC_HINTS "$ENV{LOCALAPPDATA}/Arduino15/packages/rp2040/tools/pqt-gcc-riscv/*/bin")
+    find_program(RISCV_GCC NAMES riscv32-unknown-elf-gcc riscv32-unknown-elf-gcc.exe HINTS ${RISCV_GCC_HINTS})
+    if (NOT RISCV_GCC)
+        message(FATAL_ERROR "riscv32-unknown-elf-gcc not found (set RISCV_GCC): the stub needs it for its RISC-V half")
+    endif()
+    string(REGEX REPLACE "gcc(\\.exe)?$" "objcopy\\1" RISCV_OBJCOPY "${RISCV_GCC}")
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(TWIN_ELF ${CMAKE_CURRENT_BINARY_DIR}/stub_riscv.elf)
+    set(TWIN_BIN ${CMAKE_CURRENT_BINARY_DIR}/stub_riscv.bin)
+    math(EXPR TWIN_BASE "0x10000000 + ${STUB_TWIN_OFFSET}" OUTPUT_FORMAT HEXADECIMAL)
+    add_custom_command(OUTPUT ${TWIN_BIN}
+        COMMAND ${RISCV_GCC} -march=rv32imac_zicsr -mabi=ilp32 -Os -Wall -Werror -ffreestanding
+            -nostdlib -nostartfiles -fno-pic -mno-relax -T ${CMAKE_CURRENT_LIST_DIR}/stub/stub_riscv.ld
+            -Wl,--defsym=TWIN_BASE=${TWIN_BASE} -Wl,--gc-sections -Wl,-e,twin_main
+            -o ${TWIN_ELF} ${CMAKE_CURRENT_LIST_DIR}/stub/stub_riscv.c
+        COMMAND ${RISCV_OBJCOPY} -O binary -j .text ${TWIN_ELF} ${TWIN_BIN}
+        DEPENDS stub/stub_riscv.c stub/stub_riscv.ld
+        COMMENT "Building the boot stub's RISC-V half")
+    add_custom_target(stub_riscv_twin DEPENDS ${TWIN_BIN})
+    add_dependencies(${STUB_NAME} stub_riscv_twin)
+    set_property(TARGET ${STUB_NAME} APPEND PROPERTY LINK_DEPENDS ${TWIN_BIN})   # relink: redo the splice
+    # after pico_add_extra_outputs' own POST_BUILD steps, which write the .bin and .uf2
+    add_custom_command(TARGET ${STUB_NAME} POST_BUILD
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/stub/add_riscv_twin.py
+            $<TARGET_FILE_DIR:${STUB_NAME}>/${STUB_NAME}.bin ${TWIN_BIN} ${STUB_TWIN_OFFSET}
+            $<TARGET_FILE_DIR:${STUB_NAME}>/${STUB_NAME}.bin $<TARGET_FILE_DIR:${STUB_NAME}>/${STUB_NAME}.uf2
+        VERBATIM)
 endif()
 
 pico_enable_stdio_uart(${LOADER_NAME} 1)
