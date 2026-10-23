@@ -5,8 +5,8 @@ boots it. Hold **Up** (or F1/F5) while resetting to come back. It runs on three 
 | Board in the Pico socket | Apps | Wi-Fi web file manager | Source | Build output |
 |---|---|---|---|---|
 | Waveshare ESP32-P4-WIFI6 | `.bin` | yes (through the ESP32-C6) | [esp32p4/](esp32p4/) | flashed over USB |
-| Raspberry Pi Pico / Pico W (RP2040) | `.uf2` | no | [rp2xxx/](rp2xxx/) | `PicoMultiLoader-rp2040.uf2`, flashed through BOOTSEL |
-| Raspberry Pi Pico 2 W (RP2350) | `.uf2` | yes (CYW43439) | [rp2xxx/](rp2xxx/) | `PicoMultiLoader-rp2350.uf2` (boot stub) flashed through BOOTSEL + `pml2350.uf2` in the SD root |
+| Raspberry Pi Pico / Pico W (RP2040) | `.uf2` | no | [rp2xxx/](rp2xxx/) | `PicoMultiLoader-rp2040.uf2` (or `-classic`), flashed through BOOTSEL |
+| Raspberry Pi Pico 2 W (RP2350) | `.uf2` | yes (CYW43439) | [rp2xxx/](rp2xxx/) | `PicoMultiLoader-rp2350.uf2` (boot stub) flashed through BOOTSEL + `pml2350.uf2` and/or `pml2350-classic.uf2` in the SD root |
 
 All three have the same screens and keys: file list, app details, Setup (F1), web file manager
 (F4, Wi-Fi boards), USB drive mode (F5), on-screen help, and the serial console. The browser page
@@ -356,11 +356,13 @@ refused.
    or `PicoMultiLoader-rp2350.uf2` (Pico 2 W) to the `RPI-RP2` / `RP2350` drive. (The RP2350
    file uses the UF2 "absolute" family, so it is written to the start of flash whatever partition
    table is there.)
-2. **RP2350 only:** copy `pml2350.uf2` to the root of the SD card. Without it the menu can't open:
-   the stub starts the app, or drops into BOOTSEL if there is none.
+2. **RP2350 only:** copy `pml2350.uf2` (and `pml2350-classic.uf2`, if you want to be able to switch
+   to the [classic menu](#the-classic-menu)) to the root of the SD card. Without either one the menu
+   can't open: the stub starts the app, or drops into BOOTSEL if there is none.
 3. Put the Pico back in the PicoCalc and switch it on: with no app installed, the menu opens.
 4. **Pico 2 W only:** the first time Wi-Fi is turned on (F4, or a network scan in Setup), the
-   loader copies the Wi-Fi files from `pml2350.uf2` into the last 256 KB of flash. That takes a few
+   loader copies the Wi-Fi files from `pml2350.uf2` (or `pml2350-classic.uf2`, which carries the same
+   ones) into the last 256 KB of flash. That takes a few
    seconds and happens again only when a new `pml2350.uf2` brings different files. The loader
    keeps the CYW43439 firmware there rather than in RAM, which leaves it a ~205 KB heap. If the
    installed app has written data into that area, the loader asks first, because installing erases it.
@@ -415,6 +417,20 @@ are different:
   it opens. Alternatively, it can set watchdog scratch 2 = `0x504D4C58` and scratch 3 = an exit code
   before rebooting into the menu.
 
+### The classic menu
+
+Each build also makes a **classic** menu: the plain file list of earlier versions, without Home,
+Files, the terminal or the viewers (about 45 KB more free RAM on the RP2350). It has the same flashing,
+USB drive mode, Wi-Fi and web file manager.
+
+* **RP2350:** both menus are files on the SD card, `pml2350.uf2` and `pml2350-classic.uf2`. The boot
+  stub loads the classic one if `picomultiloader.cfg` has the line `ui=classic`, otherwise the
+  graphical one; if the chosen file is missing it loads the other. Switch in the menu itself:
+  **Control center (F1) > Menu style** in the graphical menu, **Setup > Menu style** in the classic
+  one. Each restarts into the other, and refuses if the other file isn't on the card.
+* **RP2040:** the loader is in flash, so flash the one you want through BOOTSEL:
+  `PicoMultiLoader-rp2040.uf2` or `PicoMultiLoader-rp2040-classic.uf2`.
+
 ### Build
 
 Needs the [Pico SDK](https://github.com/raspberrypi/pico-sdk) 2.1 or later, the Arm GNU
@@ -423,8 +439,8 @@ toolchain, CMake and Ninja.
 ```sh
 cd rp2xxx
 export PICO_SDK_PATH=/path/to/pico-sdk
-cmake -B build-rp2040 -G Ninja -DPICO_BOARD=pico      # -> build-rp2040/PicoMultiLoader-rp2040.uf2
-cmake -B build-rp2350 -G Ninja -DPICO_BOARD=pico2_w   # -> build-rp2350/PicoMultiLoader-rp2350.uf2 + pml2350.uf2
+cmake -B build-rp2040 -G Ninja -DPICO_BOARD=pico      # -> build-rp2040/PicoMultiLoader-rp2040.uf2 + PicoMultiLoader-rp2040-classic.uf2
+cmake -B build-rp2350 -G Ninja -DPICO_BOARD=pico2_w   # -> build-rp2350/PicoMultiLoader-rp2350.uf2 + pml2350.uf2 + pml2350-classic.uf2
 cmake --build build-rp2040
 cmake --build build-rp2350
 ```

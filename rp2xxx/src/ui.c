@@ -1354,16 +1354,18 @@ static const char *const HELP_TEXT[] = {
     "Copy or Cut, go to another folder, then Paste. Pasting a copy where the name is taken adds a number, e.g. app (2).uf2.",
     "Deleting a folder deletes everything in it.",
 #if !PICO_RP2040
-    "pml2350.uf2 in the root (this menu) can't be deleted or moved from here.",
+    "pml2350.uf2 and pml2350-classic.uf2 in the root (the menus) can't be deleted or moved from here.",
 #endif
     "",
     "#Installing the loader",
 #if PICO_RP2040
     "PicoMultiLoader is the Pico's own firmware, no other bootloader needed: hold BOOTSEL, plug in USB and copy "
-    "PicoMultiLoader-rp2040.uf2 to the drive that appears.",
+    "PicoMultiLoader-rp2040.uf2 to the drive that appears. PicoMultiLoader-rp2040-classic.uf2 is the classic menu "
+    "(the file list of earlier versions) instead.",
 #else
     "PicoMultiLoader replaces uf2loader: hold BOOTSEL, plug in USB and copy PicoMultiLoader-rp2350.uf2 (an 8 KB boot "
-    "stub) to the drive that appears. Put pml2350.uf2 in the root of the SD card: the stub loads this menu from it.",
+    "stub) to the drive that appears. Put pml2350.uf2 (this menu) and pml2350-classic.uf2 (the classic one) in the "
+    "root of the SD card: the stub loads the one Menu style picks, or the other if it is missing.",
     "Without that file the menu can't open; the stub then starts the app, or BOOTSEL if there is none.",
 #endif
     "",
@@ -1388,6 +1390,10 @@ static const char *const HELP_TEXT[] = {
     "Idle screen: after that long without a key, a dim clock on black with the backlight turned down, to save the battery; "
     "10 minutes later the backlight goes off. Any key wakes it up, and does nothing else. Until the time is known it "
     "shows how long the loader has been on.",
+#if !PICO_RP2040
+    "Menu style: Enter switches to the classic menu (the file list of earlier versions, pml2350-classic.uf2) and "
+    "restarts. Its Setup switches back.",
+#endif
     "Setup: the settings below. The battery charge is at the bottom. Esc or F1 closes it.",
     "",
 #if PICOMULTILOADER_WIFI
@@ -2213,7 +2219,7 @@ static bool protected_path(const char *path)
     (void)path;
     return false;
 #else
-    return strcasecmp(path, "/pml2350.uf2") == 0;
+    return strcasecmp(path, UF2_LOADER_GUI) == 0 || strcasecmp(path, UF2_LOADER_CLASSIC) == 0;
 #endif
 }
 
@@ -3100,7 +3106,15 @@ static void web_key(void) // F4
 
 // ---- control center (F1) ----------------------------------------------------------------------
 // A panel over the dimmed Home or file list: one row per setting, the battery at the bottom.
-enum { CC_WIFI, CC_USB, CC_LIGHT, CC_IDLE, CC_THEME, CC_SETUP, CC_ROWS };
+// RP2350: the classic menu instead of this one (the boot stub loads the one the "ui" setting picks)
+#define MENU_SWITCH (!PICO_RP2040)
+enum {
+    CC_WIFI, CC_USB, CC_LIGHT, CC_IDLE, CC_THEME,
+#if MENU_SWITCH
+    CC_MENU,
+#endif
+    CC_SETUP, CC_ROWS
+};
 #define CC_FIRST   (PICOMULTILOADER_WIFI ? CC_WIFI : CC_USB)
 #define CC_X       26
 #define CC_Y       34
@@ -3211,7 +3225,11 @@ static void draw_ctl(void)
             lcd_fill_rect(CC_X + 6, y - 4, CC_W - 12, CC_ROW - 2, C_SEL_BG);
         }
         lcd_color_t fg = sel ? C_SEL_FG : C_FG, dim = sel ? C_SEL_FG : C_DIM;
-        static const char *const LABELS[CC_ROWS] = {"Wi-Fi", "USB drive", "Backlight", "Idle screen", "Theme", "Setup"};
+        static const char *const LABELS[CC_ROWS] = {"Wi-Fi", "USB drive", "Backlight", "Idle screen", "Theme",
+#if MENU_SWITCH
+                                                    "Menu style",
+#endif
+                                                    "Setup"};
         lcd_text(CC_X + 14, y, LABELS[r], fg, FONT_LARGE);
         const char *h = "";
         switch (r) {
@@ -3272,6 +3290,12 @@ static void draw_ctl(void)
             h = "Own .pal files go in " THEME_DIR;
             break;
         }
+#if MENU_SWITCH
+        case CC_MENU:
+            lcd_text(CC_VAL_X, y, "Graphical", fg, FONT_LARGE);
+            h = "Enter: the classic file list instead (restarts)";
+            break;
+#endif
         case CC_SETUP:
             lcd_text(CC_VAL_X, y, ">", dim, FONT_LARGE);
 #if PICOMULTILOADER_WIFI
@@ -3311,6 +3335,22 @@ static void ctl_wifi(void)
         s_screen = SCREEN_CTL;
     } else if (web_start()) {
         s_screen = SCREEN_CTL; // it starts in the background: the row shows how it goes
+    }
+}
+#endif
+
+#if MENU_SWITCH
+// The classic menu instead of this one: saved, then a restart loads it
+static void switch_menu(void)
+{
+    if (!s_sd_ok || !fileops_exists(UF2_LOADER_CLASSIC)) {
+        toast("Copy pml2350-classic.uf2 to the card");
+    } else if (!config_set("ui", "classic")) {
+        toast("Could not save (SD card?)");
+    } else {
+        draw_footer(NULL, C_FG, "Restarting...");
+        lcd_flush();
+        uf2_restart_menu();
     }
 }
 #endif
@@ -3369,6 +3409,13 @@ static bool ctl_key(int key)
     case CC_THEME:
         next_theme();
         break;
+#if MENU_SWITCH
+    case CC_MENU:
+        if (key == KEY_ENTER) {
+            switch_menu();
+        }
+        break;
+#endif
     case CC_SETUP:
         if (key != KEY_LEFT) {
             enter_wifi();

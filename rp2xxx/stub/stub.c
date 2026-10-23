@@ -2,8 +2,9 @@
 //
 // It occupies the first 8 KB of flash and carries a partition table that gives apps the rest of
 // the chip (0x2000 to the end), the same layout as pelrun's uf2loader, so apps made for that work
-// unchanged. At reset it either starts the app or loads the full loader (PML2350.UF2 in the root of
-// the SD card) into RAM and runs it:
+// unchanged. At reset it either starts the app or loads the full loader (pml2350.uf2 in the root of
+// the SD card, or pml2350-classic.uf2 if picomultiloader.cfg there has the line ui=classic) into RAM
+// and runs it:
 //
 //   - an app asked for it the uf2loader way (watchdog scratch): mode 0 = app, otherwise the menu;
 //   - otherwise Up, F1 or F5 held on the keyboard in the first 0.5 s shows the menu;
@@ -28,7 +29,10 @@
 #define BL_MAGIC        0xe98cc638u // uf2loader: scratch[0]; scratch[1] = mode
 #define BL_MODE_DEFAULT 0           // start the app
 
-#define LOADER_NAME  "PML2350 UF2" // 8.3 directory entry name
+#define LOADER_GUI     "pml2350.uf2"
+#define LOADER_CLASSIC "pml2350-classic.uf2"
+#define CONFIG_NAME    "picomultiloader.cfg" // the loader's settings (config.h)
+#define CLASSIC_LINE   "ui=classic"
 #define LOADER_RAM   0x20000000u
 #define LOADER_END   0x20080000u   // main RAM; the scratch banks hold the stub
 #define RP2350_ARM_S 0xe48bff59u
@@ -166,7 +170,7 @@ static bool sd_read(uint32_t lba)
     return ok;
 }
 
-// ---- FAT16/FAT32, read-only, 8.3 names in the root directory ----------------------------------
+// ---- FAT16/FAT32, read-only, files in the root directory --------------------------------------
 static uint32_t s_fat, s_data, s_root, s_root_secs, s_spc;
 static bool s_fat32;
 
@@ -251,7 +255,46 @@ static bool walk_chain(uint32_t cl, sector_fn_t fn)
     return true;
 }
 
-static uint32_t s_file_cl;
+// Looking for a file by its long name (any case), or by its 8.3 name if it has no long one.
+static const char *s_want;
+static uint32_t s_file_cl, s_file_size;
+static bool s_lfn_ok; // the long name entries just read spell s_want
+
+static char lower(int c) { return c >= 'A' && c <= 'Z' ? (char)(c + 32) : (char)c; }
+
+// A long name entry holds 13 characters of the name, in UCS-2
+static void lfn_entry(const uint8_t *e)
+{
+    static const uint8_t AT[13] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
+    unsigned ord = e[0] & 0x1F, len = strlen(s_want);
+    if (e[0] & 0x40) { // the last part, which comes first
+        s_lfn_ok = ord && (ord - 1) * 13 < len && len <= ord * 13;
+    }
+    for (unsigned k = 0; s_lfn_ok && k < 13; k++) {
+        unsigned at = (ord - 1) * 13 + k, c = u16(e + AT[k]);
+        if (at < len ? c >= 128 || lower(c) != s_want[at] : at == len && c != 0) {
+            s_lfn_ok = false;
+        }
+    }
+}
+
+// The 8.3 name of an entry is s_want
+static bool sfn_match(const uint8_t *e)
+{
+    const char *w = s_want;
+    for (int i = 0; i < 11; i++) {
+        char c = *w == '.' || !*w ? ' ' : *w++;
+        if (i == 7 && *w == '.') {
+            w++;
+        } else if (i == 7 && *w) {
+            return false;
+        }
+        if (lower(e[i]) != c) {
+            return false;
+        }
+    }
+    return !*w;
+}
 
 // Directory sector: >0 continue, 0 done (found or end of directory)
 static int dir_sector(void)
@@ -261,12 +304,71 @@ static int dir_sector(void)
         if (e[0] == 0) {
             return 0;
         }
-        if (e[0] != 0xE5 && !(e[11] & 0x18) && memcmp(e, LOADER_NAME, 11) == 0) {
-            s_file_cl = (uint32_t)u16(e + 20) << 16 | u16(e + 26);
-            return 0;
+        if (e[0] == 0xE5) {
+            s_lfn_ok = false;
+        } else if (e[11] == 0x0F) {
+            lfn_entry(e);
+        } else {
+            if (!(e[11] & 0x18) && (s_lfn_ok || sfn_match(e))) {
+                s_file_cl = (uint32_t)u16(e + 20) << 16 | u16(e + 26);
+                s_file_size = u32(e + 28);
+                return 0;
+            }
+            s_lfn_ok = false;
         }
     }
     return 1;
+}
+
+static bool find_file(const char *name)
+{
+    s_want = name;
+    s_lfn_ok = false;
+    s_file_cl = 0;
+    return walk_chain(s_fat32 ? s_root : 0, dir_sector) && s_file_cl >= 2;
+}
+
+// ---- the "ui" setting -------------------------------------------------------------------------
+static uint32_t s_left;  // bytes of the settings file not read yet
+static int s_line_at;    // characters of CLASSIC_LINE matched on this line, -1 = not that line
+static bool s_classic;
+
+static bool line_end(void)
+{
+    s_classic |= s_line_at == (int)sizeof(CLASSIC_LINE) - 1;
+    s_line_at = 0;
+    return s_classic;
+}
+
+// Settings file sector: >0 continue, 0 done
+static int cfg_sector(void)
+{
+    for (int i = 0; i < 512 && s_left; i++, s_left--) {
+        char c = (char)s_buf[i];
+        if (c == '\n' || c == '\r') {
+            if (line_end()) {
+                return 0;
+            }
+        } else if (s_line_at >= 0) {
+            s_line_at = s_line_at < (int)sizeof(CLASSIC_LINE) - 1 && c == CLASSIC_LINE[s_line_at] ? s_line_at + 1 : -1;
+        }
+    }
+    if (s_left) {
+        return 1;
+    }
+    line_end(); // the last line may have no line break
+    return 0;
+}
+
+static bool want_classic(void)
+{
+    s_classic = false;
+    if (find_file(CONFIG_NAME)) {
+        s_left = s_file_size;
+        s_line_at = 0;
+        walk_chain(s_file_cl, cfg_sector);
+    }
+    return s_classic;
 }
 
 // ---- loading the loader -----------------------------------------------------------------------
@@ -291,17 +393,23 @@ static int uf2_sector(void)
     return ++s_loaded == num ? 0 : 1;
 }
 
+static bool load_file(const char *name)
+{
+    if (!find_file(name)) {
+        return false;
+    }
+    s_loaded = 0;
+    return walk_chain(s_file_cl, uf2_sector) && s_loaded && s_loaded == s_expected;
+}
+
+// The menu the settings ask for; if that file is missing or bad, the other one
 static bool load_loader(void)
 {
     if (!sd_init() || !fat_mount()) {
         return false;
     }
-    s_file_cl = 0;
-    if (!walk_chain(s_fat32 ? s_root : 0, dir_sector) || s_file_cl < 2) {
-        return false;
-    }
-    s_loaded = 0;
-    return walk_chain(s_file_cl, uf2_sector) && s_loaded && s_loaded == s_expected;
+    bool classic = want_classic();
+    return load_file(classic ? LOADER_CLASSIC : LOADER_GUI) || load_file(classic ? LOADER_GUI : LOADER_CLASSIC);
 }
 
 // ---- starting things --------------------------------------------------------------------------

@@ -459,7 +459,8 @@ void apps_scan_dir(apps_t *a, const char *dir)
                 add_dir(a, path, root ? 0 : APP_EXTRA);
             } else if (has_uf2_ext(fi.fname)
 #if !PICO_RP2040
-                       && !(root && strcasecmp(fi.fname, "pml2350.uf2") == 0) // the loader itself
+                       && !(root && (strcasecmp(fi.fname, UF2_LOADER_GUI + 1) == 0 || // the loader itself
+                                     strcasecmp(fi.fname, UF2_LOADER_CLASSIC + 1) == 0))
 #endif
             ) {
                 add_file(a, path, root ? 0 : APP_EXTRA);

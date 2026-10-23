@@ -85,8 +85,16 @@ res_state_t uf2_res_check(void);
 /** uf2_res_check() == RES_OK. */
 bool uf2_res_ready(void);
 
-/** Copy the resources from /pml2350.uf2 into flash (a few seconds). On failure, writes `err`. */
+/** Copy the resources from /pml2350.uf2 (or /pml2350-classic.uf2) into flash (a few seconds). On
+ *  failure, writes `err`. */
 bool uf2_res_install(uf2_progress_cb_t progress, char *err, size_t err_len);
+
+/** The two menus the RP2350 boot stub can load from the SD card (the "ui" setting picks one). */
+#define UF2_LOADER_GUI     "/pml2350.uf2"
+#define UF2_LOADER_CLASSIC "/pml2350-classic.uf2"
+
+/** Restart, so the boot stub loads the menu again (the one the "ui" setting picks). */
+void uf2_restart_menu(void) __attribute__((noreturn));
 #endif
 
 /** Name (and version) of the app currently in flash; false if there is none. */

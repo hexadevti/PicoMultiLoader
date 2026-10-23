@@ -704,9 +704,9 @@ static bool write_first_sector(const char *path, uf2_walk_t *w, char *err, size_
 // The Wi-Fi firmware and the web page are linked into the last 256 KB of flash (.pml_res, see
 // CMakeLists.txt) to leave RAM for the loader. pml2350.uf2 carries them as blocks of RES_FAMILY
 // after its RAM blocks (add_res.py); the stub skips those, and uf2_res_install() copies them here.
+// pml2350-classic.uf2 carries the same ones, so either file will do.
 #define RES_MAGIC  0x52574d50u // "PMWR"
 #define RES_FAMILY 0x504d4c52u
-#define LOADER_FILE "/pml2350.uf2"
 
 typedef struct {
     uint32_t magic;
@@ -775,15 +775,11 @@ bool uf2_res_ready(void)
     return uf2_res_check() == RES_OK;
 }
 
-bool uf2_res_install(uf2_progress_cb_t progress, char *err, size_t err_len)
+static bool res_install_from(const char *file, uf2_progress_cb_t progress, char *err, size_t err_len)
 {
     FIL f;
-    if (s_res_want.magic != RES_MAGIC) {
-        snprintf(err, err_len, "This loader was built without its resources (add_res.py).");
-        return false;
-    }
-    if (f_open(&f, sd_path(LOADER_FILE), FA_READ) != FR_OK) {
-        snprintf(err, err_len, "Cannot open " LOADER_FILE ".");
+    if (f_open(&f, sd_path(file), FA_READ) != FR_OK) {
+        snprintf(err, err_len, "Cannot open %s.", file);
         return false;
     }
     s_res_state = -1;
@@ -796,7 +792,7 @@ bool uf2_res_install(uf2_progress_cb_t progress, char *err, size_t err_len)
         idx = b->num_blocks;
     } else {
         f_close(&f);
-        snprintf(err, err_len, LOADER_FILE " is not a UF2 file.");
+        snprintf(err, err_len, "%s is not a UF2 file.", file);
         return false;
     }
     uint64_t erased = 0; // one bit per 4 KB sector of the area
@@ -827,7 +823,7 @@ bool uf2_res_install(uf2_progress_cb_t progress, char *err, size_t err_len)
                 const res_hdr_t *h = (const res_hdr_t *)s_page;
                 if (h->magic != s_res_want.magic || h->size != s_res_want.size || h->crc != s_res_want.crc ||
                     h->check != s_res_want.check) {
-                    snprintf(err, err_len, LOADER_FILE " on the card is not the loader that is running.");
+                    snprintf(err, err_len, "%s on the card is not the loader that is running.", file);
                     ok = false;
                     break;
                 }
@@ -852,7 +848,7 @@ bool uf2_res_install(uf2_progress_cb_t progress, char *err, size_t err_len)
     }
     f_close(&f);
     if (ok && (!got_hdr || done != want_pages)) {
-        snprintf(err, err_len, LOADER_FILE " has %lu of %lu resource blocks.", (unsigned long)done,
+        snprintf(err, err_len, "%s has %lu of %lu resource blocks.", file, (unsigned long)done,
                  (unsigned long)want_pages);
         ok = false;
     }
@@ -870,6 +866,35 @@ bool uf2_res_install(uf2_progress_cb_t progress, char *err, size_t err_len)
         ok = false;
     }
     return ok;
+}
+
+bool uf2_res_install(uf2_progress_cb_t progress, char *err, size_t err_len)
+{
+    if (s_res_want.magic != RES_MAGIC) {
+        snprintf(err, err_len, "This loader was built without its resources (add_res.py).");
+        return false;
+    }
+    if (res_install_from(PML_LOADER_FILE, progress, err, err_len)) {
+        return true;
+    }
+    char other_err[96]; // the other menu's file, if this one is missing or of another version
+    if (res_install_from(PML_UI_CLASSIC ? UF2_LOADER_GUI : UF2_LOADER_CLASSIC, progress, other_err,
+                         sizeof(other_err))) {
+        return true;
+    }
+    return false; // the first error says more
+}
+
+void uf2_restart_menu(void)
+{
+    printf("boot: restarting the menu\n");
+    stdio_flush();
+    watchdog_hw->scratch[1] = 1; // uf2loader's "menu" mode: the stub loads the loader again
+    watchdog_hw->scratch[0] = BL_MAGIC;
+    watchdog_reboot(0, 0, 0);
+    for (;;) {
+        tight_loop_contents();
+    }
 }
 #endif
 
