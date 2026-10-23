@@ -4,7 +4,7 @@
 #include <string.h>
 #include "ff.h"
 
-#define MAX_KEYS  12
+#define MAX_KEYS  24 // every key the menus use (about 16), with room to spare: more are dropped
 #define KEY_LEN   16
 #define VALUE_LEN 160
 
