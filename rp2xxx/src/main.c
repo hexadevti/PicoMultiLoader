@@ -153,6 +153,15 @@ int main(void)
 #endif
         uint64_t now = time_us_64();
         if (now < next_poll) {
+            // Nothing to do before the next keyboard poll: sleep (WFE) rather than spin, unless the
+            // USB drive needs tud_task() all the time. Wi-Fi traffic wakes it at once.
+            if (usbdrive_state() == USBDRIVE_OFF) {
+#if PICOMULTILOADER_WIFI
+                webserver_wait_until(next_poll);
+#else
+                sleep_until(from_us_since_boot(next_poll));
+#endif
+            }
             continue;
         }
         next_poll = now + POLL_US;

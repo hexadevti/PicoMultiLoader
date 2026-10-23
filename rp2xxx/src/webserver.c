@@ -1379,6 +1379,15 @@ void webserver_poll(void)
     }
 }
 
+void webserver_wait_until(uint64_t until_us)
+{
+    if (s_radio_ready) {
+        cyw43_arch_wait_for_work_until(from_us_since_boot(until_us));
+    } else {
+        sleep_until(from_us_since_boot(until_us));
+    }
+}
+
 bool webserver_start(void)
 {
     if (s_status.state != WEB_OFF) {

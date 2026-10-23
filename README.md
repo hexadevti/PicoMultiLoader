@@ -345,7 +345,7 @@ Flash layout:
 | Chip | Layout |
 |---|---|
 | RP2040 (2 MB) | `0x000000` boot2 (ours, enters the loader) + app, up to `0x1BF000` · `0x1BF000` app record · `0x1C0000` loader (256 KB) |
-| RP2350 (4 MB) | `0x000000` boot stub + partition table (8 KB) · `0x002000` app (4088 KB), started with the bootrom's `chain_image`, which maps it to `0x10000000`. The loader runs from RAM. |
+| RP2350 (4 MB) | `0x000000` boot stub + partition table (8 KB) · `0x002000` app (3832 KB), started with the bootrom's `chain_image`, which maps it to `0x10000000` · `0x3C0000` Wi-Fi files (256 KB: the CYW43439 firmware and the web page). The loader runs from RAM. |
 
 Apps are normal Pico SDK flash builds linked at `0x10000000`; RAM-only (`no_flash`) UF2s are
 refused.
@@ -359,6 +359,11 @@ refused.
 2. **RP2350 only:** copy `pml2350.uf2` to the root of the SD card. Without it the menu can't open:
    the stub starts the app, or drops into BOOTSEL if there is none.
 3. Put the Pico back in the PicoCalc and switch it on: with no app installed, the menu opens.
+4. **Pico 2 W only:** the first time Wi-Fi is turned on (F4, or a network scan in Setup), the
+   loader copies the Wi-Fi files from `pml2350.uf2` into the last 256 KB of flash. That takes a few
+   seconds and happens again only when a new `pml2350.uf2` brings different files. The loader
+   keeps the CYW43439 firmware there rather than in RAM, which leaves it a ~205 KB heap. If the
+   installed app has written data into that area, the loader asks first, because installing erases it.
 
 On the RP2350, apps can also be installed through BOOTSEL: a normal RP2350 UF2 copied to the
 drive goes into the app partition at `0x2000`.
@@ -369,11 +374,44 @@ drive goes into the app partition at `0x2000`.
   2 MB flash: an app that writes there (a file system at "the end of flash", for example)
   overwrites the loader, which then has to be flashed again through BOOTSEL. On the RP2350 the
   app runs from a window mapped to `0x10000000`, so apps with a file system at the end of flash
-  (Arduino-Pico ones, for example) work.
+  (Arduino-Pico ones, for example) work. On the Pico 2 W, though, the last 256 KB holds the Wi-Fi
+  files: apps get 3832 KB, and an app that writes there loses that data when the Wi-Fi files are
+  installed (the loader asks first), and turns Wi-Fi off until they are installed again.
+* **The clock** is set from the web and is lost when an app runs or the power goes off (there is
+  no RTC). It comes back the next time Wi-Fi is on.
 * A power cut while flashing leaves no valid app; the menu opens at the next start. On the
   RP2040, a cut while sector 0 is being rewritten can also lose boot2: flash the loader again
   through BOOTSEL. (On the RP2350 the app's first sector is written last, so a half-written app
   is never started.)
+
+### The menu (RP2040 / RP2350)
+
+The Pico builds have a newer menu than the ESP32-P4 build described under [Usage](#usage). Some keys
+are different:
+
+| Key | Does |
+|---|---|
+| F1 | Control center: Wi-Fi, USB drive mode, backlight, idle screen, theme, and Setup |
+| F2 | Add or remove a favourite |
+| F3 | Files: the SD card. `.uf2` files flash; `.txt`, `.md`, `.log`, `.ini`, `.csv` open in a reader; `.bmp` in an image viewer. Tab: copy, cut, paste, delete |
+| F4 | Wi-Fi and the web file manager on/off (Pico 2 W) |
+| F5 | Terminal: `help` lists the commands (`ls`, `cd`, `cat`, `view`, `run`, `apps`, `date`, `tz`, `wifi`, `free`, `df`, `about`, ...) |
+| F10 (Shift+F5) | Screenshot to `/pml/shots/shot-NNN.bmp` |
+
+* **Home** is the start screen. It shows every top-level folder on the card that has an `app.ini` or a
+  `.uf2` in it, plus loose `.uf2` files in the root. Tabs: All, Recent, Favourites, and one per category.
+* **Idle screen:** after a while without a key press (set in the control center: 1-30 minutes or never),
+  a dim clock on black with the backlight turned down, redrawn once a minute; 10 minutes later the
+  backlight goes off. Between keyboard polls the loader sleeps the CPU (WFE), so it draws little
+  power when nothing is happening.
+* **Date and time** (Pico 2 W): once Wi-Fi has joined your network, the loader sends one HTTP request
+  to `ip-api.com`. The reply's `Date` header gives the time, and the body gives your connection's time
+  zone, with summer time included. It syncs again every 6 hours, and the time shows in the middle of the status bar. You can set the time zone by hand under
+  **Setup > Time zone**, or with `tz +01:00` in the terminal (`tz auto` goes back to automatic). Files the
+  loader writes get real dates once the time is known.
+* **Messages from apps:** an app can leave a line in `/pml/exit.txt`, which the menu shows once when
+  it opens. Alternatively, it can set watchdog scratch 2 = `0x504D4C58` and scratch 3 = an exit code
+  before rebooting into the menu.
 
 ### Build
 
@@ -394,9 +432,9 @@ point the build at a working one with `-DPICOTOOL_EXE=/path/to/picotool`.
 
 ### Differences from the ESP32-P4 build
 
-* **Settings** (Wi-Fi network, AP password, start folder, autostart, last folder) are kept in
-  `/picomultiloader.cfg` on the SD card instead of NVS.
-* **USB drive mode (F5)** uses the Pico's own micro-USB port (full speed, 12 Mbit/s). The serial
+* **Settings** (Wi-Fi network, AP password, start folder, autostart, last folder, theme, idle
+  screen, time zone) are kept in `/picomultiloader.cfg` on the SD card instead of NVS.
+* **USB drive mode** (control center, F1) uses the Pico's own micro-USB port (full speed, 12 Mbit/s). The serial
   console is on the PicoCalc's USB-C port (UART0, 115200).
 * **Web file manager (F4)**, Pico 2 W only: lwIP and the CYW43439 driver from the Pico SDK, with
   the same page, API, `picocalc.local` name, `PicoMultiLoader-XXXX` access point and DHCP server

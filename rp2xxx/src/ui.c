@@ -306,6 +306,27 @@ static bool web_running(void)
 
 // ---- drawing ----------------------------------------------------------------------------------
 // Status bar (title, Wi-Fi, battery); clears the screen first.
+// The clock in the middle of the status bar, once the time is known (set from the web)
+#define BAR_CLOCK_X ((LCD_W - 5 * 6) / 2)
+static int s_bar_minute = -1; // minute of the day shown, -1 = none
+
+static int bar_minute(void)
+{
+    clock_tm_t tm;
+    return clock_local(&tm) ? tm.hour * 60 + tm.min : -1;
+}
+
+static void draw_bar_clock(void)
+{
+    char text[12];
+    s_bar_minute = bar_minute();
+    lcd_fill_rect(BAR_CLOCK_X, 2, 5 * 6, 10, C_PANEL);
+    if (s_bar_minute >= 0) {
+        snprintf(text, sizeof(text), "%02d:%02d", s_bar_minute / 60, s_bar_minute % 60);
+        lcd_text(BAR_CLOCK_X, 3, text, C_FG, FONT_SMALL);
+    }
+}
+
 static void draw_bar(void)
 {
     look_anim_reset();
@@ -313,6 +334,7 @@ static void draw_bar(void)
     lcd_fill_rect(0, 0, LCD_W, BAR_H, C_PANEL);
     lcd_hline(0, BAR_H, LCD_W, C_LINE);
     lcd_text(6, 3, "PicoMultiLoader", C_FG, FONT_SMALL);
+    draw_bar_clock();
 
     int x = LCD_W - 6; // right edge of the next item, filled right to left
     if (s_battery >= 0) {
@@ -971,15 +993,16 @@ static const char *const HELP_TEXT[] = {
     "Wi-Fi: Enter turns Wi-Fi and the web server on or off; the address is shown below it.",
 #endif
     "USB drive: Enter starts USB drive mode. Backlight: Left/Right. Theme: Left/Right or Enter; your own .pal files go in " THEME_DIR ".",
-    "Idle screen: after that long without a key, the clock and date over a moving pattern, with the backlight dimmed. "
-    "Any key wakes it up, and does nothing else. Until the time is known it shows how long the loader has been on.",
+    "Idle screen: after that long without a key, a dim clock on black with the backlight turned down, to save the battery; "
+    "10 minutes later the backlight goes off. Any key wakes it up, and does nothing else. Until the time is known it "
+    "shows how long the loader has been on.",
     "Setup: the settings below. The battery charge is at the bottom. Esc or F1 closes it.",
     "",
 #if PICOMULTILOADER_WIFI
     "#Date and time",
     "There is no clock chip: while Wi-Fi is on and joined to your network, the loader asks ip-api.com for the time and "
     "the time zone of your connection (summer time included), then every 6 hours. It is lost when an app runs or the power goes off.",
-    "Terminal: date shows it. tz +01:00 sets the time zone by hand; tz auto goes back to the one from the web.",
+    "It shows in the middle of the status bar and on the idle screen. Terminal: date shows it. tz +01:00 sets the time zone by hand; tz auto goes back to the one from the web.",
     "Files the loader writes (uploads, screenshots) get the date once it is known.",
     "",
 #endif
@@ -2760,7 +2783,7 @@ static bool ctl_key(int key)
 #define TERM_COLS  ((LCD_W - 2 * TERM_X) / 6)
 #define TERM_Y     (BAR_H + 4)
 #define TERM_LH    10
-#define TERM_ROWS  ((FOOTER_Y - 2 - TERM_Y) / TERM_LH)
+#define TERM_ROWS  ((LCD_H - 2 - TERM_Y) / TERM_LH)
 #define TERM_LINES 80 // kept for scrolling back
 #define TERM_IN    96
 #define TERM_HIST  8
@@ -2787,9 +2810,9 @@ static void term_put(const char *text, uint8_t kind)
     printf("%s\n", text);
     s_term_back = 0;
     size_t len = strlen(text);
-    do { // wrap at the last space that fits
+    do { // wrap at the last space that fits (a typed command: at the column, as it was typed)
         size_t n = len > TERM_COLS ? TERM_COLS : len;
-        if (n < len) {
+        if (n < len && kind != 2) {
             size_t sp = n;
             while (sp > 0 && text[sp] != ' ') {
                 sp--;
@@ -2799,7 +2822,7 @@ static void term_put(const char *text, uint8_t kind)
         term_line(text, n, kind);
         text += n;
         len -= n;
-        while (*text == ' ') {
+        while (*text == ' ' && kind != 2) {
             text++;
             len--;
         }
@@ -2829,29 +2852,38 @@ static void enter_term(void)
 static void draw_term(void)
 {
     draw_bar();
+    // The prompt and what is being typed follow the output, like any terminal, wrapped at the
+    // column, with a block cursor after them (on a line of its own when the last one is full).
+    char line[TERM_IN + PATH_MAX_LEN + 8];
+    term_prompt(line, sizeof(line));
+    strlcat(line, s_term_in, sizeof(line));
+    int in_len = (int)strlen(line), in_rows = in_len / TERM_COLS + 1;
     int rows = TERM_ROWS, kept = s_term_n < TERM_LINES ? s_term_n : TERM_LINES;
-    int max_back = kept > rows ? kept - rows : 0;
+    int total = kept + in_rows;
+    int max_back = total > rows ? total - rows : 0;
     s_term_back = s_term_back > max_back ? max_back : s_term_back;
-    int last = s_term_n - s_term_back; // one past the bottom line shown
+    int first = total - rows - s_term_back; // the top line shown, counting from the oldest kept
     for (int r = 0; r < rows; r++) {
-        int k = last - rows + r;
-        if (k < 0 || k < s_term_n - kept) {
+        int k = first + r, y = TERM_Y + r * TERM_LH;
+        if (k < 0 || k >= total) {
             continue;
         }
-        int i = k % TERM_LINES;
-        lcd_color_t color = s_term_err[i] == 1 ? C_ERR : s_term_err[i] == 2 ? C_ACCENT : C_FG;
-        lcd_text(TERM_X, TERM_Y + r * TERM_LH, s_term[i], color, FONT_SMALL);
+        if (k < kept) {
+            int i = (s_term_n - kept + k) % TERM_LINES;
+            lcd_text(TERM_X, y, s_term[i], s_term_err[i] == 1 ? C_ERR : C_FG, FONT_SMALL);
+            continue;
+        }
+        int at = (k - kept) * TERM_COLS;
+        char part[TERM_COLS + 1];
+        strlcpy(part, line + (at < in_len ? at : in_len), sizeof(part));
+        int x = lcd_text(TERM_X, y, part, C_FG, FONT_SMALL);
+        if (k == total - 1) {
+            lcd_fill_rect(x, y - 1, 6, TERM_LH - 1, C_FG); // the cursor
+        }
     }
     if (s_term_back) {
         lcd_fill_rect(LCD_W - 3, TERM_Y + (rows * TERM_LH) * (max_back - s_term_back) / (max_back + 1), 2, 8, C_DIM);
     }
-    char line[TERM_IN + PATH_MAX_LEN + 8], shown[TERM_COLS + 1];
-    term_prompt(line, sizeof(line));
-    strlcat(line, s_term_in, sizeof(line));
-    strlcat(line, "_", sizeof(line));
-    size_t n = strlen(line), cols = (LCD_W - 2 * MARGIN) / 6;
-    strlcpy(shown, n > cols ? line + n - cols : line, sizeof(shown)); // keep the end in view
-    draw_footer(shown, C_BRIGHT, "Enter Run  Tab Complete  Up/Down History  Esc Clear");
 }
 
 static void term_history(void)
@@ -3234,52 +3266,18 @@ static bool image_key(int key)
 }
 
 // ---- idle screen ------------------------------------------------------------------------------
-// After the idle time without a key: a plasma whose colours rotate (nothing is redrawn but the
-// clock), how long the loader has been on, and the backlight dimmed. A key wakes it and does
-// nothing else.
-#define IDLE_FRAME_US 60000
+// After the idle time without a key: a dim clock on black with the backlight turned down, drawn
+// once a minute and nothing in between (the main loop sleeps meanwhile). It moves a little each
+// minute, and after IDLE_OFF_US more the backlight goes off. A key wakes it and does nothing else.
+#define IDLE_OFF_US   (10ull * 60 * 1000000)
 #define DIGIT_W       34
 #define DIGIT_H       62
 #define SEG           7
+#define IDLE_BLOCK_H  (DIGIT_H + 16 + 3 * 18) // the clock and the lines under it
 
-static bool s_idle;
-static uint64_t s_last_key_us, s_idle_frame_us;
-static int s_idle_phase, s_idle_minute;
-
-// sin() over a period of 64 steps, times 127 (whole numbers: no float library in RAM)
-static const int8_t SINE[64] = {
-    0,   12,   25,   37,   49,   60,   71,   81,   90,   98,   106,  112,  117,  122,  125,  126,
-    127, 126,  125,  122,  117,  112,  106,  98,   90,   81,   71,   60,   49,   37,   25,   12,
-    0,   -12,  -25,  -37,  -49,  -60,  -71,  -81,  -90,  -98,  -106, -112, -117, -122, -125, -126,
-    -127, -126, -125, -122, -117, -112, -106, -98, -90,  -81,  -71,  -60,  -49,  -37,  -25,  -12,
-};
-
-static int isin(int a)
-{
-    return SINE[a & 63];
-}
-
-static int isqrt(int n)
-{
-    int r = 0;
-    while ((r + 1) * (r + 1) <= n) {
-        r++;
-    }
-    return r;
-}
-
-static void idle_plasma(void)
-{
-    for (int y = 0; y < LCD_H; y += 4) {
-        for (int x = 0; x < LCD_W; x += 4) {
-            int dx = x - 160, dy = y - 120;
-            int v = isin(x * 64 / 144) + isin(y * 64 / 107) + isin((x + y) * 64 / 195) +
-                    isin(isqrt(dx * dx + dy * dy) * 64 / 82); // -508..508
-            int c = 1 + (v + 508) * 14 / 1017;                 // 1..14
-            lcd_fill_rect(x, y, 4, 4, (lcd_color_t)c);
-        }
-    }
-}
+static bool s_idle, s_idle_off;
+static uint64_t s_last_key_us, s_idle_since_us;
+static int s_idle_minute;
 
 // One 7-segment digit (or the colon, d = 10) with its top-left at x, y. Returns the next x.
 #define SEG_M ((DIGIT_H - SEG) / 2)
@@ -3317,74 +3315,62 @@ static int idle_minute(void)
 
 static void idle_draw(void)
 {
-    idle_plasma();
     clock_tm_t tm;
     bool known = clock_local(&tm);
     int minutes = idle_minute();
     s_idle_minute = minutes;
-    char clock[8], date[24], zone[48];
+    char clock[8], date[24], battery[24] = "";
     if (known) {
         snprintf(clock, sizeof(clock), "%02d:%02d", tm.hour, tm.min);
         clock_date_text(&tm, date, sizeof(date));
-        strlcpy(zone, clock_zone_name(), sizeof(zone));
     } else { // no time from the web yet: show how long we have been on
         snprintf(clock, sizeof(clock), "%d:%02d", minutes / 60 % 100, minutes % 60);
         strlcpy(date, "on for (h:mm)", sizeof(date));
-        strlcpy(zone, PICOMULTILOADER_WIFI ? "Wi-Fi on sets the clock" : "", sizeof(zone));
+    }
+    if (s_battery >= 0) {
+        snprintf(battery, sizeof(battery), s_charging ? "battery %d%% charging" : "battery %d%%", s_battery);
     }
     int w = 0;
     for (const char *c = clock; *c; c++) {
         w += *c == ':' ? SEG + 10 : DIGIT_W + 8;
     }
-    int x = (LCD_W - w + 8) / 2, y = 96;
-    for (int pass = 0; pass < 2; pass++) { // a shadow, then the digits
-        int cx = x + (pass ? 0 : 3), cy = y + (pass ? 0 : 3);
-        for (const char *c = clock; *c; c++) {
-            cx = idle_digit(cx, cy, *c == ':' ? 10 : *c - '0', pass ? 15 : 0);
-        }
+    // a different place each minute, spread over the screen (h * 37 % range: hops about)
+    int h = minutes * 37 + 11;
+    int xr = LCD_W - (w - 8) - 2 * MARGIN, yr = LCD_H - IDLE_BLOCK_H - 2 * MARGIN;
+    int x = MARGIN + (xr > 0 ? h % xr : 0), y = MARGIN + (h / 7) % yr;
+    lcd_fill_rect(0, 0, LCD_W, LCD_H, 0);
+    int cx = x;
+    for (const char *c = clock; *c; c++) {
+        cx = idle_digit(cx, y, *c == ':' ? 10 : *c - '0', 2);
     }
-    char battery[24] = "";
-    if (s_battery >= 0) {
-        snprintf(battery, sizeof(battery), s_charging ? "battery %d%% charging" : "battery %d%%", s_battery);
-    }
-    const char *lines[] = {date, zone, battery, "PicoMultiLoader - press a key"};
-    for (int i = 0; i < 4; i++) {
-        int lx = (LCD_W - 7 * (int)strlen(lines[i])) / 2, ly = y + DIGIT_H + 18 + i * 18 + (i == 3 ? 30 : 0);
-        lcd_text(lx + 1, ly + 1, lines[i], 0, FONT_LARGE);
-        lcd_text(lx, ly, lines[i], 15, FONT_LARGE);
+    const char *lines[] = {date, battery, PICOMULTILOADER_WIFI && !known ? "Wi-Fi on sets the clock" : ""};
+    int mid = x + (w - 8) / 2;
+    for (int i = 0; i < 3; i++) {
+        int lx = mid - 7 * (int)strlen(lines[i]) / 2;
+        lcd_text(lx < 0 ? 0 : lx, y + DIGIT_H + 16 + i * 18, lines[i], 1, FONT_LARGE);
     }
 }
 
-// One channel of a rainbow at hue h (0..255): up, full, down, off
-static int rainbow(int h)
+static void idle_backlight(int level)
 {
-    h &= 255;
-    return h < 43 ? h * 6 : h < 128 ? 255 : h < 171 ? (170 - h) * 6 : 0;
-}
-
-// The plasma's colours: a rainbow, kept dim, turning a little each frame
-static void idle_colors(void)
-{
-    for (int i = 1; i <= 14; i++) {
-        int h = (i - 1) * 256 / 14 + s_idle_phase;
-        lcd_set_palette((lcd_color_t)i, RGB565(rainbow(h + 85) * 3 / 5, rainbow(h) * 3 / 5, rainbow(h - 85) * 3 / 5));
+    if (kbd_present()) {
+        kbd_set_lcd_backlight((uint8_t)level);
     }
-    lcd_set_palette(0, RGB565(0, 0, 0));
-    lcd_set_palette(15, RGB565(255, 255, 255));
 }
 
 static void idle_start(void)
 {
     s_idle = true;
+    s_idle_off = false;
+    s_idle_since_us = time_us_64();
     look_anim_reset();
-    int dim = ui_backlight() / 5;
-    if (kbd_present()) {
-        kbd_set_lcd_backlight((uint8_t)(dim < 10 ? 10 : dim));
-    }
-    idle_colors();
+    lcd_set_palette(0, RGB565(0, 0, 0));
+    lcd_set_palette(1, RGB565(110, 110, 120)); // the lines
+    lcd_set_palette(2, RGB565(170, 170, 180)); // the digits
+    int dim = ui_backlight() / 8;
+    idle_backlight(dim < 6 ? 6 : dim);
     idle_draw();
     lcd_flush();
-    s_idle_frame_us = time_us_64();
 }
 
 static void idle_wake(void)
@@ -3393,9 +3379,7 @@ static void idle_wake(void)
         return;
     }
     s_idle = false;
-    if (kbd_present()) {
-        kbd_set_lcd_backlight(ui_backlight());
-    }
+    idle_backlight(ui_backlight());
     if (s_screen == SCREEN_IMAGE) {
         s_image_drawn = false; // decode it again, with its palette
     } else {
@@ -3414,16 +3398,16 @@ static void idle_tick(void)
         }
         return;
     }
-    if (now - s_idle_frame_us < IDLE_FRAME_US) {
-        return;
+    if (s_idle_off) {
+        return; // nothing to see: draw nothing
     }
-    s_idle_frame_us = now;
-    s_idle_phase = (s_idle_phase + 1) & 255;
-    idle_colors();
-    if (idle_minute() != s_idle_minute) {
+    if (now - s_idle_since_us > IDLE_OFF_US) {
+        s_idle_off = true;
+        idle_backlight(0);
+    } else if (idle_minute() != s_idle_minute) {
         idle_draw();
+        lcd_flush();
     }
-    lcd_flush();
 }
 
 // ---- screenshots (F10, Shift+F5) and exit messages ---------------------------------------------
@@ -3620,6 +3604,10 @@ void ui_tick(void)
     idle_tick();
     if (!s_idle) {
         look_tick();
+        if (s_screen != SCREEN_IMAGE && bar_minute() != s_bar_minute) { // the image viewer has no bar
+            draw_bar_clock();
+            lcd_flush();
+        }
     }
 #if PICOMULTILOADER_WIFI
     web_tick();

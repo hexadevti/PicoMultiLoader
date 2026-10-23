@@ -35,6 +35,9 @@ void webserver_stop(void);
 /** Drive Wi-Fi and the server. Call as often as possible from the main loop. */
 void webserver_poll(void);
 
+/** Sleep until `until_us` (time_us_64()) or until the radio has work, whichever is first. */
+void webserver_wait_until(uint64_t until_us);
+
 /** Copy the current status. Returns a counter that changes whenever the status does. */
 uint32_t webserver_status(web_status_t *out);
 
