@@ -12,6 +12,7 @@ enum {
     KEY_ENTER     = 0x0A,
     KEY_F1        = 0x81,
     KEY_F2        = 0x82,
+    KEY_F3        = 0x83,
     KEY_F4        = 0x84,
     KEY_F5        = 0x85,
     KEY_ESC       = 0xB1,

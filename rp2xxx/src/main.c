@@ -76,6 +76,7 @@ static int console_key(void)
     case 'F': return KEY_END;
     case 'P': return KEY_F1;
     case 'Q': return KEY_F2;
+    case 'R': return KEY_F3;
     case 'S': return KEY_F4; // ESC O S
     case 'T': return KEY_F5; // ESC O T (some terminals)
     default:
@@ -98,6 +99,7 @@ static int console_key(void)
     case 6: return KEY_PAGE_DOWN;
     case 11: return KEY_F1;
     case 12: return KEY_F2;
+    case 13: return KEY_F3;
     case 14: return KEY_F4;
     case 15: return KEY_F5;
     default: return KEY_NONE;

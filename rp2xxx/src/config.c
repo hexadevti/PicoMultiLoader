@@ -4,7 +4,7 @@
 #include <string.h>
 #include "ff.h"
 
-#define MAX_KEYS  16
+#define MAX_KEYS  12
 #define KEY_LEN   16
 #define VALUE_LEN 160
 

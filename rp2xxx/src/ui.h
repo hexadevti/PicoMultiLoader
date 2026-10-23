@@ -1,4 +1,4 @@
-// ui.h - the on-screen file browser (PicoCalc UF2 Loader style)
+// ui.h - the on-screen launcher: Home (the apps), the file list, Setup, Wi-Fi and USB screens
 #pragma once
 
 #include <stdbool.h>

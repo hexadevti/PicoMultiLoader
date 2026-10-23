@@ -54,5 +54,8 @@ bool uf2_flash(const char *path, const uf2_info_t *info, uf2_progress_cb_t progr
 /** Reboot straight into the installed app. Does not return. */
 void uf2_boot_installed(void);
 
+/** The file walk's read buffer (2 KB), free to borrow while no UF2 is inspected or flashed. */
+void *uf2_scratch(size_t *len);
+
 /** Name (and version) of the app currently in flash; false if there is none. */
 bool uf2_installed(char *name, size_t name_len, char *version, size_t version_len);

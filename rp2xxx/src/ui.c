@@ -1,4 +1,5 @@
-// ui.c - on-screen file browser: pick a .uf2 on the SD card, confirm, flash it and boot it.
+// ui.c - on-screen launcher: Home (the apps on the SD card) and the file list (F3). Pick a .uf2,
+// confirm, flash it and boot it; the app that is already installed starts without flashing.
 #include "ui.h"
 
 #include <stdio.h>
@@ -6,6 +7,7 @@
 #include <string.h>
 #include <strings.h>
 #include "pico/stdlib.h"
+#include "apps.h"
 #include "config.h"
 #include "fileops.h"
 #include "keyboard.h"
@@ -37,11 +39,13 @@
 typedef struct {
     char *name;
     bool is_dir;
+    bool fav; // in the favourites
     uint32_t size;
 } entry_t;
 
 typedef enum {
-    SCREEN_BROWSE,
+    SCREEN_HOME,      // the apps (the start screen)
+    SCREEN_BROWSE,    // F3: the file list
     SCREEN_CONFIRM,
     SCREEN_ERROR,
     SCREEN_USB,
@@ -50,15 +54,23 @@ typedef enum {
     SCREEN_WIFI_SCAN, // pick a network from a scan
     SCREEN_HELP,      // how to use the loader (from F1)
     SCREEN_PICK,      // choose the start folder (from F1)
-    SCREEN_FILES,     // F2: copy / move / delete / paste
+    SCREEN_FILES,     // Tab: copy / move / delete / paste
     SCREEN_DELETE,    // confirm a delete
 } screen_t;
 
 static screen_t s_screen;
+static screen_t s_base; // SCREEN_HOME or SCREEN_BROWSE: where Esc goes back to
 static bool s_sd_ok;
 static char s_cwd[PATH_MAX_LEN]; // absolute FatFS path, "" for the root, e.g. "/apps"
-static entry_t s_entries[MAX_ENTRIES];
-static int s_count;
+// The file list and Home's apps share the memory: only the one on s_base is kept.
+static union {
+    entry_t files[MAX_ENTRIES];
+    apps_t apps;
+} s_list;
+#define s_entries s_list.files
+#define s_apps    s_list.apps
+static int s_count; // entries in s_entries; 0 while s_apps is in use
+static int s_shown_n; // apps shown on Home; 0 while s_entries is in use
 static int s_sel, s_top;
 static int s_battery = -1;
 static bool s_charging;
@@ -66,6 +78,7 @@ static bool s_charging;
 static char s_sel_path[PATH_MAX_LEN + 256];
 static char s_sel_name[64];
 static uf2_info_t s_info;
+static bool s_confirm_run; // the confirm screen's file is the installed app: Enter just starts it
 static char s_error[128];
 static const char *s_path_override; // shown in the header instead of s_cwd
 
@@ -167,6 +180,7 @@ static void free_entries(void)
 static void scan_dir(void)
 {
     free_entries();
+    s_shown_n = 0; // the apps are gone
     s_sel = s_top = 0;
     if (!s_sd_ok) {
         return;
@@ -183,8 +197,11 @@ static void scan_dir(void)
             continue;
         }
         entry_t *e = &s_entries[s_count];
+        char path[PATH_MAX_LEN + 64];
+        bool fits = (size_t)snprintf(path, sizeof(path), "%s/%s", s_cwd, fi.fname) < sizeof(path);
         e->name = strdup(fi.fname);
         e->is_dir = dir_entry;
+        e->fav = fits && apps_is_fav(path);
         e->size = dir_entry ? 0 : (uint32_t)fi.fsize;
         if (e->name) {
             s_count++;
@@ -273,8 +290,8 @@ static bool web_running(void)
 #endif
 
 // ---- drawing ----------------------------------------------------------------------------------
-// Status bar (title, Wi-Fi, battery) and the path line; clears the screen first.
-static void draw_header(void)
+// Status bar (title, Wi-Fi, battery); clears the screen first.
+static void draw_bar(void)
 {
     look_anim_reset();
     lcd_fill_rect(0, 0, LCD_W, LCD_H, C_BG);
@@ -302,7 +319,12 @@ static void draw_header(void)
         lcd_fill_rect(x + 3 * i, 9 - 2 * i, 2, 3 + 2 * i, s_icon_shown == C_BG ? C_LINE : s_icon_shown);
     }
 #endif
+}
 
+// The status bar and the path line.
+static void draw_header(void)
+{
+    draw_bar();
     char path[COLS + 1], shown[PATH_MAX_LEN + 8];
     snprintf(shown, sizeof(shown), "Path: SD%s", s_path_override ? s_path_override : s_cwd);
     if (strlen(shown) == strlen("Path: SD")) {
@@ -313,7 +335,7 @@ static void draw_header(void)
     lcd_hline(MARGIN - 4, PATH_Y + 16, LCD_W - 2 * (MARGIN - 4), C_LINE);
 }
 
-static const char *const KEY_NAMES[] = {"Enter", "Esc", "Left", "Del", "Up/Down", "PgUp/PgDn"};
+static const char *const KEY_NAMES[] = {"Enter", "Esc", "Left", "Del", "Tab", "R", "Up/Down", "PgUp/PgDn"};
 
 // `keys` is "Enter Open  F1 Setup  Esc Back": items two spaces apart, each a key and what it does.
 // Function keys get a raised cap; an item that doesn't start with a key is shown as it is.
@@ -359,11 +381,18 @@ static void draw_footer(const char *line1, lcd_color_t line1_color, const char *
     }
 }
 
-// A dialog over the dimmed file list, with a striped top edge. Content starts at LIST_Y + 4.
 static void draw_browse(void);
+static void draw_home(void);
+static void reload_base(void);
+
+// A dialog over the dimmed Home or file list, with a striped top edge. Content starts at LIST_Y + 4.
 static void draw_dialog(int h)
 {
-    draw_browse();
+    if (s_base == SCREEN_HOME) {
+        draw_home();
+    } else {
+        draw_browse();
+    }
     look_dither(BAR_H + 1, LCD_H - BAR_H - 1);
     int y = LIST_Y - 8;
     lcd_fill_rect(2, y, LCD_W - 4, h, C_PANEL);
@@ -415,19 +444,23 @@ static void draw_browse(void)
 
         entry_t *e = item_entry(idx);
         char label[COLS + 1], buf[300];
+        int size_cols = 0;
         if (!e) {
             lcd_text(MARGIN, y, "[..]", fg, FONT_LARGE);
         } else if (e->is_dir) {
             snprintf(buf, sizeof(buf), "[%s]", e->name);
-            fit(label, buf, COLS);
+            fit(label, buf, COLS - 2);
             lcd_text(MARGIN, y, label, fg, FONT_LARGE);
         } else {
             char size[12];
             format_size(size, sizeof(size), e->size);
-            int size_cols = (int)strlen(size);
-            fit(label, e->name, COLS - size_cols - 1);
+            size_cols = (int)strlen(size) + 1;
+            fit(label, e->name, COLS - size_cols - 2);
             lcd_text(MARGIN, y, label, fg, FONT_LARGE);
-            lcd_text(LCD_W - MARGIN - 7 * size_cols, y, size, sel ? C_SEL_FG : C_DIM, FONT_LARGE);
+            lcd_text(LCD_W - MARGIN - 7 * (size_cols - 1), y, size, sel ? C_SEL_FG : C_DIM, FONT_LARGE);
+        }
+        if (e && e->fav) {
+            lcd_text(LCD_W - MARGIN - 7 * (size_cols + 1), y, "*", sel ? C_SEL_FG : C_WARN, FONT_LARGE);
         }
     }
 
@@ -445,7 +478,7 @@ static void draw_browse(void)
         strlcpy(installed, s_note, sizeof(installed));
         color = s_note_color;
     } else if (s_clip[0]) {
-        snprintf(installed, sizeof(installed), "%s %s - V pastes, Esc forgets", s_clip_cut ? "Cut" : "Copied",
+        snprintf(installed, sizeof(installed), "%s %s - V pastes here, Esc forgets", s_clip_cut ? "Cut" : "Copied",
                  strrchr(s_clip, '/') + 1);
         color = C_ACCENT;
     } else if (uf2_installed(name, sizeof(name), version, sizeof(version))) {
@@ -457,9 +490,9 @@ static void draw_browse(void)
     fit(line, installed, (LCD_W - 2 * MARGIN) / 6);
     draw_footer(line, color,
 #if PICOMULTILOADER_WIFI
-                "Enter Open  F1 Setup  F2 Files  F4 Web  F5 USB"
+                "Enter Open  Tab Actions  F2 Fav  F3 Home  F4 Web  F5 USB"
 #else
-                "Enter Open  F1 Setup  F2 Files  F5 USB drive"
+                "Enter Open  Tab Actions  F2 Fav  F3 Home  F5 USB drive"
 #endif
     );
 }
@@ -477,7 +510,8 @@ static void draw_confirm(void)
     draw_dialog(156);
     char buf[96];
     int y = LIST_Y + 4;
-    lcd_text(MARGIN, y, "Flash and run this app?", C_ACCENT, FONT_LARGE);
+    lcd_text(MARGIN, y, s_confirm_run ? "Run this app? It is installed." : "Flash and run this app?", C_ACCENT,
+             FONT_LARGE);
     y += 2 * ROW_H;
     draw_kv(y, "File", s_sel_name);
     y += ROW_H;
@@ -495,7 +529,7 @@ static void draw_confirm(void)
     snprintf(buf, sizeof(buf), "flash, %u of %u KB", (unsigned)((s_info.addr_hi - s_info.addr_lo + 1023) / 1024),
              (unsigned)(uf2_flash_capacity() / 1024));
     draw_kv(y, "Type", buf);
-    draw_footer(NULL, C_FG, "Enter Flash & run  Esc Back");
+    draw_footer(NULL, C_FG, s_confirm_run ? "Enter Run  R Reflash  Esc Back" : "Enter Flash & run  Esc Back");
 }
 
 static void draw_wrapped(int y, const char *text, lcd_color_t color)
@@ -574,8 +608,7 @@ static void draw_usb(void)
     lcd_text(MARGIN + 70, y, status, color, FONT_LARGE);
     y += 2 * ROW_H;
     draw_wrapped(y, help, C_DIM);
-    draw_footer(NULL, C_FG, st == USBDRIVE_CONNECTED ? "Esc Stop (eject on the PC first!)"
-                                                     : "Esc Back to the file list");
+    draw_footer(NULL, C_FG, st == USBDRIVE_CONNECTED ? "Esc Stop (eject on the PC first!)" : "Esc Back");
 }
 
 static void leave_usb(void)
@@ -585,8 +618,10 @@ static void leave_usb(void)
     if (!s_sd_ok || !is_dir(s_cwd)) {
         strlcpy(s_cwd, SDCARD_MOUNT_POINT, sizeof(s_cwd));
     }
-    scan_dir();
-    s_screen = SCREEN_BROWSE;
+    config_reload(); // the PC may have changed anything
+    apps_reload();
+    reload_base();
+    s_screen = s_base;
 }
 
 #if PICOMULTILOADER_WIFI
@@ -601,9 +636,10 @@ static void enter_usb(void)
     }
 #endif
     free_entries(); // the listing goes stale while the PC owns the card
+    s_shown_n = s_apps.count = 0;
     if (!usbdrive_start()) {
         s_sd_ok = sdcard_mount();
-        scan_dir();
+        reload_base();
         snprintf(s_error, sizeof(s_error), "Could not start USB drive mode: no SD card, or it did not answer.");
         strlcpy(s_sel_name, "(SD card)", sizeof(s_sel_name));
         s_screen = SCREEN_ERROR;
@@ -683,7 +719,7 @@ static void draw_web(void)
         break;
     }
     draw_footer(st.state == WEB_FAILED ? "The server is still on until you stop it." : "Esc leaves it running in the background.",
-                C_DIM, st.state == WEB_FAILED ? "Esc Stop the server" : "Esc Back to the files  F4 Stop server");
+                C_DIM, st.state == WEB_FAILED ? "Esc Stop the server" : "Esc Back  F4 Stop server");
 }
 
 static uint32_t s_web_changes_seen;
@@ -696,8 +732,9 @@ static void stop_web(void)
         strlcpy(s_cwd, SDCARD_MOUNT_POINT, sizeof(s_cwd));
     }
     config_reload(); // the browser may have changed anything
-    scan_dir();
-    s_screen = SCREEN_BROWSE;
+    apps_reload();
+    reload_base();
+    s_screen = s_base;
 }
 
 static void enter_web(void)
@@ -728,7 +765,7 @@ enum { WF_START, WF_THEME, WF_HELP, WF_ROWS };
 #define WF_ROW_H   17
 #define WF_FIELD_X (MARGIN + 74)
 #define WF_COLS    ((LCD_W - MARGIN - WF_FIELD_X - 4) / 7)
-#define MAX_APS    24
+#define MAX_APS    16
 
 static int s_wf_row;
 static char s_wf_msg[64];
@@ -757,24 +794,32 @@ static const char *const HELP_TEXT[] = {
     "Copy Raspberry Pi Pico 2 (RP2350) programs (.uf2 files) to the SD card, pick one here, and the loader flashes it and boots it.",
 #endif
     "",
-    "#The file list",
-    "Up/Down, PgUp/PgDn, Home/End: move.",
-    "Enter or Right: open a folder, or show the details of a .uf2 file.",
-    "Enter on the details screen: flash and run it. Esc: back.",
-    "Backspace or Left: parent folder.",
-    "The installed app starts after flashing, or on power-on.",
+    "#Home",
+    "The apps on the card: each folder in the root with an app.ini or a .uf2 in it, and each .uf2 in the root.",
+    "Arrows, PgUp/PgDn, Home/End: move. Tab: next tab (All, Recent, Favourites, then by category).",
+    "Type to search all the apps; Backspace deletes, Esc clears.",
+    "Enter: run the app. The installed one (green dot) starts at once; any other is flashed first.",
+    "F2: add to or remove from Favourites (yellow star). F3: Files.",
 #if PICOMULTILOADER_WIFI
-    "F1: Setup (Wi-Fi network, start folder) and this help.",
-    "F2: copy, move or delete. F4: web file manager. F5: USB drive mode.",
+    "F1: Setup and this help. F4: web file manager. F5: USB drive mode.",
 #else
-    "F1: Setup (start folder) and this help.",
-    "F2: copy, move or delete. F5: USB drive mode.",
+    "F1: Setup and this help. F5: USB drive mode.",
 #endif
-    "Only folders and .uf2 files are listed. The last folder and file are remembered.",
     "No card? Insert a FAT32 card and press Enter.",
     "",
-    "#Copy, move and delete (F2)",
-    "F2 opens a menu for the selected file or folder: Copy, Cut (to move it), Paste and Delete.",
+    "#App folders",
+    "An app.ini in the folder describes the app, one key = value per line: name, category (Emulators, Tools, Dev "
+    "or Media), icon (a 32x32 16-colour BMP, icon.bmp if not set), binary (the .uf2 to run), version, author, desc "
+    "and board (rp2040, rp2350 or any). A folder with several .uf2 files and no binary opens in Files.",
+    "",
+    "#Files (F3)",
+    "Up/Down, PgUp/PgDn, Home/End: move. Enter or Right: open a folder, or show a .uf2 file's details; Enter there "
+    "flashes and runs it (or just runs it if it is installed; R reflashes).",
+    "Backspace or Left: parent folder; at the top, back to Home. Esc or F3: Home. F2: favourite.",
+    "Only folders and .uf2 files are listed. The last folder and file are remembered.",
+    "",
+    "#Copy, move and delete (Tab)",
+    "Tab opens a menu for the selected file or folder: Copy, Cut (to move it), Paste and Delete.",
     "Shortcuts in the file list: C copy, X cut, V paste into the folder shown, Del delete. Esc forgets what was copied.",
     "Copy or Cut, go to another folder, then Paste. Pasting a copy where the name is taken adds a number, e.g. app (2).uf2.",
     "Deleting a folder deletes everything in it.",
@@ -815,7 +860,7 @@ static const char *const HELP_TEXT[] = {
 #else
     "Up/Down: move. Enter: select. Settings are kept in picomultiloader.cfg on the SD card.",
 #endif
-    "Start folder: the folder the file list opens in at switch-on. Choose one, or Remember the last folder (the default).",
+    "Start folder: the folder Files (F3) opens in at switch-on. Choose one, or Remember the last folder (the default).",
     "",
 #if PICOMULTILOADER_WIFI
     "#Web file manager (F4)",
@@ -823,7 +868,7 @@ static const char *const HELP_TEXT[] = {
     "With no network saved, or if joining fails within 20 s, it makes its own network PicoMultiLoader-XXXX. Its password and the address http://192.168.4.1/ are shown on screen.",
     "In the browser: upload (drag and drop works), download, rename, delete, new folder, and Flash a .uf2 straight away.",
     "There is no login: use it on trusted networks only.",
-    "Esc goes back to the files and keeps the server running. A Wi-Fi icon at the top shows it is on: green ready, blue starting, amber reconnecting, red failed. The file list refreshes when the browser changes files.",
+    "Esc goes back and keeps the server running. A Wi-Fi icon at the top shows it is on: green ready, blue starting, amber reconnecting, red failed. Home and Files refresh when the browser changes files.",
     "F4 shows the server screen again; F4 there stops it. Flashing a file or USB drive mode stops it too.",
     "",
 #endif
@@ -835,44 +880,28 @@ static const char *const HELP_TEXT[] = {
 #endif
     "",
     "#Serial console",
-    "115200 baud on the PicoCalc's USB-C port. Arrows, Enter, Backspace, Del, Esc, F1, F2, F4, F5 and typing work like the PicoCalc keyboard.",
+    "115200 baud on the PicoCalc's USB-C port. Arrows, Enter, Tab, Backspace, Del, Esc, F1-F5 and typing work like the PicoCalc keyboard.",
     "",
     "#This help",
     "Up/Down: scroll. PgUp/PgDn: page. Home/End: top/bottom. Esc: back.",
 };
 
-#define HELP_MAX_LINES 200
-typedef struct {
-    const char *text;
-    uint8_t len;
-    bool heading;
-} help_line_t;
-
-static help_line_t s_help[HELP_MAX_LINES];
 static int s_help_count, s_help_top;
 
-static void help_add(const char *text, size_t len, bool heading)
+// Wrap HELP_TEXT into screen lines on the fly, drawing lines first..first+rows-1 at the top of the
+// list. Returns how many lines there are.
+static int help_lines(int first, int rows)
 {
-    if (s_help_count < HELP_MAX_LINES) {
-        s_help[s_help_count++] = (help_line_t){text, (uint8_t)len, heading};
-    }
-}
-
-// Wrap HELP_TEXT into screen lines (once).
-static void help_layout(void)
-{
-    if (s_help_count) {
-        return;
-    }
+    int k = 0;
     for (size_t i = 0; i < sizeof(HELP_TEXT) / sizeof(HELP_TEXT[0]); i++) {
         const char *t = HELP_TEXT[i];
         bool heading = t[0] == '#';
         t += heading;
         size_t len = strlen(t);
         if (!len) {
-            help_add("", 0, false);
+            k++;
         }
-        for (size_t pos = 0; pos < len;) {
+        for (size_t pos = 0; pos < len; k++) {
             size_t n = len - pos > COLS - 1 ? COLS - 1 : len - pos; // leave room for the scroll bar
             if (pos + n < len) { // break at the last space
                 size_t sp = n;
@@ -883,18 +912,26 @@ static void help_layout(void)
                     n = sp;
                 }
             }
-            help_add(t + pos, n, heading);
+            if (k >= first && k < first + rows) {
+                char line[COLS + 1];
+                memcpy(line, t + pos, n);
+                line[n] = '\0';
+                lcd_text(MARGIN, LIST_Y + (k - first) * ROW_H, line, heading ? C_ACCENT : C_FG, FONT_LARGE);
+            }
             pos += n;
             while (t[pos] == ' ') {
                 pos++;
             }
         }
     }
+    return k;
 }
 
 static void enter_help(void)
 {
-    help_layout();
+    if (!s_help_count) {
+        s_help_count = help_lines(0, 0);
+    }
     s_help_top = 0;
     s_screen = SCREEN_HELP;
 }
@@ -906,13 +943,7 @@ static void draw_help(void)
     if (s_help_top > max_top) {
         s_help_top = max_top;
     }
-    for (int r = 0; r < LIST_ROWS && s_help_top + r < s_help_count; r++) {
-        const help_line_t *l = &s_help[s_help_top + r];
-        char line[COLS + 1];
-        memcpy(line, l->text, l->len);
-        line[l->len] = '\0';
-        lcd_text(MARGIN, LIST_Y + r * ROW_H, line, l->heading ? C_ACCENT : C_FG, FONT_LARGE);
-    }
+    help_lines(s_help_top, LIST_ROWS);
     if (max_top) { // scroll bar
         int track = LIST_ROWS * ROW_H;
         int h = track * LIST_ROWS / s_help_count;
@@ -980,7 +1011,7 @@ static void enter_wifi(void)
 // ---- start folder (Setup) ---------------------------------------------------------------------
 // Rows: "use this folder", "remember the last folder", then ".." (below the root) and subfolders.
 enum { PICK_USE, PICK_LAST, PICK_FIRST };
-#define MAX_PICK 128
+#define MAX_PICK 64
 
 static char s_start_dir[PATH_MAX_LEN]; // folder to open at switch-on, "/" = root; "" = the last one used
 static char s_pick[PATH_MAX_LEN];      // folder being looked at in the picker ("" = root)
@@ -1167,7 +1198,7 @@ static bool pick_key(int key)
         if (s_pick_sel == PICK_USE) {
             strlcpy(s_start_dir, sd_path(s_pick), sizeof(s_start_dir));
             sd_name(name, sizeof(name), s_pick);
-            snprintf(msg, sizeof(msg), "Opens %.40s at switch-on.", name);
+            snprintf(msg, sizeof(msg), "Files opens %.36s at switch-on.", name);
         } else {
             s_start_dir[0] = '\0';
             snprintf(msg, sizeof(msg), "Opens the last folder used.");
@@ -1268,7 +1299,7 @@ static void draw_wifi(void)
     y += ROW_H + 2;
     draw_wrapped(y, s_wf_row <= WF_PASS    ? "Type to edit, Backspace deletes. 2.4 GHz networks only."
                     : s_wf_row == WF_HELP ? "Keys, flashing, Wi-Fi, web and USB drive mode explained."
-                    : s_wf_row == WF_START ? "The folder the file list opens in when you switch on."
+                    : s_wf_row == WF_START ? "The folder Files (F3) opens in when you switch on."
                     : s_wf_row == WF_AUTO  ? "ON: the web file manager starts by itself at switch-on."
                     : s_wf_row == WF_THEME ? THEME_HINT
                                           : "F4 joins this network and starts the web file manager.",
@@ -1365,7 +1396,7 @@ static void draw_wifi(void)
     y += ROW_H + 2;
     draw_wrapped(y, s_wf_row == WF_HELP    ? "Keys, flashing and USB drive mode explained."
                     : s_wf_row == WF_THEME ? THEME_HINT
-                                           : "The folder the file list opens in when you switch on.",
+                                           : "The folder Files (F3) opens in when you switch on.",
                  C_DIM);
     draw_footer(NULL, C_FG, "Up/Down Move  Enter Select  Esc Back");
 }
@@ -1412,7 +1443,7 @@ static bool wifi_key(int key)
 #endif
     case KEY_ESC:
     case KEY_F1:
-        s_screen = SCREEN_BROWSE;
+        s_screen = s_base;
         return true;
     case KEY_ENTER:
         break;
@@ -1531,7 +1562,7 @@ static void rescan_dir(void)
     }
 }
 
-// ---- copy / move / delete (F2) ----------------------------------------------------------------
+// ---- copy / move / delete (Tab) ---------------------------------------------------------------
 enum { FA_COPY, FA_CUT, FA_PASTE, FA_DELETE, FA_FORGET };
 static int s_fa_items[5], s_fa_count, s_fa_sel;
 static char s_fa_path[PATH_MAX_LEN + 64]; // the file or folder the menu / delete screen is about
@@ -1693,14 +1724,17 @@ static void paste(void)
         return;
     }
     bool same_folder = (size_t)(name - 1 - s_clip) == strlen(s_cwd) && strncasecmp(s_clip, s_cwd, strlen(s_cwd)) == 0;
-    static char dst[PATH_MAX_LEN + 80], shown[PATH_MAX_LEN + 96]; // static: the main stack is small
+    // In the UF2 reader's buffer (idle while pasting): the main stack is small.
+    size_t scratch_len;
+    char *dst = uf2_scratch(&scratch_len), *shown = dst + PATH_MAX_LEN + 80;
+    _Static_assert(2 * PATH_MAX_LEN + 176 <= 2048, "paste scratch");
     char err[96];
     if (s_clip_cut) {
         if (same_folder) {
             note(C_DIM, "%s is already in this folder.", name);
             return;
         }
-        snprintf(dst, sizeof(dst), "%s/%s", s_cwd, name);
+        snprintf(dst, PATH_MAX_LEN + 80, "%s/%s", s_cwd, name);
         if (fileops_exists(dst)) {
             note(C_ERR, "There is already a %s here.", name);
             return;
@@ -1712,15 +1746,15 @@ static void paste(void)
         note(C_OK, "Moved %s here", name);
         s_clip[0] = '\0';
     } else {
-        if (!free_name(dst, sizeof(dst), name, folder)) {
+        if (!free_name(dst, PATH_MAX_LEN + 80, name, folder)) {
             note(C_ERR, "Too many copies of %s here.", name);
             return;
         }
         draw_header();
         lcd_text(MARGIN, LIST_Y + 4, folder ? "Copying folder..." : "Copying...", C_ACCENT, FONT_LARGE);
-        sd_name(shown, sizeof(shown), s_clip);
+        sd_name(shown, PATH_MAX_LEN + 96, s_clip);
         draw_kv(LIST_Y + 4 + 2 * ROW_H, "From", shown);
-        sd_name(shown, sizeof(shown), dst);
+        sd_name(shown, PATH_MAX_LEN + 96, dst);
         draw_kv(LIST_Y + 4 + 3 * ROW_H, "To", shown);
         draw_footer(NULL, C_FG, "Please wait");
         lcd_flush();
@@ -1813,13 +1847,12 @@ static bool files_key(int key)
         s_fa_sel = s_fa_sel > 0 ? s_fa_sel - 1 : s_fa_count - 1;
         return true;
     case KEY_DOWN:
-    case KEY_TAB:
         s_fa_sel = s_fa_sel + 1 < s_fa_count ? s_fa_sel + 1 : 0;
         return true;
     case KEY_ESC:
     case KEY_BACKSPACE:
     case KEY_LEFT:
-    case KEY_F2:
+    case KEY_TAB:
         s_screen = SCREEN_BROWSE;
         return true;
     case KEY_ENTER:
@@ -1847,6 +1880,470 @@ static bool files_key(int key)
         break;
     }
     return true;
+}
+
+// ---- Home: the apps ---------------------------------------------------------------------------
+enum { TAB_ALL, TAB_RECENT, TAB_FAVS, TAB_CAT }; // then one per category
+#define TABS       (TAB_CAT + APP_CATS - 1)
+#define TAB_Y      (BAR_H + 4)
+#define GRID_Y     40
+#define GRID_COLS  4
+#define GRID_ROWS  4
+#define CELL_W     (LCD_W / GRID_COLS)
+#define CELL_H     58
+#define FILTER_MAX 16
+#define RUN_KEY    "run_path" // "size.date.time|path" of the .uf2 flashed last, to know it is installed
+
+static uint8_t s_shown[APPS_MAX];     // the apps on the tab (indexes into s_apps.list), in order
+static int s_tab, s_hsel, s_htop;     // s_htop: the first grid row shown
+static int s_running = -1;            // the installed app, -1 = none of these
+static char s_filter[FILTER_MAX + 1]; // typed: search all the apps
+static int s_info_for = -1;           // the app s_app_info is about
+static app_info_t s_app_info;
+
+// The file's size and time with its path: it is the installed app while this matches.
+static bool run_stamp(const char *path, char *out, size_t len)
+{
+    FILINFO fi;
+    if (f_stat(sd_path(path), &fi) != FR_OK) {
+        return false;
+    }
+    snprintf(out, len, "%lu.%u.%u|%s", (unsigned long)fi.fsize, fi.fdate, fi.ftime, path);
+    return true;
+}
+
+// The .uf2 that was flashed last, if it is still the app in flash and unchanged on the card.
+static bool installed_path(char *out, size_t len)
+{
+    char have[160], want[160], name[8], version[8];
+    const char *bar;
+    if (!load_setting(RUN_KEY, have, sizeof(have)) || !(bar = strchr(have, '|')) ||
+        !uf2_installed(name, sizeof(name), version, sizeof(version)) || !run_stamp(bar + 1, want, sizeof(want)) ||
+        strcasecmp(want, have) != 0) {
+        return false;
+    }
+    strlcpy(out, bar + 1, len);
+    return true;
+}
+
+static bool is_installed(const char *path)
+{
+    char run[PATH_MAX_LEN + 64];
+    return installed_path(run, sizeof(run)) && strcasecmp(run, path) == 0;
+}
+
+static const char *tab_name(int tab)
+{
+    return tab == TAB_ALL ? "All" : tab == TAB_RECENT ? "Recent" : tab == TAB_FAVS ? "Favourites"
+                                                                   : apps_cat_name(tab - TAB_CAT + 1);
+}
+
+static bool contains(const char *s, const char *part) // ignoring case
+{
+    size_t n = strlen(part);
+    for (; *s; s++) {
+        if (strncasecmp(s, part, n) == 0) {
+            return true;
+        }
+    }
+    return !n;
+}
+
+static bool on_tab(const app_t *e)
+{
+    if (s_filter[0]) {
+        return contains(apps_str(&s_apps, e->title), s_filter);
+    }
+    switch (s_tab) {
+    case TAB_ALL:
+        return !(e->flags & APP_EXTRA);
+    case TAB_RECENT:
+        return e->recent >= 0;
+    case TAB_FAVS:
+        return e->flags & APP_FAV;
+    default:
+        return e->cat == s_tab - TAB_CAT + 1;
+    }
+}
+
+static int home_index(void) // the selected app in s_apps.list, -1 = none
+{
+    return s_hsel < s_shown_n ? s_shown[s_hsel] : -1;
+}
+
+// Fill s_shown for the tab or the search; `keep` (a s_apps.list index) stays selected if shown.
+static void home_build(int keep)
+{
+    s_shown_n = 0;
+    for (int i = 0; i < s_apps.count; i++) {
+        if (on_tab(&s_apps.list[i])) {
+            s_shown[s_shown_n++] = (uint8_t)i;
+        }
+    }
+    if (s_tab == TAB_RECENT && !s_filter[0]) { // the last run first
+        for (int i = 1; i < s_shown_n; i++) {
+            uint8_t v = s_shown[i];
+            int j = i;
+            for (; j > 0 && s_apps.list[s_shown[j - 1]].recent > s_apps.list[v].recent; j--) {
+                s_shown[j] = s_shown[j - 1];
+            }
+            s_shown[j] = v;
+        }
+    }
+    s_hsel = s_htop = 0;
+    for (int i = 0; i < s_shown_n; i++) {
+        if (s_shown[i] == keep) {
+            s_hsel = i;
+        }
+    }
+    s_info_for = -1;
+}
+
+// Show Home, reading the apps from the card again.
+static void go_home(void)
+{
+    char keep[PATH_MAX_LEN] = "", run[PATH_MAX_LEN + 64], bin[PATH_MAX_LEN + 64];
+    int sel = home_index();
+    if (sel >= 0) {
+        strlcpy(keep, apps_str(&s_apps, s_apps.list[sel].path), sizeof(keep));
+    }
+    free_entries();
+    s_base = s_screen = SCREEN_HOME;
+    s_apps.count = 0;
+    if (s_sd_ok) {
+        apps_scan(&s_apps);
+    }
+    bool have_run = installed_path(run, sizeof(run));
+    s_running = sel = -1;
+    for (int i = 0; i < s_apps.count; i++) {
+        const app_t *e = &s_apps.list[i];
+        if (have_run && s_running < 0 && apps_binary_path(&s_apps, e, bin, sizeof(bin)) && strcasecmp(bin, run) == 0) {
+            s_running = i;
+        }
+        if (keep[0] && strcasecmp(apps_str(&s_apps, e->path), keep) == 0) {
+            sel = i;
+        }
+    }
+    home_build(sel);
+}
+
+// Show the file list in s_cwd, with the file flashed last selected if it is there.
+static void go_files(void)
+{
+    if (!is_dir(s_cwd)) {
+        strlcpy(s_cwd, SDCARD_MOUNT_POINT, sizeof(s_cwd));
+    }
+    s_base = s_screen = SCREEN_BROWSE;
+    scan_dir();
+    char last_file[64];
+    if (load_setting("last_file", last_file, sizeof(last_file))) {
+        select_name(last_file);
+    }
+    save_setting("last_dir", sd_path(s_cwd));
+}
+
+// Read the card again for the screen under the others (after USB drive mode, the web server...).
+static void reload_base(void)
+{
+    if (s_base == SCREEN_HOME) {
+        go_home();
+    } else {
+        rescan_dir();
+    }
+}
+
+// No card: try it again (Enter).
+static void retry_card(void)
+{
+    sdcard_unmount();
+    s_sd_ok = sdcard_mount();
+    config_reload();
+    apps_reload();
+    strlcpy(s_cwd, SDCARD_MOUNT_POINT, sizeof(s_cwd));
+    reload_base();
+}
+
+static void draw_home(void)
+{
+    draw_bar();
+    char buf[PATH_MAX_LEN + 80];
+    if (s_filter[0]) {
+        snprintf(buf, sizeof(buf), "Search: %s_", s_filter);
+        lcd_text(MARGIN, TAB_Y, buf, C_BRIGHT, FONT_SMALL);
+        snprintf(buf, sizeof(buf), "%d found  Esc clears", s_shown_n);
+        lcd_text(LCD_W - MARGIN - 6 * (int)strlen(buf), TAB_Y, buf, C_DIM, FONT_SMALL);
+    } else {
+        for (int t = 0, x = 4; t < TABS; t++) {
+            const char *name = tab_name(t);
+            int w = 6 * (int)strlen(name) + 6;
+            if (t == s_tab) {
+                lcd_fill_rect(x, TAB_Y - 2, w, 13, C_SEL_BG);
+            }
+            lcd_text(x + 3, TAB_Y, name, t == s_tab ? C_SEL_FG : C_DIM, FONT_SMALL);
+            x += w + 1;
+        }
+    }
+    lcd_hline(MARGIN - 4, GRID_Y - 5, LCD_W - 2 * (MARGIN - 4), C_LINE);
+
+    if (!s_sd_ok) {
+        lcd_text(MARGIN, LIST_Y + 2 * ROW_H, "No SD card found.", C_ERR, FONT_LARGE);
+        lcd_text(MARGIN, LIST_Y + 4 * ROW_H, "Insert a FAT32 card and press", C_DIM, FONT_LARGE);
+        lcd_text(MARGIN, LIST_Y + 5 * ROW_H, "Enter to retry.", C_DIM, FONT_LARGE);
+    } else if (!s_shown_n) {
+        lcd_text(MARGIN, LIST_Y + 2 * ROW_H,
+                 s_filter[0]            ? "No app matches."
+                 : s_tab == TAB_RECENT  ? "No app run yet."
+                 : s_tab == TAB_FAVS    ? "No favourites yet."
+                 : s_tab == TAB_ALL     ? "No apps on the card."
+                                        : "No apps in this category.",
+                 C_DIM, FONT_LARGE);
+        draw_wrapped(LIST_Y + 4 * ROW_H,
+                     s_tab == TAB_FAVS  ? "F2 adds the selected app, or a file or folder in Files (F3)."
+                     : s_tab == TAB_ALL ? "Put .uf2 files, or folders with one in, in the root of the card."
+                                        : "",
+                     C_DIM);
+    }
+
+    int row = s_hsel / GRID_COLS;
+    if (row < s_htop) {
+        s_htop = row;
+    } else if (row >= s_htop + GRID_ROWS) {
+        s_htop = row - GRID_ROWS + 1;
+    }
+    for (int k = 0; k < GRID_COLS * GRID_ROWS && s_htop * GRID_COLS + k < s_shown_n; k++) {
+        int i = s_htop * GRID_COLS + k, idx = s_shown[i];
+        const app_t *e = &s_apps.list[idx];
+        int cx = k % GRID_COLS * CELL_W, cy = GRID_Y + k / GRID_COLS * CELL_H;
+        bool sel = i == s_hsel;
+        if (sel) {
+            lcd_fill_rect(cx + 3, cy, CELL_W - 6, CELL_H - 2, C_FIELD);
+            look_march(cx + 3, cy, CELL_W - 6, CELL_H - 2);
+        }
+        apps_draw_icon(&s_apps, e, cx + (CELL_W - 32) / 2, cy + 5);
+        if (e->flags & APP_FAV) {
+            lcd_text(cx + CELL_W - 15, cy + 3, "*", C_WARN, FONT_SMALL);
+        }
+        if (idx == s_running) {
+            lcd_fill_rect(cx + 10, cy + 6, 4, 4, C_OK);
+        }
+        char label[13];
+        fit(label, apps_str(&s_apps, e->title), 12);
+        lcd_text(cx + (CELL_W - 6 * (int)strlen(label)) / 2, cy + 41, label, sel ? C_BRIGHT : C_FG, FONT_SMALL);
+    }
+    int rows = (s_shown_n + GRID_COLS - 1) / GRID_COLS;
+    if (rows > GRID_ROWS) { // scroll bar
+        int track = GRID_ROWS * CELL_H - 2, h = track * GRID_ROWS / rows;
+        lcd_fill_rect(LCD_W - 3, GRID_Y + (track - h) * s_htop / (rows - GRID_ROWS), 2, h, C_DIM);
+    }
+
+    int idx = home_index();
+    lcd_color_t color = C_DIM;
+    buf[0] = '\0';
+    if (s_note[0]) {
+        strlcpy(buf, s_note, sizeof(buf));
+        color = s_note_color;
+    } else if (idx == s_running && idx >= 0) {
+        snprintf(buf, sizeof(buf), "%s is installed: Enter starts it", apps_str(&s_apps, s_apps.list[idx].title));
+        color = C_OK;
+    } else if (idx >= 0) {
+        const app_t *e = &s_apps.list[idx];
+        if (s_info_for != idx) {
+            apps_info(&s_apps, e, &s_app_info);
+            s_info_for = idx;
+        }
+        if ((e->flags & APP_DIR) && e->binary == APP_NONE) {
+            snprintf(buf, sizeof(buf), "Enter shows the files in SD%s", apps_str(&s_apps, e->path));
+        } else if (s_app_info.desc[0] || s_app_info.version[0]) {
+            snprintf(buf, sizeof(buf), "%s%s%s", s_app_info.version, s_app_info.version[0] ? "  " : "",
+                     s_app_info.desc);
+        } else {
+            snprintf(buf, sizeof(buf), "SD%s", apps_str(&s_apps, e->path));
+        }
+    }
+    char line[(LCD_W - 2 * MARGIN) / 6 + 1];
+    fit(line, buf, (LCD_W - 2 * MARGIN) / 6);
+    draw_footer(line, color,
+#if PICOMULTILOADER_WIFI
+                "Enter Run  F1 Setup  F2 Fav  F3 Files  F4 Web  F5 USB"
+#else
+                "Enter Run  F1 Setup  F2 Fav  F3 Files  F5 USB drive"
+#endif
+    );
+}
+
+// Start the installed app as it is (s_sel_path is its file).
+static void run_installed(void)
+{
+#if PICOMULTILOADER_WIFI
+    if (web_running()) {
+        webserver_stop();
+    }
+#endif
+    apps_add_recent(s_sel_path);
+    draw_header();
+    lcd_text(MARGIN, LIST_Y + 4, "Starting...", C_ACCENT, FONT_LARGE);
+    draw_kv(LIST_Y + 4 + 2 * ROW_H, "File", s_sel_name);
+    draw_footer(NULL, C_FG, "No flashing needed: it is installed");
+    lcd_flush();
+    uf2_boot_installed();
+}
+
+static void home_open(void)
+{
+    if (!s_sd_ok) {
+        retry_card();
+        return;
+    }
+    int idx = home_index();
+    if (idx < 0) {
+        return;
+    }
+    const app_t *e = &s_apps.list[idx];
+    if (!apps_binary_path(&s_apps, e, s_sel_path, sizeof(s_sel_path))) { // no .uf2, or several: show them
+        strlcpy(s_cwd, apps_str(&s_apps, e->path), sizeof(s_cwd));
+        go_files();
+        return;
+    }
+    strlcpy(s_sel_name, strrchr(s_sel_path, '/') + 1, sizeof(s_sel_name));
+    if (idx == s_running) {
+        run_installed();
+    } else {
+        inspect_file();
+    }
+}
+
+static void fav_toast(int r)
+{
+    toast(r < 0 ? "Could not save the favourites" : r ? "Added to Favourites" : "Removed from Favourites");
+}
+
+static void home_fav(void)
+{
+    int idx = home_index();
+    if (idx < 0) {
+        return;
+    }
+    app_t *e = &s_apps.list[idx];
+    char bin[PATH_MAX_LEN + 64];
+    const char *path = apps_str(&s_apps, e->path);
+    // a .uf2 in the folder made a favourite in Files counts as the app
+    bool has_bin = (e->flags & APP_DIR) && apps_binary_path(&s_apps, e, bin, sizeof(bin));
+    int r = apps_toggle_fav(has_bin && apps_is_fav(bin) ? bin : path);
+    fav_toast(r);
+    if (apps_is_fav(path) || (has_bin && apps_is_fav(bin))) {
+        e->flags |= APP_FAV;
+    } else {
+        e->flags &= (uint8_t)~APP_FAV;
+    }
+    if (s_tab == TAB_FAVS && !s_filter[0]) {
+        home_build(idx);
+    }
+}
+
+static void browse_fav(void)
+{
+    entry_t *e = selected_entry(); // fills s_fa_path
+    if (e) {
+        int r = apps_toggle_fav(s_fa_path);
+        fav_toast(r);
+        e->fav = apps_is_fav(s_fa_path);
+    }
+}
+
+#if PICOMULTILOADER_WIFI
+static void web_key(void) // F4
+{
+    if (web_running()) {
+        s_screen = SCREEN_WEB; // already on in the background
+    } else {
+        enter_web();
+    }
+}
+#endif
+
+// Returns false if the key isn't used here.
+static bool home_key(int key)
+{
+    int n = s_shown_n;
+    bool had_note = s_note[0];
+    s_note[0] = '\0';
+    switch (key) {
+    case KEY_LEFT:
+        s_hsel -= s_hsel > 0;
+        return true;
+    case KEY_RIGHT:
+        s_hsel += s_hsel + 1 < n;
+        return true;
+    case KEY_UP:
+        s_hsel -= s_hsel >= GRID_COLS ? GRID_COLS : 0;
+        return true;
+    case KEY_DOWN: // to the last app if the row below is short
+        s_hsel = s_hsel + GRID_COLS < n ? s_hsel + GRID_COLS : s_hsel / GRID_COLS < (n - 1) / GRID_COLS ? n - 1 : s_hsel;
+        return true;
+    case KEY_PAGE_UP:
+        s_hsel = s_hsel >= GRID_COLS * GRID_ROWS ? s_hsel - GRID_COLS * GRID_ROWS : s_hsel % GRID_COLS;
+        return true;
+    case KEY_PAGE_DOWN:
+        s_hsel = s_hsel + GRID_COLS * GRID_ROWS < n ? s_hsel + GRID_COLS * GRID_ROWS : (n ? n - 1 : 0);
+        return true;
+    case KEY_HOME:
+        s_hsel = 0;
+        return true;
+    case KEY_END:
+        s_hsel = n ? n - 1 : 0;
+        return true;
+    case KEY_TAB:
+        if (!s_filter[0]) {
+            s_tab = (s_tab + 1) % TABS;
+        }
+        s_filter[0] = '\0';
+        home_build(home_index());
+        return true;
+    case KEY_BACKSPACE:
+        if (s_filter[0]) {
+            s_filter[strlen(s_filter) - 1] = '\0';
+            home_build(home_index());
+        }
+        return true;
+    case KEY_ESC:
+        if (s_filter[0]) {
+            s_filter[0] = '\0';
+            home_build(home_index());
+            return true;
+        }
+        return had_note;
+    case KEY_ENTER:
+        home_open();
+        return true;
+    case KEY_F1:
+        enter_wifi();
+        return true;
+    case KEY_F2:
+        home_fav();
+        return true;
+    case KEY_F3:
+        go_files();
+        return true;
+#if PICOMULTILOADER_WIFI
+    case KEY_F4:
+        web_key();
+        return true;
+#endif
+    case KEY_F5:
+        enter_usb();
+        return true;
+    default:
+        if ((key > ' ' && key < 0x7F) || (key == ' ' && s_filter[0])) {
+            if (strlen(s_filter) < FILTER_MAX) {
+                size_t len = strlen(s_filter);
+                s_filter[len] = (char)key;
+                s_filter[len + 1] = '\0';
+                home_build(home_index());
+            }
+            return true;
+        }
+        return had_note;
+    }
 }
 
 #if PICOMULTILOADER_WIFI
@@ -1884,9 +2381,11 @@ static void web_tick(void)
         return;
     }
     uint32_t changes = webserver_changes();
-    if (s_screen == SCREEN_BROWSE && changes != s_web_changes_seen) {
+    if (s_screen == s_base && changes != s_web_changes_seen) {
         s_web_changes_seen = changes;
-        rescan_dir();
+        config_reload();
+        apps_reload();
+        reload_base();
         ui_redraw();
     } else if (web_icon_color() != s_icon_shown) {
         web_status_t st;
@@ -1926,6 +2425,9 @@ void ui_tick(void)
 void ui_redraw(void)
 {
     switch (s_screen) {
+    case SCREEN_HOME:
+        draw_home();
+        break;
     case SCREEN_BROWSE:
         draw_browse();
         break;
@@ -2022,6 +2524,11 @@ static void flash_and_run(void)
         return;
     }
     save_setting("last_file", s_sel_name);
+    char stamp[160];
+    if (run_stamp(s_sel_path, stamp, sizeof(stamp))) {
+        save_setting(RUN_KEY, stamp);
+    }
+    apps_add_recent(s_sel_path);
 
     lcd_text(MARGIN, PROG_Y + PROG_H + 30, "Done. Starting app...", C_OK, FONT_LARGE);
     lcd_flush();
@@ -2039,6 +2546,7 @@ static bool inspect_file(void)
         s_screen = SCREEN_ERROR;
         return false;
     }
+    s_confirm_run = is_installed(s_sel_path);
     s_screen = SCREEN_CONFIRM;
     return true;
 }
@@ -2046,11 +2554,7 @@ static bool inspect_file(void)
 static void open_selected(void)
 {
     if (!s_sd_ok) {
-        sdcard_unmount();
-        s_sd_ok = sdcard_mount();
-        config_reload();
-        strlcpy(s_cwd, SDCARD_MOUNT_POINT, sizeof(s_cwd));
-        scan_dir();
+        retry_card();
         return;
     }
     if (item_count() == 0) {
@@ -2074,6 +2578,11 @@ static void open_selected(void)
 void ui_key(int key)
 {
     switch (s_screen) {
+    case SCREEN_HOME:
+        if (!home_key(key)) {
+            return;
+        }
+        break;
     case SCREEN_BROWSE: {
         int n = item_count();
         bool had_note = s_note[0];
@@ -2103,24 +2612,30 @@ void ui_key(int key)
             break;
         case KEY_BACKSPACE:
         case KEY_LEFT:
-            change_dir(NULL);
+            if (at_root()) {
+                go_home();
+            } else {
+                change_dir(NULL);
+            }
             break;
         case KEY_F1:
             enter_wifi();
             break;
+        case KEY_F2:
+            browse_fav();
+            break;
+        case KEY_F3:
+            go_home();
+            break;
 #if PICOMULTILOADER_WIFI
         case KEY_F4:
-            if (web_running()) {
-                s_screen = SCREEN_WEB; // already on in the background
-            } else {
-                enter_web();
-            }
+            web_key();
             break;
 #endif
         case KEY_F5:
             enter_usb();
             break;
-        case KEY_F2:
+        case KEY_TAB:
             enter_files();
             break;
         case KEY_DEL:
@@ -2138,11 +2653,12 @@ void ui_key(int key)
         case 'V':
             paste();
             break;
-        case KEY_ESC: // forget the copied item; otherwise nothing: the app only starts after a flash or a restart
-            if (!s_clip[0] && !had_note) {
-                return;
+        case KEY_ESC: // forget the copied item, else back to Home
+            if (s_clip[0]) {
+                s_clip[0] = '\0';
+            } else {
+                go_home();
             }
-            s_clip[0] = '\0';
             break;
         default:
             if (!had_note) {
@@ -2153,12 +2669,16 @@ void ui_key(int key)
         break;
     }
     case SCREEN_CONFIRM:
-        if (key == KEY_ENTER) {
+        if (key == KEY_ENTER && s_confirm_run) {
+            run_installed();
+            return;
+        }
+        if (key == KEY_ENTER || (s_confirm_run && (key == 'r' || key == 'R'))) {
             flash_and_run();
             return;
         }
         if (key == KEY_ESC || key == KEY_BACKSPACE || key == KEY_LEFT) {
-            s_screen = SCREEN_BROWSE;
+            s_screen = s_base;
             break;
         }
         return;
@@ -2214,7 +2734,7 @@ void ui_key(int key)
             break;
         }
         if (key == KEY_ESC || key == KEY_BACKSPACE || key == KEY_LEFT) {
-            s_screen = SCREEN_BROWSE; // the server keeps running
+            s_screen = s_base; // the server keeps running
             break;
         }
         return;
@@ -2222,12 +2742,12 @@ void ui_key(int key)
 #else
     case SCREEN_WEB:
     case SCREEN_WIFI_SCAN:
-        s_screen = SCREEN_BROWSE;
+        s_screen = s_base;
         break;
 #endif
     case SCREEN_ERROR:
         if (key == KEY_ESC || key == KEY_ENTER || key == KEY_BACKSPACE || key == KEY_LEFT) {
-            s_screen = SCREEN_BROWSE;
+            s_screen = s_base;
             break;
         }
         return;
@@ -2309,10 +2829,9 @@ void ui_init(bool sd_ok)
     if (s_boot_line < 0) { // no boot screen
         load_theme();
     }
-    s_screen = SCREEN_BROWSE;
     strlcpy(s_cwd, SDCARD_MOUNT_POINT, sizeof(s_cwd));
 
-    // Open the start folder from Setup, else the last directory, else the root
+    // Files opens the start folder from Setup, else the last directory, else the root
     char last[PATH_MAX_LEN];
     if (!load_setting("start_dir", s_start_dir, sizeof(s_start_dir))) {
         s_start_dir[0] = '\0';
@@ -2322,18 +2841,10 @@ void ui_init(bool sd_ok)
     } else if (load_setting("last_dir", last, sizeof(last)) && last[0] == '/' && is_dir(last)) {
         copy_dir(s_cwd, sizeof(s_cwd), last);
     }
-    printf("ui: opening %s\n", sd_path(s_cwd));
-    scan_dir();
-
-    // Preselect the file that was flashed last
-    char last_file[64];
-    if (load_setting("last_file", last_file, sizeof(last_file))) {
-        for (int i = 0; i < item_count(); i++) {
-            entry_t *e = item_entry(i);
-            if (e && !e->is_dir && strcmp(e->name, last_file) == 0) {
-                s_sel = i;
-                break;
-            }
+    go_home();
+    for (int i = 0; i < s_shown_n; i++) { // select the app run last
+        if (s_apps.list[s_shown[i]].recent == 0) {
+            s_hsel = i;
         }
     }
 
@@ -2350,9 +2861,9 @@ void ui_init(bool sd_ok)
     }
     ui_boot_check("Wi-Fi", !(s_web_auto && sd_ok) ? "off" : web_ok ? "starting" : "failed", web_ok);
 #endif
-    char where[PATH_MAX_LEN + 4];
-    sd_name(where, sizeof(where), s_cwd);
-    ui_boot_check("Start folder", where, sd_ok);
+    char found[16];
+    snprintf(found, sizeof(found), "%d found", s_apps.count);
+    ui_boot_check("Apps", sd_ok ? found : "-", sd_ok);
     if (s_boot_line >= 0) { // let the logo shimmer for a moment
         for (uint64_t until = time_us_64() + 500000; time_us_64() < until;) {
             look_tick();

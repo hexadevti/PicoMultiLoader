@@ -54,6 +54,7 @@ endif()
 
 add_executable(${LOADER_NAME}
     src/main.c
+    src/apps.c
     src/config.c
     src/fileops.c
     src/keyboard.c

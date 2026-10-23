@@ -242,7 +242,7 @@ void uf2_boot_or_menu(void)
 #endif
 
 // ---- walking a UF2 file -----------------------------------------------------------------------
-#define CHUNK_BLOCKS 8
+#define CHUNK_BLOCKS 4
 
 typedef struct uf2_walk uf2_walk_t;
 typedef bool (*block_fn_t)(uf2_walk_t *w, const struct uf2_block *b);
@@ -257,9 +257,16 @@ struct uf2_walk {
     uint32_t first_index; // file block index of the first accepted block
     uint8_t erased[512];  // sector bitmap (flashing)
     uint32_t written;
+    uint32_t first_pages; // RP2350: pages of the app's first sector, programmed last
 };
 
 static struct uf2_block s_chunk[CHUNK_BLOCKS] __attribute__((aligned(256)));
+
+void *uf2_scratch(size_t *len)
+{
+    *len = sizeof(s_chunk);
+    return s_chunk;
+}
 static uint8_t s_page[256] __attribute__((aligned(256)));
 
 static bool fail(uf2_walk_t *w, const char *msg)
@@ -552,9 +559,6 @@ bool uf2_inspect(const char *path, uf2_info_t *info, char *err, size_t err_len)
 #if PICO_RP2040
 extern const uint8_t __boot2_start__[];
 static uint8_t s_boot2[256] __attribute__((aligned(4)));
-#else
-// The app's first sector, written last (see app_present())
-static uint8_t s_first[FLASH_SECTOR_SIZE] __attribute__((aligned(256)));
 #endif
 
 // Offsets are physical flash offsets. Nothing may run from flash meanwhile, so no interrupts.
@@ -581,8 +585,8 @@ static bool flash_block(uf2_walk_t *w, const struct uf2_block *b)
         return fail(w, "Address beyond 16 MB.");
     }
 #if !PICO_RP2040
-    if (sector == 0) {
-        memcpy(&s_first[addr - XIP_BASE], b->data, 256);
+    if (sector == 0) { // written last, by write_first_sector()
+        w->first_pages++;
         w->written++;
         return true;
     }
@@ -628,6 +632,47 @@ static bool write_record(const uf2_info_t *info, const char *path)
     memcpy(s_page, &r, sizeof(r));
     return program_page(RECORD_OFFSET, s_page);
 }
+#else
+// The app's first sector holds its boot block (see app_present()), so it is programmed last, in a
+// second pass over the file: the app only looks complete once everything else is in flash.
+static bool write_first_sector(const char *path, uf2_walk_t *w, char *err, size_t err_len)
+{
+    uint32_t left = w->first_pages;
+    if (f_open(&w->f, sd_path(path), FA_READ) != FR_OK || f_lseek(&w->f, (FSIZE_t)w->first_index * 512) != FR_OK) {
+        f_close(&w->f);
+        snprintf(err, err_len, "Cannot open the file again.");
+        return false;
+    }
+    bool ok = true;
+    for (uint32_t idx = w->first_index, total = w->info->file_size / 512; ok && left && idx < total;) {
+        UINT n = 0;
+        uint32_t want = total - idx < CHUNK_BLOCKS ? total - idx : CHUNK_BLOCKS;
+        if (f_read(&w->f, s_chunk, want * 512, &n) != FR_OK || n != want * 512) {
+            snprintf(err, err_len, "Read error on the SD card.");
+            ok = false;
+            break;
+        }
+        for (uint32_t i = 0; ok && left && i < want; i++, idx++) {
+            const struct uf2_block *b = &s_chunk[i];
+            if ((b->flags & UF2_FLAG_NOT_MAIN_FLASH) || !(b->flags & UF2_FLAG_FAMILY_ID_PRESENT) ||
+                b->file_size != w->info->family || b->target_addr - XIP_BASE >= FLASH_SECTOR_SIZE) {
+                continue; // the same blocks walk() took for sector 0
+            }
+            memcpy(s_page, b->data, 256);
+            if (!program_page(APP_OFFSET + (b->target_addr - XIP_BASE), s_page)) {
+                snprintf(err, err_len, "Flash write failed at 0x%08lx.", (unsigned long)b->target_addr);
+                ok = false;
+            }
+            left--;
+        }
+    }
+    f_close(&w->f);
+    if (ok && left) {
+        snprintf(err, err_len, "The first sector changed while flashing.");
+        ok = false;
+    }
+    return ok;
+}
 #endif
 
 bool uf2_flash(const char *path, const uf2_info_t *info, uf2_progress_cb_t progress, char *err, size_t err_len)
@@ -641,7 +686,6 @@ bool uf2_flash(const char *path, const uf2_info_t *info, uf2_progress_cb_t progr
     erase_sector(RECORD_OFFSET); // until the new app is complete there is none
 #else
     erase_sector(APP_OFFSET); // until the new app is complete there is none
-    memset(s_first, 0xFF, sizeof(s_first));
 #endif
     uf2_walk_t *w = &s_walk;
     memset(w, 0, sizeof(*w));
@@ -668,11 +712,8 @@ bool uf2_flash(const char *path, const uf2_info_t *info, uf2_progress_cb_t progr
         return false;
     }
 #else
-    for (uint32_t off = 0; off < sizeof(s_first); off += 256) {
-        if (!program_page(APP_OFFSET + off, &s_first[off])) {
-            snprintf(err, err_len, "Flash write failed at 0x%08lx.", (unsigned long)(XIP_BASE + off));
-            return false;
-        }
+    if (!write_first_sector(path, w, err, err_len)) {
+        return false;
     }
     const char *base = strrchr(path, '/');
     config_set(APP_CONFIG_KEY, base ? base + 1 : path);
