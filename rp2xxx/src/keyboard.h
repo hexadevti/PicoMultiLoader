@@ -7,6 +7,9 @@
 // Key codes reported by the PicoCalc keyboard firmware
 enum {
     KEY_NONE      = 0,
+    KEY_CTRL_C    = 0x03, // Ctrl + a letter: the letter & 0x1F
+    KEY_CTRL_V    = 0x16,
+    KEY_CTRL_X    = 0x18,
     KEY_BACKSPACE = 0x08,
     KEY_TAB       = 0x09,
     KEY_ENTER     = 0x0A,
@@ -35,6 +38,9 @@ enum {
 
 /** Probe the keyboard. Returns true if it answers (i.e. the PicoCalc is switched on). */
 bool kbd_init(void);
+
+/** True if a key is waiting for kbd_poll() (it is kept for it): for long jobs to give way. */
+bool kbd_waiting(void);
 
 /** True if the last kbd_init() / kbd_poll() reached the keyboard. */
 bool kbd_present(void);

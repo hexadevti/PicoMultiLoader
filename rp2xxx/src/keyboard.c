@@ -87,14 +87,49 @@ static bool is_repeatable(int key)
     return key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN;
 }
 
+#define KEY_MOD_CTRL 0xA5
+static bool s_ctrl;      // Ctrl is held
+static uint8_t s_ahead[2]; // an event kbd_waiting() read, for the next kbd_poll()
+static bool s_have_ahead;
+
+static bool next_event(uint8_t r[2])
+{
+    if (s_have_ahead) {
+        s_have_ahead = false;
+        r[0] = s_ahead[0];
+        r[1] = s_ahead[1];
+        return true;
+    }
+    return kbd_read(REG_FIFO, r) && r[1] != 0;
+}
+
+bool kbd_waiting(void)
+{
+    if (!s_inited) {
+        return false;
+    }
+    if (s_have_ahead || (s_held_key != KEY_NONE && time_us_64() >= s_next_repeat)) {
+        return true;
+    }
+    s_have_ahead = kbd_read(REG_FIFO, s_ahead) && s_ahead[1] != 0;
+    return s_have_ahead;
+}
+
 int kbd_poll(void)
 {
     if (!s_inited) {
         return KEY_NONE;
     }
     uint8_t r[2];
-    if (kbd_read(REG_FIFO, r) && r[1] != 0) {
+    if (next_event(r)) {
         int key = r[1];
+        if (key == KEY_MOD_CTRL) { // a modifier: held while the letter is pressed
+            s_ctrl = r[0] == STATE_PRESSED || (r[0] != STATE_RELEASED && s_ctrl);
+            return KEY_NONE;
+        }
+        if (s_ctrl && ((key >= 'a' && key <= 'z') || (key >= 'A' && key <= 'Z'))) {
+            key &= 0x1F;
+        }
         if (r[0] == STATE_PRESSED) {
             s_held_key = is_repeatable(key) ? key : KEY_NONE;
             s_next_repeat = time_us_64() + REPEAT_DELAY_US;

@@ -398,8 +398,8 @@ static int cmp_apps(const void *x, const void *y)
     return strcasecmp(apps_str(s_sorting, p->title), apps_str(s_sorting, q->title));
 }
 
-// Mark the apps that a list names, and add the ones it names that aren't in the root.
-static void merge_list(apps_t *a, plist_t *l, bool fav)
+// Mark the apps that a list names, and (`add`) add the ones it names that aren't in the root.
+static void merge_list(apps_t *a, plist_t *l, bool fav, bool add)
 {
     pl_load(l);
     int index = 0;
@@ -417,7 +417,7 @@ static void merge_list(apps_t *a, plist_t *l, bool fav)
         }
         if (i == a->count) { // not in the root: add it if it is still there
             FILINFO fi;
-            if (f_stat(sd_path(path), &fi) != FR_OK) {
+            if (!add || f_stat(sd_path(path), &fi) != FR_OK) {
                 continue;
             }
             if (fi.fattrib & AM_DIR) {
@@ -439,32 +439,38 @@ static void merge_list(apps_t *a, plist_t *l, bool fav)
 
 void apps_scan(apps_t *a)
 {
+    apps_scan_dir(a, "");
+}
+
+void apps_scan_dir(apps_t *a, const char *dir)
+{
+    bool root = !dir[0];
     a->count = a->used = 0;
     DIR d;
     FILINFO fi;
-    if (f_opendir(&d, sd_path("")) == FR_OK) {
+    if (f_opendir(&d, sd_path(dir)) == FR_OK) {
         while (f_readdir(&d, &fi) == FR_OK && fi.fname[0]) {
-            char path[FF_MAX_LFN + 2];
-            if (hidden(&fi) || strcasecmp(fi.fname, PML_DIR + 1) == 0) {
+            char path[PATH_CAP];
+            if (hidden(&fi) || (root && strcasecmp(fi.fname, PML_DIR + 1) == 0) ||
+                (size_t)snprintf(path, sizeof(path), "%s/%s", dir, fi.fname) >= sizeof(path)) {
                 continue;
             }
-            snprintf(path, sizeof(path), "/%s", fi.fname);
             if (fi.fattrib & AM_DIR) {
-                add_dir(a, path, 0);
+                add_dir(a, path, root ? 0 : APP_EXTRA);
             } else if (has_uf2_ext(fi.fname)
 #if !PICO_RP2040
-                       && strcasecmp(fi.fname, "pml2350.uf2") != 0 // the loader itself
+                       && !(root && strcasecmp(fi.fname, "pml2350.uf2") == 0) // the loader itself
 #endif
             ) {
-                add_file(a, path, 0);
+                add_file(a, path, root ? 0 : APP_EXTRA);
             }
         }
         f_closedir(&d);
     }
     s_sorting = a;
     qsort(a->list, a->count, sizeof(a->list[0]), cmp_apps);
-    merge_list(a, &s_favs, true);
-    merge_list(a, &s_recents, false);
+    merge_list(a, &s_favs, true, root);
+    merge_list(a, &s_recents, false, root);
 }
 
 bool apps_info(const apps_t *a, const app_t *e, app_info_t *out)

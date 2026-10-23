@@ -19,6 +19,10 @@ void sdcard_unmount(void);
 /** Free and total space in bytes (false if not mounted). */
 bool sdcard_space(uint64_t *total, uint64_t *free_bytes);
 
+/** sdcard_space() a little at a time, for a card whose free space isn't known yet (counting it reads
+ *  the whole FAT): 1 = done, filled in; 0 = not yet, call again; -1 = can't tell. */
+int sdcard_space_step(uint64_t *total, uint64_t *free_bytes);
+
 /** Unmount the filesystem and open the card for raw sector access (USB drive mode). */
 bool sdcard_open_raw(uint32_t *sector_count);
 

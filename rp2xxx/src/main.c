@@ -57,6 +57,10 @@ static int console_key(void)
     case 0x10: // Ctrl+P: dump the screen for screenshots
         lcd_dump();
         return KEY_NONE;
+    case KEY_CTRL_C:
+    case KEY_CTRL_V:
+    case KEY_CTRL_X:
+        return c;
     default:
         return c >= 0x20 && c < 0x7F ? c : KEY_NONE; // typed text (Wi-Fi settings)
     }

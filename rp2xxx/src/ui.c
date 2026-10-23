@@ -42,7 +42,8 @@
 typedef struct {
     char *name;
     bool is_dir;
-    bool fav; // in the favourites
+    bool fav;    // in the favourites
+    bool marked; // marked with Space, for Copy / Cut / Delete
     uint32_t size;
 } entry_t;
 
@@ -97,8 +98,11 @@ static bool s_confirm_run; // the confirm screen's file is the installed app: En
 static char s_error[128];
 static const char *s_path_override; // shown in the header instead of s_cwd
 
-static char s_clip[PATH_MAX_LEN + 64]; // file or folder marked with Copy or Cut, "" = none
-static bool s_clip_cut;                // Cut: Paste moves it instead of copying
+static char s_clip[PATH_MAX_LEN + 64]; // the folder the copied or cut items are in
+static char s_clip_names[1024];        // their names, one after another, each ending in '\0'
+static int s_clip_n;                   // how many there are, 0 = nothing to paste
+static bool s_clip_cut;                // Cut: Paste moves them instead of copying
+static bool s_show_all;                // Files lists every file, not only apps and documents
 static char s_note[80];                // result of the last file operation, shown in the footer
 static lcd_color_t s_note_color;
 static char s_toast[48];               // a message over the screen for a moment, "" = none
@@ -192,9 +196,40 @@ static void free_entries(void)
     s_count = 0;
 }
 
+static int marked_count(void)
+{
+    int n = 0;
+    for (int i = 0; i < s_count; i++) {
+        n += s_entries[i].marked;
+    }
+    return n;
+}
+
+static void unmark_all(void)
+{
+    for (int i = 0; i < s_count; i++) {
+        s_entries[i].marked = false;
+    }
+}
+
+// "name" for one item on the clipboard, "3 items" for more
+static void clip_label(char *out, size_t len)
+{
+    if (s_clip_n == 1) {
+        strlcpy(out, s_clip_names, len);
+    } else {
+        snprintf(out, len, "%d items", s_clip_n);
+    }
+}
+
+static char s_pv_key[PATH_MAX_LEN + 64]; // the file list's preview is of this item, "" = none yet
+static bool s_space_known;              // the card's free space has been read for it
+
 static void scan_dir(void)
 {
     free_entries();
+    s_pv_key[0] = '\0'; // read the preview and the free space again
+    s_space_known = false;
     s_shown_n = 0; // the apps are gone
     s_sel = s_top = 0;
     if (!s_sd_ok) {
@@ -208,7 +243,8 @@ static void scan_dir(void)
     FILINFO fi;
     while (s_count < MAX_ENTRIES && f_readdir(&dir, &fi) == FR_OK && fi.fname[0]) {
         bool dir_entry = (fi.fattrib & AM_DIR) != 0;
-        if (hidden(&fi) || (!dir_entry && !has_uf2_ext(fi.fname) && view_kind(fi.fname) == VIEW_NONE)) {
+        if (hidden(&fi) ||
+            (!s_show_all && !dir_entry && !has_uf2_ext(fi.fname) && view_kind(fi.fname) == VIEW_NONE)) {
             continue;
         }
         entry_t *e = &s_entries[s_count];
@@ -217,6 +253,7 @@ static void scan_dir(void)
         e->name = strdup(fi.fname);
         e->is_dir = dir_entry;
         e->fav = fits && apps_is_fav(path);
+        e->marked = false;
         e->size = dir_entry ? 0 : (uint32_t)fi.fsize;
         if (e->name) {
             s_count++;
@@ -372,7 +409,8 @@ static void draw_header(void)
     lcd_hline(MARGIN - 4, PATH_Y + 16, LCD_W - 2 * (MARGIN - 4), C_LINE);
 }
 
-static const char *const KEY_NAMES[] = {"Enter", "Esc", "Left", "Del", "Tab", "R", "Up/Down", "Left/Right", "PgUp/PgDn", "Home/End"};
+static const char *const KEY_NAMES[] = {"Enter", "Esc", "Left", "Del", "Tab", "R", "Spc", "^C", "^V", "^X",
+                                        "Up/Down", "Left/Right", "PgUp/PgDn", "Home/End"};
 
 // `keys` is "Enter Open  F1 Control  Esc Back": items two spaces apart, each a key and what it does.
 // Function keys get a raised cap; an item that doesn't start with a key is shown as it is.
@@ -451,87 +489,436 @@ static void draw_toast(void)
     lcd_text(x + 10, y + 5, s_toast, C_BRIGHT, FONT_SMALL);
 }
 
+// ---- the file list (F3) -----------------------------------------------------------------------
+// The list on the left, each item with a mark coloured by its type; a preview of the selected one
+// on the right; the card's used space under them. The preview reads the card only once the
+// selection has rested for a moment (browse_tick), so scrolling stays quick.
+#define BR_Y        42                 // the first row
+#define BR_ROW      16
+#define BR_W        200                // the list's width; the preview pane is right of it
+#define BR_BOTTOM   (FOOTER_Y - 1)     // the rule over the SD usage line
+#define BR_ROWS     ((BR_BOTTOM - 2 - BR_Y) / BR_ROW)
+#define PV_X        (BR_W + 8)
+#define PV_COLS     ((LCD_W - 6 - PV_X) / 6)
+#define PV_LINES    15
+#define PV_DELAY_US 300000
+
+static char s_pv[PV_LINES][PV_COLS + 1];
+static lcd_color_t s_pv_color[PV_LINES];
+static int s_pv_n;
+static bool s_pv_pending;                // read it from the card once the selection rests
+static uint64_t s_pv_since;
+static uint64_t s_space_total, s_space_free;
+
+static bool has_ext(const char *name, const char *ext)
+{
+    size_t len = strlen(name), n = strlen(ext);
+    return len > n && strcasecmp(name + len - n, ext) == 0;
+}
+
+// Folders amber, apps in the accent, images in the second accent, settings green, other text dim
+static lcd_color_t type_color(const entry_t *e)
+{
+    if (!e || e->is_dir) {
+        return C_WARN;
+    }
+    if (has_uf2_ext(e->name)) {
+        return C_ACCENT;
+    }
+    view_kind_t kind = view_kind(e->name);
+    if (kind == VIEW_IMAGE) {
+        return C_ACC2;
+    }
+    if (kind == VIEW_NONE) {
+        return C_LINE; // listed only with "Show all files"
+    }
+    return kind == VIEW_MARKDOWN || has_ext(e->name, ".ini") || has_ext(e->name, ".cfg") ? C_OK : C_DIM;
+}
+
+// Add a preview line, wrapped at the pane's width.
+static void pv_add(const char *text, lcd_color_t color)
+{
+    size_t len = strlen(text);
+    do {
+        if (s_pv_n == PV_LINES) {
+            return;
+        }
+        size_t n = len > PV_COLS ? PV_COLS : len;
+        memcpy(s_pv[s_pv_n], text, n);
+        s_pv[s_pv_n][n] = '\0';
+        s_pv_color[s_pv_n++] = color;
+        text += n;
+        len -= n;
+    } while (len);
+}
+
+// What is known without reading the card: shown at once, until browse_tick() has the rest.
+static void pv_quick(const entry_t *e)
+{
+    char size[12];
+    s_pv_n = 0;
+    s_pv_pending = e != NULL;
+    s_pv_since = time_us_64();
+    if (!e) {
+        const char *slash = strrchr(s_cwd, '/');
+        char up[PATH_MAX_LEN];
+        strlcpy(up, s_cwd, slash ? (size_t)(slash - s_cwd) + 1 : sizeof(up));
+        pv_add("Parent folder", C_FG);
+        pv_add(up[0] ? up : "/", C_DIM);
+        return;
+    }
+    if (e->is_dir) {
+        pv_add("Folder", C_FG);
+        return;
+    }
+    view_kind_t kind = view_kind(e->name);
+    bool app = has_uf2_ext(e->name);
+    pv_add(app                    ? "App (.uf2)"
+           : kind == VIEW_IMAGE    ? "Image"
+           : kind == VIEW_MARKDOWN ? "Markdown"
+           : kind == VIEW_NONE     ? "File"
+                                   : "Text",
+           C_FG);
+    format_size(size, sizeof(size), e->size);
+    pv_add(size, C_DIM);
+    if (!app && kind == VIEW_NONE) {
+        pv_add("", C_DIM);
+        pv_add("No viewer for it", C_DIM);
+        s_pv_pending = false; // nothing more to read
+    }
+}
+
+// Reading the preview gave way to a key: show just the kind, and read it once the selection rests again.
+static void pv_retry(const char *kind)
+{
+    s_pv_n = 0;
+    pv_add(kind, C_FG);
+    s_pv_pending = true;
+    s_pv_since = time_us_64();
+}
+
+static bool pv_stop(void)
+{
+    return kbd_waiting();
+}
+
+static void pv_folder(const char *path)
+{
+    DIR dir;
+    FILINFO fi;
+    int items = 0;
+    char line[24];
+    s_pv_n = 2; // "Folder" and the count, filled in below
+    pv_add("", C_DIM);
+    if (f_opendir(&dir, sd_path(path)) == FR_OK) {
+        while (items < 9999 && f_readdir(&dir, &fi) == FR_OK && fi.fname[0]) {
+            if (items % 16 == 15 && kbd_waiting()) { // a key: give way, try again later
+                f_closedir(&dir);
+                pv_retry("Folder");
+                return;
+            }
+            if (hidden(&fi)) {
+                continue;
+            }
+            items++;
+            if (s_pv_n < PV_LINES) {
+                char name[PV_COLS + 1], shown[sizeof(fi.fname) + 1];
+                snprintf(shown, sizeof(shown), "%s%s", fi.fname, (fi.fattrib & AM_DIR) ? "/" : "");
+                fit(name, shown, PV_COLS);
+                pv_add(name, (fi.fattrib & AM_DIR) ? C_WARN : C_DIM);
+            }
+        }
+        f_closedir(&dir);
+    }
+    snprintf(line, sizeof(line), items == 1 ? "%d item" : "%d items", items);
+    strlcpy(s_pv[0], "Folder", sizeof(s_pv[0]));
+    s_pv_color[0] = C_FG;
+    strlcpy(s_pv[1], line, sizeof(s_pv[1]));
+    s_pv_color[1] = C_DIM;
+}
+
+static void pv_app(const char *path, const entry_t *e)
+{
+    uf2_info_t info;
+    char err[96], buf[48], name[40], version[24];
+    bool ok = uf2_inspect_stoppable(path, &info, pv_stop, err, sizeof(err));
+    if (!ok && !err[0]) {
+        pv_retry("App (.uf2)");
+        return;
+    }
+    s_pv_n = 0;
+    if (!ok) {
+        pv_add("App (.uf2)", C_FG);
+        pv_add("", C_DIM);
+        pv_add(err, C_ERR);
+        return;
+    }
+    pv_add(info.name[0] ? info.name : e->name, C_FG);
+    if (info.version[0]) {
+        pv_add(info.version, C_DIM);
+    }
+    if (info.build_date[0]) {
+        pv_add(info.build_date, C_DIM);
+    }
+    pv_add(uf2_family_name(info.family), C_DIM);
+    format_size(buf, sizeof(buf), info.addr_hi - info.addr_lo);
+    strlcat(buf, " of flash", sizeof(buf));
+    pv_add(buf, C_DIM);
+    pv_add("", C_DIM);
+    if (info.name[0] && uf2_installed(name, sizeof(name), version, sizeof(version)) && strcmp(name, info.name) == 0) {
+        pv_add(strcmp(version, info.version) == 0 ? "Installed" : "Other version installed", C_OK);
+    } else {
+        pv_add("Enter flashes it", C_DIM);
+    }
+}
+
+static void pv_text(const char *path)
+{
+    FIL f;
+    char buf[512], line[128];
+    UINT got = 0;
+    s_pv_n = 0;
+    if (f_open(&f, sd_path(path), FA_READ) != FR_OK) {
+        pv_add("Cannot open it.", C_ERR);
+        return;
+    }
+    f_read(&f, buf, sizeof(buf) - 1, &got);
+    f_close(&f);
+    buf[got] = '\0';
+    size_t n = 0;
+    for (const char *c = buf;; c++) {
+        if (*c == '\n' || !*c) {
+            line[n] = '\0';
+            pv_add(line, s_pv_n ? C_DIM : C_FG);
+            n = 0;
+            if (!*c || s_pv_n == PV_LINES) {
+                break;
+            }
+        } else if (*c == '\t' || (unsigned char)*c >= ' ') {
+            if (n < sizeof(line) - 1) {
+                line[n++] = *c == '\t' ? ' ' : *c;
+            }
+        }
+    }
+    if (!got) {
+        pv_add("(empty)", C_DIM);
+    }
+}
+
+static void pv_image(const char *path, const entry_t *e)
+{
+    FIL f;
+    uint8_t h[30];
+    UINT got = 0;
+    char buf[32];
+    s_pv_n = 0;
+    pv_add("Image", C_FG);
+    if (f_open(&f, sd_path(path), FA_READ) == FR_OK) {
+        f_read(&f, h, sizeof(h), &got);
+        f_close(&f);
+    }
+    if (got == sizeof(h) && h[0] == 'B' && h[1] == 'M') {
+        int32_t w = (int32_t)(h[18] | h[19] << 8 | h[20] << 16 | (uint32_t)h[21] << 24);
+        int32_t ht = (int32_t)(h[22] | h[23] << 8 | h[24] << 16 | (uint32_t)h[25] << 24);
+        snprintf(buf, sizeof(buf), "%ld x %ld", (long)w, (long)(ht < 0 ? -ht : ht));
+        pv_add(buf, C_DIM);
+        snprintf(buf, sizeof(buf), "%u-bit BMP", (unsigned)(h[28] | h[29] << 8));
+        pv_add(buf, C_DIM);
+    } else {
+        pv_add("Not a BMP file", C_ERR);
+    }
+    format_size(buf, sizeof(buf), e->size);
+    pv_add(buf, C_DIM);
+    pv_add("", C_DIM);
+    pv_add("Enter shows it", C_DIM);
+}
+
+// Read the selected item for the preview.
+static void pv_load(void)
+{
+    s_pv_pending = false;
+    entry_t *e = s_sel < item_count() ? item_entry(s_sel) : NULL;
+    if (!e) {
+        return;
+    }
+    if (e->is_dir) {
+        pv_folder(s_pv_key);
+    } else if (has_uf2_ext(e->name)) {
+        pv_app(s_pv_key, e);
+    } else if (view_kind(e->name) == VIEW_IMAGE) {
+        pv_image(s_pv_key, e);
+    } else {
+        pv_text(s_pv_key);
+    }
+}
+
+// Tenths of a GB (or MB, for a small card) in `out`, e.g. "12.4"
+static void format_tenths(char *out, size_t len, uint64_t bytes, uint64_t unit)
+{
+    uint64_t t = (bytes * 10 + unit / 2) / unit;
+    snprintf(out, len, "%lu.%lu", (unsigned long)(t / 10), (unsigned long)(t % 10));
+}
+
+static void draw_space(void)
+{
+    int y = FOOTER_Y + 3;
+    if (!s_space_known || !s_space_total) {
+        lcd_text(MARGIN, y, "SD", C_DIM, FONT_SMALL);
+        return;
+    }
+    uint64_t used = s_space_total - s_space_free;
+    uint64_t unit = s_space_total >= (1ull << 30) ? 1ull << 30 : 1ull << 20;
+    char a[16], b[16], line[48];
+    format_tenths(a, sizeof(a), used, unit);
+    format_tenths(b, sizeof(b), s_space_total, unit);
+    snprintf(line, sizeof(line), "SD  %s / %s %s", a, b, unit == 1ull << 20 ? "MB" : "GB");
+    lcd_text(MARGIN, y, line, C_DIM, FONT_SMALL);
+    int bx = 130, bw = LCD_W - 6 - bx;
+    look_frame(bx, y, bw, 9, C_LINE);
+    lcd_fill_rect(bx + 2, y + 2, (int)((uint64_t)(bw - 4) * used / s_space_total), 5, C_ACCENT);
+}
+
+static void draw_preview(void)
+{
+    lcd_fill_rect(BR_W + 2, BAR_H + 22, LCD_W - BR_W - 2, BR_BOTTOM - BAR_H - 22, C_BG);
+    if (!s_pv_key[0]) {
+        return;
+    }
+    lcd_text(PV_X, BR_Y + 2, "Preview", C_DIM, FONT_SMALL);
+    for (int i = 0; i < s_pv_n; i++) {
+        lcd_text(PV_X, BR_Y + 20 + i * 13, s_pv[i], s_pv_color[i], FONT_SMALL);
+    }
+}
+
 static void draw_browse(void)
 {
-    draw_header();
-
+    draw_bar();
     int n = item_count();
+    char path[PATH_MAX_LEN + 8], shown[COLS + 1], count[16] = "";
+    snprintf(path, sizeof(path), "SD:%s/", s_cwd);
+    int marked = marked_count();
+    if (marked) {
+        snprintf(count, sizeof(count), "%d marked", marked);
+    } else if (s_sd_ok) {
+        snprintf(count, sizeof(count), s_count == 1 ? "%d item" : "%d items", s_count);
+    }
+    int count_x = LCD_W - MARGIN - 6 * (int)strlen(count);
+    fit(shown, path, (count_x - 8 - MARGIN) / 7);
+    lcd_text(MARGIN, PATH_Y - 1, shown, C_FG, FONT_LARGE);
+    lcd_text(count_x, PATH_Y + 1, count, marked ? C_BRIGHT : C_DIM, FONT_SMALL);
+    lcd_hline(0, PATH_Y + 15, LCD_W, C_LINE);
+
     if (!s_sd_ok) {
         lcd_text(MARGIN, LIST_Y + 2 * ROW_H, "No SD card found.", C_ERR, FONT_LARGE);
         lcd_text(MARGIN, LIST_Y + 4 * ROW_H, "Insert a FAT32 card and press", C_DIM, FONT_LARGE);
         lcd_text(MARGIN, LIST_Y + 5 * ROW_H, "Enter to retry.", C_DIM, FONT_LARGE);
     } else if (n == 0) {
-        lcd_text(MARGIN, LIST_Y + 2 * ROW_H, "Nothing to open here.", C_DIM, FONT_LARGE);
+        lcd_text(MARGIN, BR_Y + 2 * BR_ROW, "Nothing to open here.", C_DIM, FONT_SMALL);
     }
 
     if (s_sel < s_top) {
         s_top = s_sel;
-    } else if (s_sel >= s_top + LIST_ROWS) {
-        s_top = s_sel - LIST_ROWS + 1;
+    } else if (s_sel >= s_top + BR_ROWS) {
+        s_top = s_sel - BR_ROWS + 1;
     }
 
-    for (int row = 0; row < LIST_ROWS && s_top + row < n; row++) {
+    for (int row = 0; row < BR_ROWS && s_top + row < n; row++) {
         int idx = s_top + row;
-        int y = LIST_Y + row * ROW_H;
+        int y = BR_Y + row * BR_ROW;
         bool sel = idx == s_sel;
-        lcd_color_t fg = sel ? C_SEL_FG : C_FG;
         if (sel) {
-            lcd_fill_rect(MARGIN - 4, y - 1, LCD_W - 2 * (MARGIN - 4), ROW_H, C_SEL_BG);
+            lcd_fill_rect(2, y - 3, BR_W - 6, BR_ROW - 1, C_SEL_BG);
         }
-
         entry_t *e = item_entry(idx);
-        char label[COLS + 1], buf[300];
-        int size_cols = 0;
-        if (!e) {
-            lcd_text(MARGIN, y, "[..]", fg, FONT_LARGE);
-        } else if (e->is_dir) {
-            snprintf(buf, sizeof(buf), "[%s]", e->name);
-            fit(label, buf, COLS - 2);
-            lcd_text(MARGIN, y, label, fg, FONT_LARGE);
-        } else {
-            char size[12];
+        bool marked = e && e->marked;
+        if (marked) {
+            lcd_fill_rect(3, y - 1, 2, BR_ROW - 5, sel ? C_SEL_FG : C_BRIGHT);
+        }
+        lcd_fill_rect(8, y + 1, 6, 8, sel ? C_SEL_FG : type_color(e));
+        char label[40], buf[300], size[12] = "";
+        if (e && !e->is_dir) {
             format_size(size, sizeof(size), e->size);
-            size_cols = (int)strlen(size) + 1;
-            fit(label, e->name, COLS - size_cols - 2);
-            lcd_text(MARGIN, y, label, sel || has_uf2_ext(e->name) ? fg : C_ACC2, FONT_LARGE); // documents in colour
-            lcd_text(LCD_W - MARGIN - 7 * (size_cols - 1), y, size, sel ? C_SEL_FG : C_DIM, FONT_LARGE);
         }
+        int size_x = BR_W - 8 - 6 * (int)strlen(size);
         if (e && e->fav) {
-            lcd_text(LCD_W - MARGIN - 7 * (size_cols + 1), y, "*", sel ? C_SEL_FG : C_WARN, FONT_LARGE);
+            size_x -= 8;
+            lcd_text(size_x + 2, y, "*", sel ? C_SEL_FG : C_WARN, FONT_SMALL);
         }
+        snprintf(buf, sizeof(buf), e && !e->is_dir ? "%s" : "[%s]", e ? e->name : "..");
+        fit(label, buf, (size_x - 4 - 20) / 6);
+        lcd_text(20, y, label, sel ? C_SEL_FG : marked ? C_BRIGHT : C_FG, FONT_SMALL);
+        lcd_text(BR_W - 8 - 6 * (int)strlen(size), y, size, sel ? C_SEL_FG : C_DIM, FONT_SMALL);
     }
 
     // scroll bar
-    if (n > LIST_ROWS) {
-        int track = LIST_ROWS * ROW_H;
-        int h = track * LIST_ROWS / n;
-        int y = LIST_Y + (track - h) * s_top / (n - LIST_ROWS);
-        lcd_fill_rect(LCD_W - 3, y - 1, 2, h, C_DIM);
+    if (n > BR_ROWS) {
+        int track = BR_ROWS * BR_ROW;
+        int h = track * BR_ROWS / n;
+        int y = BR_Y - 3 + (track - h) * s_top / (n - BR_ROWS);
+        lcd_fill_rect(BR_W - 3, y, 2, h, C_DIM);
     }
 
-    char name[40], version[24], installed[PATH_MAX_LEN + 96];
+    if (s_sd_ok) {
+        lcd_fill_rect(BR_W, PATH_Y + 16, 1, BR_BOTTOM - PATH_Y - 16, C_LINE);
+        char key[sizeof(s_pv_key)] = "";
+        if (s_sel < n) {
+            entry_t *e = item_entry(s_sel);
+            snprintf(key, sizeof(key), "%s/%s", s_cwd, e ? e->name : "..");
+        }
+        if (strcmp(key, s_pv_key) != 0) {
+            strlcpy(s_pv_key, key, sizeof(s_pv_key));
+            s_pv_n = 0;
+            s_pv_pending = false;
+            if (key[0]) {
+                pv_quick(item_entry(s_sel));
+            }
+        }
+        draw_preview();
+    }
+    lcd_hline(0, BR_BOTTOM, LCD_W, C_LINE);
+
+    const char *keys = "Enter Open  Spc Mark  ^C Copy  ^V Paste  Tab More  F3 Home";
+    char note[PATH_MAX_LEN + 96], what[64];
     lcd_color_t color = C_DIM;
     if (s_note[0]) {
-        strlcpy(installed, s_note, sizeof(installed));
+        strlcpy(note, s_note, sizeof(note));
         color = s_note_color;
-    } else if (s_clip[0]) {
-        snprintf(installed, sizeof(installed), "%s %s - V pastes here, Esc forgets", s_clip_cut ? "Cut" : "Copied",
-                 strrchr(s_clip, '/') + 1);
+    } else if (marked) {
+        snprintf(note, sizeof(note), "%d marked - ^C copy, ^X cut, Del delete, Esc unmarks", marked);
+        color = C_BRIGHT;
+    } else if (s_clip_n) {
+        clip_label(what, sizeof(what));
+        snprintf(note, sizeof(note), "%s %s - ^V pastes here, Esc forgets", s_clip_cut ? "Cut" : "Copied", what);
         color = C_ACCENT;
-    } else if (uf2_installed(name, sizeof(name), version, sizeof(version))) {
-        snprintf(installed, sizeof(installed), "Installed: %s %s", name, version);
     } else {
-        snprintf(installed, sizeof(installed), "Installed: (none)");
+        draw_footer(NULL, C_DIM, keys);
+        if (s_sd_ok) {
+            draw_space();
+        }
+        return;
     }
     char line[(LCD_W - 2 * MARGIN) / 6 + 1];
-    fit(line, installed, (LCD_W - 2 * MARGIN) / 6);
-    draw_footer(line, color,
-#if PICOMULTILOADER_WIFI
-                "Enter Open  Tab Actions  F2 Fav  F3 Home  F4 Web  F5 Term"
-#else
-                "Enter Open  Tab Actions  F2 Fav  F3 Home  F5 Terminal"
-#endif
-    );
+    fit(line, note, (LCD_W - 2 * MARGIN) / 6);
+    draw_footer(line, color, keys);
+}
+
+// From ui_tick(): fill in the preview once the selection has rested, and the card's used space.
+static void browse_tick(void)
+{
+    if (s_pv_pending && time_us_64() - s_pv_since > PV_DELAY_US) {
+        pv_load();
+        ui_redraw();
+    } else if (!s_space_known && s_sd_ok && !s_pv_pending) {
+        int r = sdcard_space_step(&s_space_total, &s_space_free);
+        if (r == 0) {
+            return; // counting: more on the next tick
+        }
+        if (r < 0) {
+            s_space_total = 0;
+        }
+        s_space_known = true; // don't ask again until the list is read again
+        ui_redraw();
+    }
 }
 
 static void draw_kv(int y, const char *key, const char *value)
@@ -926,7 +1313,7 @@ static const char *const HELP_TEXT[] = {
     "",
     "#Home",
     "The apps on the card: each folder in the root with an app.ini or a .uf2 in it, and each .uf2 in the root.",
-    "Arrows, PgUp/PgDn, Home/End: move. Tab: next tab (All, Recent, Favourites, then by category).",
+    "Arrows, PgUp/PgDn, Home/End: move. Tab: next tab (Favourites, Recent, All). It opens on the app run last.",
     "Type to search all the apps; Backspace deletes, Esc clears.",
     "Enter: run the app. The installed one (green dot) starts at once; any other is flashed first.",
     "F2: add to or remove from Favourites (yellow star). F3: Files.",
@@ -940,13 +1327,15 @@ static const char *const HELP_TEXT[] = {
     "#App folders",
     "An app.ini in the folder describes the app, one key = value per line: name, category (Emulators, Tools, Dev "
     "or Media), icon (a 32x32 16-colour BMP, icon.bmp if not set), binary (the .uf2 to run), version, author, desc "
-    "and board (rp2040, rp2350 or any). A folder with several .uf2 files and no binary opens in Files.",
+    "and board (rp2040, rp2350 or any). A folder with several .uf2 files and no binary opens on Home: its apps and "
+    "folders, and a Back tile (or Esc, Backspace) for the folder above; Tab goes straight back to the tabs.",
     "",
     "#Files (F3)",
     "Up/Down, PgUp/PgDn, Home/End: move. Enter or Right: open a folder, or show a .uf2 file's details; Enter there "
     "flashes and runs it (or just runs it if it is installed; R reflashes).",
-    "Backspace or Left: parent folder; at the top, back to Home. Esc or F3: Home. F2: favourite.",
-    "Folders, .uf2 files and files the viewers open are listed (those in another colour). The last folder and file are remembered.",
+    "Backspace or Left: parent folder; at the top, back to Home. Esc or F3: Home.",
+    "Folders, .uf2 files and files the viewers open are listed; Tab > Show all files lists every file. The last "
+    "folder and file are remembered.",
     "",
     "#Text reader and image viewer",
     "Enter on a .txt, .md, .log, .ini, .csv, .py or .bas file reads it in pages: Up/Down or PgUp/PgDn turn them, "
@@ -957,8 +1346,11 @@ static const char *const HELP_TEXT[] = {
     "In the terminal, view <file> opens them too.",
     "",
     "#Copy, move and delete (Tab)",
-    "Tab opens a menu for the selected file or folder: Copy, Cut (to move it), Paste and Delete.",
-    "Shortcuts in the file list: C copy, X cut, V paste into the folder shown, Del delete. Esc forgets what was copied.",
+    "Space marks or unmarks the selected item and moves on; Copy, Cut and Delete act on the marked items, or on the "
+    "selected one when none is marked. Esc unmarks them.",
+    "Tab opens a menu: Copy, Cut (to move), Paste, Delete and Show all files.",
+    "Shortcuts in the file list: Ctrl+C copy, Ctrl+X cut, Ctrl+V paste into the folder shown, Del delete. Esc forgets "
+    "what was copied.",
     "Copy or Cut, go to another folder, then Paste. Pasting a copy where the name is taken adds a number, e.g. app (2).uf2.",
     "Deleting a folder deletes everything in it.",
 #if !PICO_RP2040
@@ -1787,10 +2179,11 @@ static void rescan_dir(void)
 }
 
 // ---- copy / move / delete (Tab) ---------------------------------------------------------------
-enum { FA_COPY, FA_CUT, FA_PASTE, FA_DELETE, FA_FORGET };
-static int s_fa_items[5], s_fa_count, s_fa_sel;
-static char s_fa_path[PATH_MAX_LEN + 64]; // the file or folder the menu / delete screen is about
+enum { FA_COPY, FA_CUT, FA_PASTE, FA_DELETE, FA_FORGET, FA_SHOW_ALL };
+static int s_fa_items[6], s_fa_count, s_fa_sel;
+static char s_fa_path[PATH_MAX_LEN + 64]; // the first item the delete screen is about
 static bool s_fa_is_dir;
+static int s_del_n;                       // how many items it is about
 
 static void note(lcd_color_t color, const char *fmt, const char *arg)
 {
@@ -1798,15 +2191,19 @@ static void note(lcd_color_t color, const char *fmt, const char *arg)
     s_note_color = color;
 }
 
-// The selected file or folder (not ".."); fills s_fa_path.
-static entry_t *selected_entry(void)
+// The next item to act on: the marked ones in turn, else the selected one (not ".."). *it starts at 0.
+static entry_t *target(int *it)
 {
-    entry_t *e = item_count() ? item_entry(s_sel) : NULL;
-    if (e) {
-        snprintf(s_fa_path, sizeof(s_fa_path), "%s/%s", s_cwd, e->name);
-        s_fa_is_dir = e->is_dir;
+    if (marked_count()) {
+        while (*it < s_count) {
+            entry_t *e = &s_entries[(*it)++];
+            if (e->marked) {
+                return e;
+            }
+        }
+        return NULL;
     }
-    return e;
+    return (*it)++ == 0 && item_count() ? item_entry(s_sel) : NULL;
 }
 
 // The loader itself on the RP2350: the boot stub loads this menu from it.
@@ -1833,61 +2230,116 @@ static void select_name(const char *name)
 
 static void mark(bool cut)
 {
-    entry_t *e = selected_entry();
-    if (!e) {
+    char path[PATH_MAX_LEN + 64];
+    size_t used = 0;
+    int it = 0, n = 0;
+    entry_t *e;
+    while ((e = target(&it))) { // check them all before the clipboard changes
+        snprintf(path, sizeof(path), "%s/%s", s_cwd, e->name);
+        if (cut && protected_path(path)) {
+            note(C_ERR, "%s is the loader menu; it stays here.", e->name);
+            return;
+        }
+        used += strlen(e->name) + 1;
+        n++;
+    }
+    if (!n) {
         return;
     }
-    if (cut && protected_path(s_fa_path)) {
-        note(C_ERR, "%s is the loader menu; it stays here.", e->name);
+    if (used > sizeof(s_clip_names)) {
+        note(C_ERR, "%sToo many items at once: mark fewer.", "");
         return;
     }
-    strlcpy(s_clip, s_fa_path, sizeof(s_clip));
+    used = 0;
+    it = 0;
+    while ((e = target(&it))) {
+        size_t len = strlen(e->name) + 1;
+        memcpy(s_clip_names + used, e->name, len);
+        used += len;
+    }
+    strlcpy(s_clip, s_cwd, sizeof(s_clip));
+    s_clip_n = n;
     s_clip_cut = cut;
+    unmark_all();
 }
 
 static void ask_delete(void)
 {
-    entry_t *e = selected_entry();
-    if (!e) {
-        return;
+    char path[PATH_MAX_LEN + 64];
+    int it = 0;
+    entry_t *e;
+    s_del_n = 0;
+    while ((e = target(&it))) {
+        snprintf(path, sizeof(path), "%s/%s", s_cwd, e->name);
+        if (protected_path(path)) {
+            note(C_ERR, "%s is the loader menu; delete it from a PC.", e->name);
+            s_screen = SCREEN_BROWSE;
+            return;
+        }
+        if (!s_del_n++) {
+            strlcpy(s_fa_path, path, sizeof(s_fa_path));
+            s_fa_is_dir = e->is_dir;
+        }
     }
-    if (protected_path(s_fa_path)) {
-        note(C_ERR, "%s is the loader menu; delete it from a PC.", e->name);
-        s_screen = SCREEN_BROWSE;
-        return;
+    if (s_del_n) {
+        s_screen = SCREEN_DELETE;
     }
-    s_screen = SCREEN_DELETE;
 }
 
 static void draw_delete(void)
 {
     draw_dialog(112);
     int y = LIST_Y + 4;
-    lcd_text(MARGIN, y, s_fa_is_dir ? "Delete this folder?" : "Delete this file?", C_ERR, FONT_LARGE);
-    y += 2 * ROW_H;
-    draw_kv(y, s_fa_is_dir ? "Folder" : "File", strrchr(s_fa_path, '/') + 1);
-    y += 2 * ROW_H;
-    if (s_fa_is_dir) {
-        draw_wrapped(y, "Everything in it is deleted too. This can't be undone.", C_FG);
+    char buf[32];
+    if (s_del_n > 1) {
+        snprintf(buf, sizeof(buf), "Delete %d items?", s_del_n);
+        lcd_text(MARGIN, y, buf, C_ERR, FONT_LARGE);
+        y += 2 * ROW_H;
+        draw_kv(y, "First", strrchr(s_fa_path, '/') + 1);
+        y += 2 * ROW_H;
+        draw_wrapped(y, "Folders among them are deleted with everything in them. This can't be undone.", C_FG);
     } else {
-        draw_wrapped(y, "This can't be undone.", C_FG);
+        lcd_text(MARGIN, y, s_fa_is_dir ? "Delete this folder?" : "Delete this file?", C_ERR, FONT_LARGE);
+        y += 2 * ROW_H;
+        draw_kv(y, s_fa_is_dir ? "Folder" : "File", strrchr(s_fa_path, '/') + 1);
+        y += 2 * ROW_H;
+        draw_wrapped(y, s_fa_is_dir ? "Everything in it is deleted too. This can't be undone." : "This can't be undone.",
+                     C_FG);
     }
     draw_footer(NULL, C_FG, "Enter Delete  Esc Cancel");
 }
 
 static void do_delete(void)
 {
-    char err[96], name[64];
-    strlcpy(name, strrchr(s_fa_path, '/') + 1, sizeof(name));
+    char err[96], path[PATH_MAX_LEN + 64], count[16];
+    int it = 0, done = 0;
+    bool failed = false;
+    entry_t *e;
     draw_footer(NULL, C_FG, "Deleting...");
     lcd_flush();
-    if (fileops_delete(s_fa_path, err, sizeof(err))) {
-        note(C_OK, "Deleted %s", name);
-        if (strcasecmp(s_clip, s_fa_path) == 0) {
-            s_clip[0] = '\0';
+    while ((e = target(&it))) {
+        snprintf(path, sizeof(path), "%s/%s", s_cwd, e->name);
+        if (!fileops_delete(path, err, sizeof(err))) {
+            note(C_ERR, "%s", err);
+            failed = true;
+            break;
         }
-    } else {
-        note(C_ERR, "%s", err);
+        if (!done++) {
+            strlcpy(s_fa_path, path, sizeof(s_fa_path));
+        }
+        if (!marked_count()) {
+            break; // it was the selected one
+        }
+        e->marked = false; // done with it: the next target() goes on from here
+        it = 0;
+    }
+    if (done && !failed) {
+        if (done == 1) {
+            note(C_OK, "Deleted %s", strrchr(s_fa_path, '/') + 1);
+        } else {
+            snprintf(count, sizeof(count), "%d", done);
+            note(C_OK, "Deleted %s items", count);
+        }
     }
     rescan_dir();
     s_screen = SCREEN_BROWSE;
@@ -1917,7 +2369,9 @@ static void copy_progress(const char *name, uint64_t done, uint64_t total)
 // "name (2).ext", "name (3).ext"... for a copy whose name is taken in the folder shown.
 static bool free_name(char *out, size_t len, const char *name, bool is_dir)
 {
-    snprintf(out, len, "%s/%s", s_cwd, name);
+    if ((size_t)snprintf(out, len, "%s/%s", s_cwd, name) >= len) {
+        return false;
+    }
     const char *dot = is_dir ? NULL : strrchr(name, '.');
     int base = dot && dot != name ? (int)(dot - name) : (int)strlen(name);
     for (int n = 2; fileops_exists(out); n++) {
@@ -1929,93 +2383,137 @@ static bool free_name(char *out, size_t len, const char *name, bool is_dir)
     return true;
 }
 
-static void paste(void)
+// Paste one item (`src`, named `name`) into the folder shown; `dst` gets where it went. False, with a
+// note, if it couldn't.
+static bool paste_one(const char *src, const char *name, char *dst, char *shown, int idx)
 {
-    if (!s_clip[0]) {
-        note(C_DIM, "%sNothing to paste: copy (C) or cut (X) a file first.", "");
-        return;
-    }
-    const char *name = strrchr(s_clip, '/') + 1;
-    if (!fileops_exists(s_clip)) {
-        note(C_ERR, "%s is gone; nothing to paste.", name);
-        s_clip[0] = '\0';
-        return;
-    }
-    bool folder = is_dir(s_clip);
-    size_t src_len = strlen(s_clip);
-    if (folder && strncasecmp(s_cwd, s_clip, src_len) == 0 && (s_cwd[src_len] == '\0' || s_cwd[src_len] == '/')) {
-        note(C_ERR, "Can't put %s inside itself.", name);
-        return;
-    }
-    bool same_folder = (size_t)(name - 1 - s_clip) == strlen(s_cwd) && strncasecmp(s_clip, s_cwd, strlen(s_cwd)) == 0;
-    // In the UF2 reader's buffer (idle while pasting): the main stack is small.
-    size_t scratch_len;
-    char *dst = uf2_scratch(&scratch_len), *shown = dst + PATH_MAX_LEN + 80;
-    _Static_assert(2 * PATH_MAX_LEN + 176 <= 2048, "paste scratch");
     char err[96];
+    if (!fileops_exists(src)) {
+        note(C_ERR, "%s is gone; nothing to paste.", name);
+        return false;
+    }
+    bool folder = is_dir(src);
+    size_t src_len = strlen(src);
+    if (folder && strncasecmp(s_cwd, src, src_len) == 0 && (s_cwd[src_len] == '\0' || s_cwd[src_len] == '/')) {
+        note(C_ERR, "Can't put %s inside itself.", name);
+        return false;
+    }
     if (s_clip_cut) {
-        if (same_folder) {
+        if (strcasecmp(s_clip, s_cwd) == 0) {
             note(C_DIM, "%s is already in this folder.", name);
-            return;
+            return false;
         }
-        snprintf(dst, PATH_MAX_LEN + 80, "%s/%s", s_cwd, name);
+        if ((size_t)snprintf(dst, PATH_MAX_LEN + 80, "%s/%s", s_cwd, name) >= PATH_MAX_LEN + 80) {
+            note(C_ERR, "%s: the path is too long.", name);
+            return false;
+        }
         if (fileops_exists(dst)) {
             note(C_ERR, "There is already a %s here.", name);
-            return;
+            return false;
         }
-        if (!fileops_move(s_clip, dst, err, sizeof(err))) {
+        if (!fileops_move(src, dst, err, sizeof(err))) {
             note(C_ERR, "%s", err);
-            return;
+            return false;
         }
-        note(C_OK, "Moved %s here", name);
-        s_clip[0] = '\0';
-    } else {
-        if (!free_name(dst, PATH_MAX_LEN + 80, name, folder)) {
-            note(C_ERR, "Too many copies of %s here.", name);
-            return;
-        }
-        draw_header();
-        lcd_text(MARGIN, LIST_Y + 4, folder ? "Copying folder..." : "Copying...", C_ACCENT, FONT_LARGE);
-        sd_name(shown, PATH_MAX_LEN + 96, s_clip);
-        draw_kv(LIST_Y + 4 + 2 * ROW_H, "From", shown);
-        sd_name(shown, PATH_MAX_LEN + 96, dst);
-        draw_kv(LIST_Y + 4 + 3 * ROW_H, "To", shown);
-        draw_footer(NULL, C_FG, "Please wait");
-        lcd_flush();
-        s_copy_shown[0] = '\0';
-        draw_progress(0, 1);
-        if (!fileops_copy(s_clip, dst, copy_progress, err, sizeof(err))) {
-            note(C_ERR, "%s", err);
-            rescan_dir();
-            return;
-        }
-        note(C_OK, "Copied to %s", strrchr(dst, '/') + 1);
+        return true;
     }
-    scan_dir();
-    select_name(strrchr(dst, '/') + 1);
+    if (!free_name(dst, PATH_MAX_LEN + 80, name, folder)) {
+        note(C_ERR, "Too many copies of %s here.", name);
+        return false;
+    }
+    char title[40];
+    if (s_clip_n > 1) {
+        snprintf(title, sizeof(title), "Copying %d of %d...", idx + 1, s_clip_n);
+    } else {
+        strlcpy(title, folder ? "Copying folder..." : "Copying...", sizeof(title));
+    }
+    draw_header();
+    lcd_text(MARGIN, LIST_Y + 4, title, C_ACCENT, FONT_LARGE);
+    sd_name(shown, PATH_MAX_LEN + 96, src);
+    draw_kv(LIST_Y + 4 + 2 * ROW_H, "From", shown);
+    sd_name(shown, PATH_MAX_LEN + 96, dst);
+    draw_kv(LIST_Y + 4 + 3 * ROW_H, "To", shown);
+    draw_footer(NULL, C_FG, "Please wait");
+    lcd_flush();
+    s_copy_shown[0] = '\0';
+    draw_progress(0, 1);
+    if (!fileops_copy(src, dst, copy_progress, err, sizeof(err))) {
+        note(C_ERR, "%s", err);
+        return false;
+    }
+    return true;
+}
+
+static void paste(void)
+{
+    if (!s_clip_n) {
+        note(C_DIM, "%sNothing to paste: copy (Ctrl+C) or cut (Ctrl+X) first.", "");
+        return;
+    }
+    // In the UF2 reader's buffer (idle while pasting): the main stack is small.
+    size_t scratch_len;
+    char *src = uf2_scratch(&scratch_len), *dst = src + PATH_MAX_LEN + 260, *shown = dst + PATH_MAX_LEN + 80;
+    _Static_assert(3 * PATH_MAX_LEN + 436 <= 2048, "paste scratch");
+    char last[64] = "", count[16];
+    const char *name = s_clip_names;
+    int done = 0;
+    for (; done < s_clip_n; done++, name += strlen(name) + 1) {
+        if ((size_t)snprintf(src, PATH_MAX_LEN + 260, "%s/%s", s_clip, name) >= PATH_MAX_LEN + 260) {
+            note(C_ERR, "%s: the path is too long.", name);
+            break;
+        }
+        if (!paste_one(src, name, dst, shown, done)) {
+            break;
+        }
+        strlcpy(last, strrchr(dst, '/') + 1, sizeof(last));
+    }
+    if (done == s_clip_n) {
+        snprintf(count, sizeof(count), "%d", done);
+        if (done > 1) {
+            note(C_OK, s_clip_cut ? "Moved %s items here" : "Copied %s items here", count);
+        } else {
+            note(C_OK, s_clip_cut ? "Moved %s here" : "Copied to %s", s_clip_cut ? s_clip_names : last);
+        }
+    }
+    if (s_clip_cut && done) { // what was moved isn't there to move again
+        size_t gone = (size_t)(name - s_clip_names);
+        memmove(s_clip_names, name, sizeof(s_clip_names) - gone);
+        s_clip_n -= done;
+    }
+    if (done) {
+        scan_dir();
+        select_name(last);
+    } else {
+        rescan_dir();
+    }
+}
+
+static void toggle_show_all(void)
+{
+    s_show_all = !s_show_all;
+    save_setting("files_all", s_show_all ? "1" : "0");
+    rescan_dir();
 }
 
 static void enter_files(void)
 {
-    entry_t *e = selected_entry();
+    int it = 0;
+    bool any = target(&it) != NULL;
     s_fa_count = 0;
-    if (e) {
+    if (any) {
         s_fa_items[s_fa_count++] = FA_COPY;
         s_fa_items[s_fa_count++] = FA_CUT;
     }
-    if (s_clip[0]) {
+    if (s_clip_n) {
         s_fa_items[s_fa_count++] = FA_PASTE;
     }
-    if (e) {
+    if (any) {
         s_fa_items[s_fa_count++] = FA_DELETE;
     }
-    if (s_clip[0]) {
+    if (s_clip_n) {
         s_fa_items[s_fa_count++] = FA_FORGET;
     }
-    if (!s_fa_count) {
-        note(C_DIM, "%sSelect a file or folder first.", "");
-        return;
-    }
+    s_fa_items[s_fa_count++] = FA_SHOW_ALL;
     s_fa_sel = 0;
     s_screen = SCREEN_FILES;
 }
@@ -2023,42 +2521,49 @@ static void enter_files(void)
 static void draw_files(void)
 {
     draw_header();
-    int y = LIST_Y + 4;
+    int y = LIST_Y + 4, marked = marked_count();
     entry_t *e = item_count() ? item_entry(s_sel) : NULL;
-    char buf[PATH_MAX_LEN + 80];
-    if (e) {
+    char buf[PATH_MAX_LEN + 160], what[64];
+    if (marked) {
+        snprintf(buf, sizeof(buf), "%d marked", marked);
+        draw_kv(y, "Items", buf);
+    } else if (e) {
         draw_kv(y, e->is_dir ? "Folder" : "File", e->name);
     } else {
         lcd_text(MARGIN, y, "This folder", C_DIM, FONT_LARGE);
     }
     y += 2 * ROW_H;
+    clip_label(what, sizeof(what));
     for (int i = 0; i < s_fa_count; i++, y += WF_ROW_H) {
         char label[COLS + 1];
         switch (s_fa_items[i]) {
         case FA_COPY:
-            strlcpy(buf, "Copy  (C)", sizeof(buf));
+            strlcpy(buf, "Copy  (Ctrl+C)", sizeof(buf));
             break;
         case FA_CUT:
-            strlcpy(buf, "Cut, to move it  (X)", sizeof(buf));
+            strlcpy(buf, "Cut, to move  (Ctrl+X)", sizeof(buf));
             break;
         case FA_PASTE:
-            snprintf(buf, sizeof(buf), "Paste %s here  (V)", strrchr(s_clip, '/') + 1);
+            snprintf(buf, sizeof(buf), "Paste %s here  (Ctrl+V)", what);
             break;
         case FA_DELETE:
             strlcpy(buf, "Delete  (Del)", sizeof(buf));
             break;
+        case FA_FORGET:
+            snprintf(buf, sizeof(buf), "Forget the %s %s", s_clip_cut ? "cut" : "copied", s_clip_n > 1 ? "items" : "item");
+            break;
         default:
-            snprintf(buf, sizeof(buf), "Forget the %s item", s_clip_cut ? "cut" : "copied");
+            strlcpy(buf, s_show_all ? "Show only apps and documents" : "Show all files", sizeof(buf));
             break;
         }
         fit(label, buf, COLS);
         draw_option(y, label, i == s_fa_sel);
     }
-    if (s_clip[0]) {
+    if (s_clip_n) {
         y += ROW_H;
         char where[PATH_MAX_LEN + 72];
         sd_name(where, sizeof(where), s_clip);
-        snprintf(buf, sizeof(buf), "%s: %s", s_clip_cut ? "Cut" : "Copied", where);
+        snprintf(buf, sizeof(buf), "%s %s from %s", s_clip_cut ? "Cut" : "Copied", what, where);
         draw_wrapped(y, buf, C_DIM);
     }
     draw_footer(NULL, C_FG, "Up/Down Move  Enter Select  Esc Back");
@@ -2099,16 +2604,18 @@ static bool files_key(int key)
     case FA_DELETE:
         ask_delete();
         break;
+    case FA_FORGET:
+        s_clip_n = 0;
+        break;
     default:
-        s_clip[0] = '\0';
+        toggle_show_all();
         break;
     }
     return true;
 }
 
 // ---- Home: the apps ---------------------------------------------------------------------------
-enum { TAB_ALL, TAB_RECENT, TAB_FAVS, TAB_CAT }; // then one per category
-#define TABS       (TAB_CAT + APP_CATS - 1)
+enum { TAB_FAVS, TAB_RECENT, TAB_ALL, TABS };
 #define TAB_Y      (BAR_H + 4)
 #define GRID_Y     40
 #define GRID_COLS  4
@@ -2118,8 +2625,13 @@ enum { TAB_ALL, TAB_RECENT, TAB_FAVS, TAB_CAT }; // then one per category
 #define FILTER_MAX 16
 #define RUN_KEY    "run_path" // "size.date.time|path" of the .uf2 flashed last, to know it is installed
 
-static uint8_t s_shown[APPS_MAX];     // the apps on the tab (indexes into s_apps.list), in order
+#define HOME_BACK  0xFF               // in s_shown: the Back tile of a folder
+
+static uint8_t s_shown[APPS_MAX + 1]; // the apps on the tab (indexes into s_apps.list), in order
 static int s_tab, s_hsel, s_htop;     // s_htop: the first grid row shown
+static char s_hdir[PATH_MAX_LEN];     // Home shows what is in this folder, "" = the tabs
+static char s_hentry[PATH_MAX_LEN];   // the folder opened from the tabs: Back there returns to them
+static bool s_home_shown;             // Home has been opened since power-on
 static int s_running = -1;            // the installed app, -1 = none of these
 static char s_filter[FILTER_MAX + 1]; // typed: search all the apps
 static int s_info_for = -1;           // the app s_app_info is about
@@ -2158,8 +2670,7 @@ static bool is_installed(const char *path)
 
 static const char *tab_name(int tab)
 {
-    return tab == TAB_ALL ? "All" : tab == TAB_RECENT ? "Recent" : tab == TAB_FAVS ? "Favourites"
-                                                                   : apps_cat_name(tab - TAB_CAT + 1);
+    return tab == TAB_ALL ? "All" : tab == TAB_RECENT ? "Recent" : "Favourites";
 }
 
 static bool contains(const char *s, const char *part) // ignoring case
@@ -2178,33 +2689,42 @@ static bool on_tab(const app_t *e)
     if (s_filter[0]) {
         return contains(apps_str(&s_apps, e->title), s_filter);
     }
+    if (s_hdir[0]) {
+        return true; // everything in the folder
+    }
     switch (s_tab) {
     case TAB_ALL:
         return !(e->flags & APP_EXTRA);
     case TAB_RECENT:
         return e->recent >= 0;
-    case TAB_FAVS:
-        return e->flags & APP_FAV;
     default:
-        return e->cat == s_tab - TAB_CAT + 1;
+        return e->flags & APP_FAV;
     }
 }
 
-static int home_index(void) // the selected app in s_apps.list, -1 = none
+static int home_index(void) // the selected app in s_apps.list, -1 = none (or the Back tile)
 {
-    return s_hsel < s_shown_n ? s_shown[s_hsel] : -1;
+    return s_hsel < s_shown_n && s_shown[s_hsel] != HOME_BACK ? s_shown[s_hsel] : -1;
+}
+
+static bool home_on_back(void)
+{
+    return s_hsel < s_shown_n && s_shown[s_hsel] == HOME_BACK;
 }
 
 // Fill s_shown for the tab or the search; `keep` (a s_apps.list index) stays selected if shown.
 static void home_build(int keep)
 {
     s_shown_n = 0;
+    if (s_hdir[0] && !s_filter[0]) {
+        s_shown[s_shown_n++] = HOME_BACK;
+    }
     for (int i = 0; i < s_apps.count; i++) {
         if (on_tab(&s_apps.list[i])) {
             s_shown[s_shown_n++] = (uint8_t)i;
         }
     }
-    if (s_tab == TAB_RECENT && !s_filter[0]) { // the last run first
+    if (s_tab == TAB_RECENT && !s_filter[0] && !s_hdir[0]) { // the last run first
         for (int i = 1; i < s_shown_n; i++) {
             uint8_t v = s_shown[i];
             int j = i;
@@ -2234,8 +2754,11 @@ static void go_home(void)
     free_entries();
     s_base = s_screen = SCREEN_HOME;
     s_apps.count = 0;
+    if (s_hdir[0] && (!s_sd_ok || !is_dir(s_hdir))) {
+        s_hdir[0] = '\0'; // gone: back to the tabs
+    }
     if (s_sd_ok) {
-        apps_scan(&s_apps);
+        apps_scan_dir(&s_apps, s_hdir);
     }
     bool have_run = installed_path(run, sizeof(run));
     s_running = sel = -1;
@@ -2248,7 +2771,77 @@ static void go_home(void)
             sel = i;
         }
     }
+    if (!s_home_shown) {
+        // At power-on: the app run last, on Favourites if it is one, else on Recent. Nothing run
+        // yet: Favourites, or All when there are none.
+        s_home_shown = true;
+        int last = -1, favs = 0;
+        for (int i = 0; i < s_apps.count; i++) {
+            last = s_apps.list[i].recent == 0 ? i : last;
+            favs += (s_apps.list[i].flags & APP_FAV) != 0;
+        }
+        sel = last;
+        s_tab = last >= 0 ? ((s_apps.list[last].flags & APP_FAV) ? TAB_FAVS : TAB_RECENT) : favs ? TAB_FAVS : TAB_ALL;
+    }
     home_build(sel);
+}
+
+static void home_select(const char *path)
+{
+    for (int i = 0; i < s_shown_n; i++) {
+        if (s_shown[i] != HOME_BACK && strcasecmp(apps_str(&s_apps, s_apps.list[s_shown[i]].path), path) == 0) {
+            s_hsel = i;
+            return;
+        }
+    }
+}
+
+// Show what is in the folder `path` on Home, the first item selected.
+static void home_enter(const char *path)
+{
+    if (!s_hdir[0]) {
+        strlcpy(s_hentry, path, sizeof(s_hentry));
+    }
+    strlcpy(s_hdir, path, sizeof(s_hdir));
+    s_filter[0] = '\0';
+    s_hsel = 0;
+    go_home();
+    s_hsel = s_shown_n > 1 ? 1 : 0;
+}
+
+// Back: to the parent folder, or to the tabs from the folder opened there; that folder selected.
+static void home_up(void)
+{
+    char from[PATH_MAX_LEN];
+    strlcpy(from, s_hdir, sizeof(from));
+    if (strcasecmp(s_hdir, s_hentry) == 0) {
+        s_hdir[0] = '\0';
+    } else {
+        *strrchr(s_hdir, '/') = '\0';
+    }
+    s_filter[0] = '\0';
+    s_hsel = 0;
+    go_home();
+    home_select(from);
+}
+
+// Back to the tabs from however deep a folder.
+static void home_leave(void)
+{
+    strlcpy(s_hdir, s_hentry, sizeof(s_hdir));
+    home_up();
+}
+
+// The Back tile: a folder with an arrow.
+static void draw_back_icon(int x, int y)
+{
+    lcd_fill_rect(x + 2, y + 6, 12, 4, C_ACCENT);
+    lcd_fill_rect(x + 2, y + 9, 28, 19, C_ACCDK);
+    look_frame(x + 2, y + 9, 28, 19, C_ACCENT);
+    for (int i = 0; i < 6; i++) {
+        lcd_fill_rect(x + 8 + i, y + 18 - i, 1, 2 * i + 1, C_BRIGHT);
+    }
+    lcd_fill_rect(x + 14, y + 17, 11, 3, C_BRIGHT);
 }
 
 // Show the file list in s_cwd, with the file flashed last selected if it is there.
@@ -2296,6 +2889,12 @@ static void draw_home(void)
         lcd_text(MARGIN, TAB_Y, buf, C_BRIGHT, FONT_SMALL);
         snprintf(buf, sizeof(buf), "%d found  Esc clears", s_shown_n);
         lcd_text(LCD_W - MARGIN - 6 * (int)strlen(buf), TAB_Y, buf, C_DIM, FONT_SMALL);
+    } else if (s_hdir[0]) {
+        char shown[(LCD_W - 2 * MARGIN) / 6 - 8 + 1];
+        snprintf(buf, sizeof(buf), "SD:%s", s_hdir);
+        fit(shown, buf, sizeof(shown) - 1);
+        lcd_text(MARGIN, TAB_Y, shown, C_BRIGHT, FONT_SMALL);
+        lcd_text(LCD_W - MARGIN - 6 * 8, TAB_Y, "Esc Back", C_DIM, FONT_SMALL);
     } else {
         for (int t = 0, x = 4; t < TABS; t++) {
             const char *name = tab_name(t);
@@ -2318,8 +2917,7 @@ static void draw_home(void)
                  s_filter[0]            ? "No app matches."
                  : s_tab == TAB_RECENT  ? "No app run yet."
                  : s_tab == TAB_FAVS    ? "No favourites yet."
-                 : s_tab == TAB_ALL     ? "No apps on the card."
-                                        : "No apps in this category.",
+                                        : "No apps on the card.",
                  C_DIM, FONT_LARGE);
         draw_wrapped(LIST_Y + 4 * ROW_H,
                      s_tab == TAB_FAVS  ? "F2 adds the selected app, or a file or folder in Files (F3)."
@@ -2336,13 +2934,18 @@ static void draw_home(void)
     }
     for (int k = 0; k < GRID_COLS * GRID_ROWS && s_htop * GRID_COLS + k < s_shown_n; k++) {
         int i = s_htop * GRID_COLS + k, idx = s_shown[i];
-        const app_t *e = &s_apps.list[idx];
         int cx = k % GRID_COLS * CELL_W, cy = GRID_Y + k / GRID_COLS * CELL_H;
         bool sel = i == s_hsel;
         if (sel) {
             lcd_fill_rect(cx + 3, cy, CELL_W - 6, CELL_H - 2, C_FIELD);
             look_march(cx + 3, cy, CELL_W - 6, CELL_H - 2);
         }
+        if (idx == HOME_BACK) {
+            draw_back_icon(cx + (CELL_W - 32) / 2, cy + 5);
+            lcd_text(cx + (CELL_W - 6 * 4) / 2, cy + 41, "Back", sel ? C_BRIGHT : C_FG, FONT_SMALL);
+            continue;
+        }
+        const app_t *e = &s_apps.list[idx];
         apps_draw_icon(&s_apps, e, cx + (CELL_W - 32) / 2, cy + 5);
         if (e->flags & APP_FAV) {
             lcd_text(cx + CELL_W - 15, cy + 3, "*", C_WARN, FONT_SMALL);
@@ -2366,6 +2969,12 @@ static void draw_home(void)
     if (s_note[0]) {
         strlcpy(buf, s_note, sizeof(buf));
         color = s_note_color;
+    } else if (home_on_back()) {
+        if (strcasecmp(s_hdir, s_hentry) == 0) {
+            snprintf(buf, sizeof(buf), "Enter goes back to %s", tab_name(s_tab));
+        } else {
+            snprintf(buf, sizeof(buf), "Enter goes back to SD%.*s", (int)(strrchr(s_hdir, '/') - s_hdir), s_hdir);
+        }
     } else if (idx == s_running && idx >= 0) {
         snprintf(buf, sizeof(buf), "%s is installed: Enter starts it", apps_str(&s_apps, s_apps.list[idx].title));
         color = C_OK;
@@ -2376,7 +2985,7 @@ static void draw_home(void)
             s_info_for = idx;
         }
         if ((e->flags & APP_DIR) && e->binary == APP_NONE) {
-            snprintf(buf, sizeof(buf), "Enter shows the files in SD%s", apps_str(&s_apps, e->path));
+            snprintf(buf, sizeof(buf), "Enter opens SD%s", apps_str(&s_apps, e->path));
         } else if (s_app_info.desc[0] || s_app_info.version[0]) {
             snprintf(buf, sizeof(buf), "%s%s%s", s_app_info.version, s_app_info.version[0] ? "  " : "",
                      s_app_info.desc);
@@ -2418,14 +3027,19 @@ static void home_open(void)
         retry_card();
         return;
     }
+    if (home_on_back()) {
+        home_up();
+        return;
+    }
     int idx = home_index();
     if (idx < 0) {
         return;
     }
     const app_t *e = &s_apps.list[idx];
-    if (!apps_binary_path(&s_apps, e, s_sel_path, sizeof(s_sel_path))) { // no .uf2, or several: show them
-        strlcpy(s_cwd, apps_str(&s_apps, e->path), sizeof(s_cwd));
-        go_files();
+    if (!apps_binary_path(&s_apps, e, s_sel_path, sizeof(s_sel_path))) { // no .uf2, or several: open it here
+        char path[PATH_MAX_LEN];
+        strlcpy(path, apps_str(&s_apps, e->path), sizeof(path));
+        home_enter(path);
         return;
     }
     strlcpy(s_sel_name, strrchr(s_sel_path, '/') + 1, sizeof(s_sel_name));
@@ -2461,18 +3075,6 @@ static void home_fav(void)
     }
     if (s_tab == TAB_FAVS && !s_filter[0]) {
         home_build(idx);
-    }
-}
-
-static void browse_fav(void)
-{
-    entry_t *e = selected_entry(); // fills s_fa_path
-    if (e && !e->is_dir && !has_uf2_ext(e->name)) {
-        toast("Only apps can be favourites");
-    } else if (e) {
-        int r = apps_toggle_fav(s_fa_path);
-        fav_toast(r);
-        e->fav = apps_is_fav(s_fa_path);
     }
 }
 
@@ -3487,6 +4089,10 @@ static bool home_key(int key)
         s_hsel = n ? n - 1 : 0;
         return true;
     case KEY_TAB:
+        if (s_hdir[0] && !s_filter[0]) { // out of the folder, to the tabs
+            home_leave();
+            return true;
+        }
         if (!s_filter[0]) {
             s_tab = (s_tab + 1) % TABS;
         }
@@ -3497,12 +4103,18 @@ static bool home_key(int key)
         if (s_filter[0]) {
             s_filter[strlen(s_filter) - 1] = '\0';
             home_build(home_index());
+        } else if (s_hdir[0]) {
+            home_up();
         }
         return true;
     case KEY_ESC:
         if (s_filter[0]) {
             s_filter[0] = '\0';
             home_build(home_index());
+            return true;
+        }
+        if (s_hdir[0]) {
+            home_up();
             return true;
         }
         return had_note;
@@ -3516,6 +4128,9 @@ static bool home_key(int key)
         home_fav();
         return true;
     case KEY_F3:
+        if (s_hdir[0]) { // Files in the folder shown
+            strlcpy(s_cwd, s_hdir, sizeof(s_cwd));
+        }
         go_files();
         return true;
 #if PICOMULTILOADER_WIFI
@@ -3602,6 +4217,9 @@ void ui_tick(void)
         ui_redraw();
     }
     idle_tick();
+    if (!s_idle && s_screen == SCREEN_BROWSE) {
+        browse_tick();
+    }
     if (!s_idle) {
         look_tick();
         if (s_screen != SCREEN_IMAGE && bar_minute() != s_bar_minute) { // the image viewer has no bar
@@ -3794,8 +4412,13 @@ static void open_selected(void)
 
     snprintf(s_sel_path, sizeof(s_sel_path), "%s/%s", s_cwd, e->name);
     strlcpy(s_sel_name, e->name, sizeof(s_sel_name));
-    if (!open_viewer(SCREEN_BROWSE)) {
+    if (open_viewer(SCREEN_BROWSE)) {
+        return;
+    }
+    if (has_uf2_ext(e->name)) {
         inspect_file();
+    } else {
+        note(C_DIM, "%s: no viewer for this kind of file.", e->name);
     }
 }
 
@@ -3829,10 +4452,10 @@ void ui_key(int key)
             s_sel = s_sel + 1 < n ? s_sel + 1 : 0;
             break;
         case KEY_PAGE_UP:
-            s_sel = s_sel > LIST_ROWS ? s_sel - LIST_ROWS : 0;
+            s_sel = s_sel > BR_ROWS ? s_sel - BR_ROWS : 0;
             break;
         case KEY_PAGE_DOWN:
-            s_sel = s_sel + LIST_ROWS < n ? s_sel + LIST_ROWS : (n > 0 ? n - 1 : 0);
+            s_sel = s_sel + BR_ROWS < n ? s_sel + BR_ROWS : (n > 0 ? n - 1 : 0);
             break;
         case KEY_HOME:
             s_sel = 0;
@@ -3855,41 +4478,37 @@ void ui_key(int key)
         case KEY_F1:
             enter_ctl();
             break;
-        case KEY_F2:
-            browse_fav();
-            break;
         case KEY_F3:
             go_home();
-            break;
-#if PICOMULTILOADER_WIFI
-        case KEY_F4:
-            web_key();
-            break;
-#endif
-        case KEY_F5:
-            enter_term();
             break;
         case KEY_TAB:
             enter_files();
             break;
+        case ' ': { // mark or unmark, then on to the next
+            entry_t *e = n ? item_entry(s_sel) : NULL;
+            if (e) {
+                e->marked = !e->marked;
+            }
+            s_sel = s_sel + 1 < n ? s_sel + 1 : s_sel;
+            break;
+        }
         case KEY_DEL:
             ask_delete();
             break;
-        case 'c':
-        case 'C':
+        case KEY_CTRL_C:
             mark(false);
             break;
-        case 'x':
-        case 'X':
+        case KEY_CTRL_X:
             mark(true);
             break;
-        case 'v':
-        case 'V':
+        case KEY_CTRL_V:
             paste();
             break;
-        case KEY_ESC: // forget the copied item, else back to Home
-            if (s_clip[0]) {
-                s_clip[0] = '\0';
+        case KEY_ESC: // unmark, else forget what was copied, else back to Home
+            if (marked_count()) {
+                unmark_all();
+            } else if (s_clip_n) {
+                s_clip_n = 0;
             } else {
                 go_home();
             }
@@ -4143,6 +4762,8 @@ void ui_init(bool sd_ok)
 
     // Files opens the start folder from Setup, else the last directory, else the root
     char last[PATH_MAX_LEN];
+    char show_all[4];
+    s_show_all = load_setting("files_all", show_all, sizeof(show_all)) && show_all[0] == '1';
     if (!load_setting("start_dir", s_start_dir, sizeof(s_start_dir))) {
         s_start_dir[0] = '\0';
     }

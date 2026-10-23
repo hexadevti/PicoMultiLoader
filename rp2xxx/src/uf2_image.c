@@ -263,6 +263,7 @@ struct uf2_walk {
     FIL f;
     uf2_info_t *info;
     block_fn_t on_block; // called for each accepted block; false stops the walk
+    bool (*stop)(void);  // asked now and then while checking; true gives up (err "")
     uf2_progress_cb_t progress;
     char *err;
     size_t err_len;
@@ -313,6 +314,11 @@ static bool walk(const char *path, uf2_walk_t *w)
     for (uint32_t idx = 0; ok && idx < total;) {
         UINT n = 0;
         uint32_t want = total - idx < CHUNK_BLOCKS ? total - idx : CHUNK_BLOCKS;
+        if (w->stop && idx % (4 * CHUNK_BLOCKS) == 0 && idx && w->stop()) {
+            w->err[0] = '\0';
+            ok = false;
+            break;
+        }
         if (f_read(&w->f, s_chunk, want * 512, &n) != FR_OK || n != want * 512) {
             ok = fail(w, "Read error on the SD card.");
             break;
@@ -540,9 +546,15 @@ static uf2_walk_t s_walk;
 
 bool uf2_inspect(const char *path, uf2_info_t *info, char *err, size_t err_len)
 {
+    return uf2_inspect_stoppable(path, info, NULL, err, err_len);
+}
+
+bool uf2_inspect_stoppable(const char *path, uf2_info_t *info, bool (*stop)(void), char *err, size_t err_len)
+{
     uf2_walk_t *w = &s_walk;
     memset(w, 0, sizeof(*w));
     w->info = info;
+    w->stop = stop;
     w->err = err;
     w->err_len = err_len;
     if (!walk(path, w)) {

@@ -59,6 +59,10 @@ const char *apps_cat_name(int cat);
 /** Fill `a` from the card. */
 void apps_scan(apps_t *a);
 
+/** Fill `a` with what is in the folder `dir` ("" = the root, as apps_scan()): its .uf2 files, and
+ *  its folders (any folder, flagged APP_EXTRA, except in the root). */
+void apps_scan_dir(apps_t *a, const char *dir);
+
 /** A pool string, "" for APP_NONE. */
 const char *apps_str(const apps_t *a, uint16_t off);
 

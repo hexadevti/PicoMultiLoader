@@ -56,6 +56,10 @@ const char *uf2_family_name(uint32_t family);
  */
 bool uf2_inspect(const char *path, uf2_info_t *info, char *err, size_t err_len);
 
+/** As uf2_inspect(), but `stop()` is asked now and then; if it says true, the check is given up and
+ *  false is returned with `err` empty. */
+bool uf2_inspect_stoppable(const char *path, uf2_info_t *info, bool (*stop)(void), char *err, size_t err_len);
+
 /** Flash the app in `path` into the app area. On failure, writes the reason to `err`. */
 bool uf2_flash(const char *path, const uf2_info_t *info, uf2_progress_cb_t progress, char *err, size_t err_len);
 

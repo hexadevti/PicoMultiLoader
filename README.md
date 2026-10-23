@@ -393,13 +393,15 @@ are different:
 |---|---|
 | F1 | Control center: Wi-Fi, USB drive mode, backlight, idle screen, theme, and Setup |
 | F2 | Add or remove a favourite |
-| F3 | Files: the SD card. `.uf2` files flash; `.txt`, `.md`, `.log`, `.ini`, `.csv` open in a reader; `.bmp` in an image viewer. Tab: copy, cut, paste, delete |
+| F3 | Files: the SD card. `.uf2` files flash; `.txt`, `.md`, `.log`, `.ini`, `.csv` open in a reader; `.bmp` in an image viewer. Space marks items; Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste them, Del deletes. Tab: the same, plus Show all files |
 | F4 | Wi-Fi and the web file manager on/off (Pico 2 W) |
 | F5 | Terminal: `help` lists the commands (`ls`, `cd`, `cat`, `view`, `run`, `apps`, `date`, `tz`, `wifi`, `free`, `df`, `about`, ...) |
 | F10 (Shift+F5) | Screenshot to `/pml/shots/shot-NNN.bmp` |
 
 * **Home** is the start screen. It shows every top-level folder on the card that has an `app.ini` or a
-  `.uf2` in it, plus loose `.uf2` files in the root. Tabs: All, Recent, Favourites, and one per category.
+  `.uf2` in it, plus loose `.uf2` files in the root. Tabs: Favourites, Recent, All. It opens on the app run last.
+  A folder with no single `.uf2` to run opens on Home too, showing its `.uf2` files and folders
+  after a **Back** tile; Back (or Esc / Backspace) goes to the folder above, and Tab straight back to the tabs.
 * **Idle screen:** after a while without a key press (set in the control center: 1-30 minutes or never),
   a dim clock on black with the backlight turned down, redrawn once a minute; 10 minutes later the
   backlight goes off. Between keyboard polls the loader sleeps the CPU (WFE), so it draws little
