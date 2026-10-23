@@ -58,6 +58,7 @@ add_executable(${LOADER_NAME}
     src/fileops.c
     src/keyboard.c
     src/lcd.c
+    src/look.c
     src/sdcard.c
     src/uf2_image.c
     src/ui.c

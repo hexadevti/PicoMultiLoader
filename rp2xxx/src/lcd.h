@@ -31,6 +31,9 @@ void lcd_flush_rows(int y, int h);
 void lcd_fill_rect(int x, int y, int w, int h, lcd_color_t color);
 void lcd_hline(int x, int y, int w, lcd_color_t color);
 
+/** Set every other pixel of rows y..y+h-1 to `color`, in a checkerboard. */
+void lcd_checker(int y, int h, lcd_color_t color);
+
 /** Draw text with a transparent background. Returns the x after the last glyph. */
 int lcd_text(int x, int y, const char *s, lcd_color_t color, lcd_font_t font);
 

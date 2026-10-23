@@ -10,6 +10,7 @@
 #include "fileops.h"
 #include "keyboard.h"
 #include "lcd.h"
+#include "look.h"
 #include "sdcard.h"
 #include "uf2_image.h"
 #include "usb_drive.h"
@@ -17,28 +18,15 @@
 #include "webserver.h"
 #endif
 
-// ---- colours / layout -------------------------------------------------------------------------
-// The framebuffer holds palette indices; ui_init() loads the colours.
-enum {
-    C_BG,
-    C_FG,
-    C_DIM,
-    C_ACCENT,
-    C_SEL_BG,
-    C_SEL_FG,
-    C_ERR,
-    C_OK,
-    C_WARN,
-    C_FIELD,   // text field background
-    C_SIG_OFF, // unlit signal bars
-};
-
+// ---- layout -----------------------------------------------------------------------------------
+// The colours are palette roles (look.h); the theme fills them in.
 #define MARGIN    8
-#define TITLE_Y   6
-#define PATH_Y    24
+#define BAR_H     16 // status bar; a rule below it
+#define PATH_Y    22
 #define LIST_Y    46
 #define ROW_H     15
 #define FOOTER_Y  (LCD_H - 34)
+#define KEYS_Y    (LCD_H - 18) // key bar; a rule above it
 #define LIST_ROWS ((FOOTER_Y - 4 - LIST_Y) / ROW_H)
 #define COLS      ((LCD_W - 2 * MARGIN) / 7)
 
@@ -85,6 +73,9 @@ static char s_clip[PATH_MAX_LEN + 64]; // file or folder marked with Copy or Cut
 static bool s_clip_cut;                // Cut: Paste moves it instead of copying
 static char s_note[80];                // result of the last file operation, shown in the footer
 static lcd_color_t s_note_color;
+static char s_toast[48];               // a message over the screen for a moment, "" = none
+static uint64_t s_toast_until;
+static int s_boot_line = -1;           // checklist lines on the boot screen, -1 = not showing it
 
 // ---- helpers ----------------------------------------------------------------------------------
 static bool at_root(void)
@@ -244,9 +235,9 @@ static void change_dir(const char *name)
     save_setting("last_dir", sd_path(s_cwd));
 }
 
-// ---- web server icon (top bar, shown while the server is on) ----------------------------------
+// ---- web server icon (status bar Wi-Fi bars, lit while the server is on) -----------------------
 #if PICOMULTILOADER_WIFI
-static lcd_color_t s_icon_shown; // colour of the icon last drawn, 0 (C_BG) = none
+static lcd_color_t s_icon_shown; // colour of the bars last drawn, 0 (C_BG) = unlit
 
 static bool web_running(void)
 {
@@ -274,22 +265,6 @@ static lcd_color_t web_icon_color(void)
     }
 }
 
-// A Wi-Fi fan, WEB_ICON_W x 11 pixels, top-left at (x, y).
-#define WEB_ICON_W 15
-static void draw_web_icon(int x, int y, lcd_color_t color)
-{
-    int cx = x + WEB_ICON_W / 2, cy = y + 10;
-    for (int dy = 0; dy <= 10; dy++) {
-        for (int dx = -WEB_ICON_W / 2; dx <= WEB_ICON_W / 2; dx++) {
-            int r2 = dx * dx + dy * dy;
-            bool dot = r2 <= 2;
-            bool arc = 5 * abs(dx) <= 6 * dy && ((r2 >= 13 && r2 <= 28) || (r2 >= 49 && r2 <= 76));
-            if (dot || arc) {
-                lcd_fill_rect(cx + dx, cy - dy, 1, 1, color);
-            }
-        }
-    }
-}
 #else
 static bool web_running(void)
 {
@@ -298,31 +273,34 @@ static bool web_running(void)
 #endif
 
 // ---- drawing ----------------------------------------------------------------------------------
+// Status bar (title, Wi-Fi, battery) and the path line; clears the screen first.
 static void draw_header(void)
 {
+    look_anim_reset();
     lcd_fill_rect(0, 0, LCD_W, LCD_H, C_BG);
-    lcd_text(MARGIN, TITLE_Y, "PicoMultiLoader", C_FG, FONT_LARGE);
+    lcd_fill_rect(0, 0, LCD_W, BAR_H, C_PANEL);
+    lcd_hline(0, BAR_H, LCD_W, C_LINE);
+    lcd_text(6, 3, "PicoMultiLoader", C_FG, FONT_SMALL);
 
-    int right = LCD_W - MARGIN; // where the next item to the left of the battery ends
+    int x = LCD_W - 6; // right edge of the next item, filled right to left
     if (s_battery >= 0) {
-        // battery icon: 18x9 body + 2x5 nub, fill proportional to charge
-        int bx = LCD_W - MARGIN - 20, by = TITLE_Y + 2;
-        char pct[16];
+        // battery: 16x8 body + 2x4 nub, fill proportional to charge
+        char pct[12];
         snprintf(pct, sizeof(pct), "%d%%", s_battery);
-        lcd_text(bx - 4 - 7 * (int)strlen(pct), TITLE_Y, pct, C_FG, FONT_LARGE);
-        lcd_fill_rect(bx, by, 18, 9, C_FG);
-        lcd_fill_rect(bx + 1, by + 1, 16, 7, C_BG);
-        lcd_fill_rect(bx + 18, by + 2, 2, 5, C_FG);
-        lcd_fill_rect(bx + 2, by + 2, 14 * s_battery / 100, 5, s_charging ? C_OK : C_FG);
-        right = bx - 4 - 7 * (int)strlen(pct) - 8;
+        x -= 6 * (int)strlen(pct);
+        lcd_text(x, 3, pct, C_FG, FONT_SMALL);
+        x -= 21;
+        look_frame(x, 4, 16, 8, C_DIM);
+        lcd_fill_rect(x + 16, 6, 2, 4, C_DIM);
+        lcd_fill_rect(x + 2, 6, 12 * s_battery / 100, 4, s_charging ? C_OK : s_battery < 15 ? C_ERR : C_FG);
+        x -= 6;
     }
 #if PICOMULTILOADER_WIFI
     s_icon_shown = web_icon_color();
-    if (s_icon_shown != C_BG) {
-        draw_web_icon(right - WEB_ICON_W, TITLE_Y + 1, s_icon_shown);
+    x -= 11;
+    for (int i = 0; i < 4; i++) {
+        lcd_fill_rect(x + 3 * i, 9 - 2 * i, 2, 3 + 2 * i, s_icon_shown == C_BG ? C_LINE : s_icon_shown);
     }
-#else
-    (void)right;
 #endif
 
     char path[COLS + 1], shown[PATH_MAX_LEN + 8];
@@ -332,16 +310,79 @@ static void draw_header(void)
     }
     fit(path, shown, COLS);
     lcd_text(MARGIN, PATH_Y, path, C_FG, FONT_LARGE);
-    lcd_hline(MARGIN - 4, PATH_Y + 16, LCD_W - 2 * (MARGIN - 4), C_FG);
+    lcd_hline(MARGIN - 4, PATH_Y + 16, LCD_W - 2 * (MARGIN - 4), C_LINE);
 }
 
+static const char *const KEY_NAMES[] = {"Enter", "Esc", "Left", "Del", "Up/Down", "PgUp/PgDn"};
+
+// `keys` is "Enter Open  F1 Setup  Esc Back": items two spaces apart, each a key and what it does.
+// Function keys get a raised cap; an item that doesn't start with a key is shown as it is.
 static void draw_footer(const char *line1, lcd_color_t line1_color, const char *keys)
 {
-    lcd_hline(MARGIN - 4, FOOTER_Y, LCD_W - 2 * (MARGIN - 4), C_FG);
+    lcd_fill_rect(0, FOOTER_Y + 1, LCD_W, LCD_H - FOOTER_Y - 1, C_BG);
     if (line1) {
-        lcd_text(MARGIN, FOOTER_Y + 5, line1, line1_color, FONT_SMALL);
+        lcd_text(MARGIN, FOOTER_Y + 3, line1, line1_color, FONT_SMALL);
     }
-    lcd_text(MARGIN, FOOTER_Y + 19, keys, C_FG, FONT_SMALL);
+    lcd_hline(0, KEYS_Y, LCD_W, C_LINE);
+    lcd_fill_rect(0, KEYS_Y + 1, LCD_W, LCD_H - KEYS_Y - 1, C_PANEL);
+    int x = 6, y = KEYS_Y + 5;
+    while (*keys) {
+        char item[48];
+        const char *end = strstr(keys, "  ");
+        size_t n = end ? (size_t)(end - keys) : strlen(keys);
+        strlcpy(item, keys, n < sizeof(item) ? n + 1 : sizeof(item));
+        for (keys += n; *keys == ' '; keys++) {
+        }
+        char *label = strchr(item, ' ');
+        bool fkey = item[0] == 'F' && item[1] >= '1' && item[1] <= '9' && label == item + 2, key = fkey;
+        if (label) {
+            *label++ = '\0';
+            for (size_t k = 0; k < sizeof(KEY_NAMES) / sizeof(KEY_NAMES[0]); k++) {
+                key |= strcmp(item, KEY_NAMES[k]) == 0;
+            }
+        }
+        if (fkey) { // its number, then what it does on a cap
+            x = lcd_text(x, y, item + 1, C_DIM, FONT_SMALL) + 1;
+            int w = 6 * (int)strlen(label) + 4;
+            lcd_fill_rect(x, KEYS_Y + 3, w, 13, C_FIELD);
+            lcd_text(x + 2, y, label, C_FG, FONT_SMALL);
+            x += w + 6;
+        } else if (key) {
+            x = lcd_text(x, y, item, C_ACCENT, FONT_SMALL) + 4;
+            x = lcd_text(x, y, label, C_DIM, FONT_SMALL) + 8;
+        } else {
+            if (label) {
+                label[-1] = ' ';
+            }
+            x = lcd_text(x, y, item, C_FG, FONT_SMALL) + 8;
+        }
+    }
+}
+
+// A dialog over the dimmed file list, with a striped top edge. Content starts at LIST_Y + 4.
+static void draw_browse(void);
+static void draw_dialog(int h)
+{
+    draw_browse();
+    look_dither(BAR_H + 1, LCD_H - BAR_H - 1);
+    int y = LIST_Y - 8;
+    lcd_fill_rect(2, y, LCD_W - 4, h, C_PANEL);
+    look_frame(2, y, LCD_W - 4, h, C_LINE);
+    look_stripes(3, y + 1, LCD_W - 6, 3);
+}
+
+static void toast(const char *msg)
+{
+    strlcpy(s_toast, msg, sizeof(s_toast));
+    s_toast_until = time_us_64() + 1800000;
+}
+
+static void draw_toast(void)
+{
+    int w = 6 * (int)strlen(s_toast) + 20, x = (LCD_W - w) / 2, y = FOOTER_Y - 26;
+    lcd_fill_rect(x, y, w, 20, C_FIELD);
+    look_march(x, y, w, 20);
+    lcd_text(x + 10, y + 5, s_toast, C_BRIGHT, FONT_SMALL);
 }
 
 static void draw_browse(void)
@@ -416,9 +457,9 @@ static void draw_browse(void)
     fit(line, installed, (LCD_W - 2 * MARGIN) / 6);
     draw_footer(line, color,
 #if PICOMULTILOADER_WIFI
-                "Enter open  F1 Setup  F2 Files  F4 Web  F5 USB"
+                "Enter Open  F1 Setup  F2 Files  F4 Web  F5 USB"
 #else
-                "Enter open  F1 Setup  F2 Files  F5 USB drive"
+                "Enter Open  F1 Setup  F2 Files  F5 USB drive"
 #endif
     );
 }
@@ -433,7 +474,7 @@ static void draw_kv(int y, const char *key, const char *value)
 
 static void draw_confirm(void)
 {
-    draw_header();
+    draw_dialog(156);
     char buf[96];
     int y = LIST_Y + 4;
     lcd_text(MARGIN, y, "Flash and run this app?", C_ACCENT, FONT_LARGE);
@@ -454,7 +495,7 @@ static void draw_confirm(void)
     snprintf(buf, sizeof(buf), "flash, %u of %u KB", (unsigned)((s_info.addr_hi - s_info.addr_lo + 1023) / 1024),
              (unsigned)(uf2_flash_capacity() / 1024));
     draw_kv(y, "Type", buf);
-    draw_footer(NULL, C_FG, "Enter: flash & run    Esc: back");
+    draw_footer(NULL, C_FG, "Enter Flash & run  Esc Back");
 }
 
 static void draw_wrapped(int y, const char *text, lcd_color_t color)
@@ -484,14 +525,14 @@ static void draw_wrapped(int y, const char *text, lcd_color_t color)
 
 static void draw_error(void)
 {
-    draw_header();
+    draw_dialog(144);
     int y = LIST_Y + 4;
     lcd_text(MARGIN, y, "Can't run this file", C_ERR, FONT_LARGE);
     y += 2 * ROW_H;
     draw_kv(y, "File", s_sel_name);
     y += 2 * ROW_H;
     draw_wrapped(y, s_error, C_FG);
-    draw_footer(NULL, C_FG, "Esc / Enter: back");
+    draw_footer(NULL, C_FG, "Esc Back");
 }
 
 static usbdrive_state_t s_usb_shown = USBDRIVE_OFF;
@@ -533,8 +574,8 @@ static void draw_usb(void)
     lcd_text(MARGIN + 70, y, status, color, FONT_LARGE);
     y += 2 * ROW_H;
     draw_wrapped(y, help, C_DIM);
-    draw_footer(NULL, C_FG, st == USBDRIVE_CONNECTED ? "Esc: stop (eject on the PC first!)"
-                                                     : "Esc: back to the file list");
+    draw_footer(NULL, C_FG, st == USBDRIVE_CONNECTED ? "Esc Stop (eject on the PC first!)"
+                                                     : "Esc Back to the file list");
 }
 
 static void leave_usb(void)
@@ -626,9 +667,8 @@ static void draw_web(void)
             y += ROW_H + 2;
             if (st.progress >= 0) {
                 int w = LCD_W - 2 * MARGIN;
-                lcd_fill_rect(MARGIN, y, w, 10, C_FG);
-                lcd_fill_rect(MARGIN + 1, y + 1, w - 2, 8, C_BG);
-                lcd_fill_rect(MARGIN + 2, y + 2, (w - 4) * st.progress / 100, 6, C_ACCENT);
+                look_frame(MARGIN, y, w, 10, C_LINE);
+                look_stripes(MARGIN + 2, y + 2, (w - 4) * st.progress / 100, 6);
             }
         }
         if (st.ap_mode) {
@@ -643,7 +683,7 @@ static void draw_web(void)
         break;
     }
     draw_footer(st.state == WEB_FAILED ? "The server is still on until you stop it." : "Esc leaves it running in the background.",
-                C_DIM, st.state == WEB_FAILED ? "F4 / Esc: stop" : "Esc: back to the files   F4: stop server");
+                C_DIM, st.state == WEB_FAILED ? "Esc Stop the server" : "Esc Back to the files  F4 Stop server");
 }
 
 static uint32_t s_web_changes_seen;
@@ -681,9 +721,9 @@ static void enter_web(void)
 
 // ---- Setup (F1) -------------------------------------------------------------------------------
 #if PICOMULTILOADER_WIFI
-enum { WF_SSID, WF_PASS, WF_SHOW, WF_SCAN, WF_SAVE, WF_FORGET, WF_AUTO, WF_START, WF_HELP, WF_ROWS };
+enum { WF_SSID, WF_PASS, WF_SHOW, WF_SCAN, WF_SAVE, WF_FORGET, WF_AUTO, WF_START, WF_THEME, WF_HELP, WF_ROWS };
 #else
-enum { WF_START, WF_HELP, WF_ROWS };
+enum { WF_START, WF_THEME, WF_HELP, WF_ROWS };
 #endif
 #define WF_ROW_H   17
 #define WF_FIELD_X (MARGIN + 74)
@@ -882,7 +922,7 @@ static void draw_help(void)
     char where[32];
     int last = s_help_top + LIST_ROWS < s_help_count ? s_help_top + LIST_ROWS : s_help_count;
     snprintf(where, sizeof(where), "Help  line %d of %d", last, s_help_count);
-    draw_footer(where, C_DIM, "Up/Down scroll  PgUp/PgDn page  Esc back");
+    draw_footer(where, C_DIM, "Up/Down Scroll  PgUp/PgDn Page  Esc Back");
 }
 
 static bool help_key(int key)
@@ -1061,7 +1101,7 @@ static void draw_pick(void)
         int y = LIST_Y + (track - h) * s_pick_top / (n - LIST_ROWS);
         lcd_fill_rect(LCD_W - 3, y - 1, 2, h, C_DIM);
     }
-    draw_footer("Choose the folder to open at switch-on", C_DIM, "Enter open/choose  Left up  Esc cancel");
+    draw_footer("Choose the folder to open at switch-on", C_DIM, "Enter Open/choose  Left Up  Esc Cancel");
 }
 
 static void pick_up(void)
@@ -1167,6 +1207,15 @@ static void draw_start_option(int y)
     draw_option(y, start, s_wf_row == WF_START);
 }
 
+#define THEME_HINT "Enter: the next colour theme. Your own .pal files go in " THEME_DIR "."
+
+static void draw_theme_option(int y)
+{
+    char buf[40];
+    snprintf(buf, sizeof(buf), "Theme: %s", theme_name());
+    draw_option(y, buf, s_wf_row == WF_THEME);
+}
+
 #if PICOMULTILOADER_WIFI
 static void draw_field(int y, const char *label, const char *text, bool masked, bool sel)
 {
@@ -1211,6 +1260,8 @@ static void draw_wifi(void)
     y += WF_ROW_H;
     draw_start_option(y);
     y += WF_ROW_H;
+    draw_theme_option(y);
+    y += WF_ROW_H;
     draw_option(y, "Help: how to use the loader", s_wf_row == WF_HELP);
     y += WF_ROW_H + 4;
     lcd_text(MARGIN, y, s_wf_msg, s_wf_msg_color, FONT_LARGE);
@@ -1219,10 +1270,11 @@ static void draw_wifi(void)
                     : s_wf_row == WF_HELP ? "Keys, flashing, Wi-Fi, web and USB drive mode explained."
                     : s_wf_row == WF_START ? "The folder the file list opens in when you switch on."
                     : s_wf_row == WF_AUTO  ? "ON: the web file manager starts by itself at switch-on."
+                    : s_wf_row == WF_THEME ? THEME_HINT
                                           : "F4 joins this network and starts the web file manager.",
                  C_DIM);
-    draw_footer(NULL, C_FG, s_wf_dirty ? "Up/Down move  Enter select  Esc discard"
-                                       : "Up/Down move  Enter select  Esc back");
+    draw_footer(NULL, C_FG, s_wf_dirty ? "Up/Down Move  Enter Select  Esc Discard"
+                                       : "Up/Down Move  Enter Select  Esc Back");
 }
 
 static void draw_signal(int x, int y, int rssi, lcd_color_t color)
@@ -1258,7 +1310,7 @@ static void draw_wifi_scan(void)
         }
         draw_signal(LCD_W - MARGIN - 16, y, s_aps[i].rssi, sel ? C_SEL_FG : C_OK);
     }
-    draw_footer(NULL, C_FG, s_ap_count ? "Up/Down select  Enter choose  Esc back" : "Esc: back");
+    draw_footer(NULL, C_FG, s_ap_count ? "Up/Down Select  Enter Choose  Esc Back" : "Esc Back");
 }
 
 static void wifi_scan(void)
@@ -1305,14 +1357,17 @@ static void draw_wifi(void)
     y += WF_ROW_H + 3;
     draw_start_option(y);
     y += WF_ROW_H;
+    draw_theme_option(y);
+    y += WF_ROW_H;
     draw_option(y, "Help: how to use the loader", s_wf_row == WF_HELP);
     y += WF_ROW_H + 4;
     lcd_text(MARGIN, y, s_wf_msg, s_wf_msg_color, FONT_LARGE);
     y += ROW_H + 2;
-    draw_wrapped(y, s_wf_row == WF_HELP ? "Keys, flashing and USB drive mode explained."
-                                        : "The folder the file list opens in when you switch on.",
+    draw_wrapped(y, s_wf_row == WF_HELP    ? "Keys, flashing and USB drive mode explained."
+                    : s_wf_row == WF_THEME ? THEME_HINT
+                                           : "The folder the file list opens in when you switch on.",
                  C_DIM);
-    draw_footer(NULL, C_FG, "Up/Down move  Enter select  Esc back");
+    draw_footer(NULL, C_FG, "Up/Down Move  Enter Select  Esc Back");
 }
 #endif
 
@@ -1398,6 +1453,13 @@ static bool wifi_key(int key)
     case WF_START:
         enter_pick();
         break;
+    case WF_THEME: {
+        char next[24];
+        theme_next(next, sizeof(next));
+        theme_load(next);
+        save_setting("theme", theme_name());
+        break;
+    }
     case WF_HELP:
         enter_help();
         break;
@@ -1544,7 +1606,7 @@ static void ask_delete(void)
 
 static void draw_delete(void)
 {
-    draw_header();
+    draw_dialog(112);
     int y = LIST_Y + 4;
     lcd_text(MARGIN, y, s_fa_is_dir ? "Delete this folder?" : "Delete this file?", C_ERR, FONT_LARGE);
     y += 2 * ROW_H;
@@ -1555,15 +1617,14 @@ static void draw_delete(void)
     } else {
         draw_wrapped(y, "This can't be undone.", C_FG);
     }
-    draw_footer(NULL, C_FG, "Enter: delete    Esc: cancel");
+    draw_footer(NULL, C_FG, "Enter Delete  Esc Cancel");
 }
 
 static void do_delete(void)
 {
     char err[96], name[64];
     strlcpy(name, strrchr(s_fa_path, '/') + 1, sizeof(name));
-    lcd_fill_rect(0, FOOTER_Y + 1, LCD_W, LCD_H - FOOTER_Y - 1, C_BG);
-    lcd_text(MARGIN, FOOTER_Y + 19, "Deleting...", C_FG, FONT_SMALL);
+    draw_footer(NULL, C_FG, "Deleting...");
     lcd_flush();
     if (fileops_delete(s_fa_path, err, sizeof(err))) {
         note(C_OK, "Deleted %s", name);
@@ -1742,7 +1803,7 @@ static void draw_files(void)
         snprintf(buf, sizeof(buf), "%s: %s", s_clip_cut ? "Cut" : "Copied", where);
         draw_wrapped(y, buf, C_DIM);
     }
-    draw_footer(NULL, C_FG, "Up/Down move  Enter select  Esc back");
+    draw_footer(NULL, C_FG, "Up/Down Move  Enter Select  Esc Back");
 }
 
 static bool files_key(int key)
@@ -1828,6 +1889,13 @@ static void web_tick(void)
         rescan_dir();
         ui_redraw();
     } else if (web_icon_color() != s_icon_shown) {
+        web_status_t st;
+        webserver_status(&st);
+        if (web_icon_color() == C_OK) {
+            char msg[sizeof(s_toast)];
+            snprintf(msg, sizeof(msg), "Web server at http://%s/", st.ip);
+            toast(msg);
+        }
         ui_redraw();
     }
 }
@@ -1835,6 +1903,11 @@ static void web_tick(void)
 
 void ui_tick(void)
 {
+    if (s_toast[0] && time_us_64() >= s_toast_until) {
+        s_toast[0] = '\0';
+        ui_redraw();
+    }
+    look_tick();
 #if PICOMULTILOADER_WIFI
     web_tick();
 #endif
@@ -1892,14 +1965,17 @@ void ui_redraw(void)
         break;
 #endif
     }
+    if (s_toast[0]) {
+        draw_toast();
+    }
     lcd_flush();
 }
 
 // ---- flashing ---------------------------------------------------------------------------------
-#define BAR_X MARGIN
-#define BAR_Y 170
-#define BAR_W (LCD_W - 2 * MARGIN)
-#define BAR_H 16
+#define PROG_X MARGIN
+#define PROG_Y 170
+#define PROG_W (LCD_W - 2 * MARGIN)
+#define PROG_H 16
 
 static void draw_progress(size_t done, size_t total)
 {
@@ -1910,14 +1986,14 @@ static void draw_progress(size_t done, size_t total)
     }
     last = done == total ? -1 : pct;
 
-    lcd_fill_rect(BAR_X, BAR_Y, BAR_W, BAR_H, C_FG);
-    lcd_fill_rect(BAR_X + 1, BAR_Y + 1, BAR_W - 2, BAR_H - 2, C_BG);
-    lcd_fill_rect(BAR_X + 2, BAR_Y + 2, (BAR_W - 4) * pct / 100, BAR_H - 4, C_ACCENT);
+    look_frame(PROG_X, PROG_Y, PROG_W, PROG_H, C_LINE);
+    look_stripes(PROG_X + 2, PROG_Y + 2, (PROG_W - 4) * pct / 100, PROG_H - 4);
+    look_step(); // the stripes move as it goes
     char txt[16];
     snprintf(txt, sizeof(txt), "%d%%", pct);
-    lcd_fill_rect(0, BAR_Y + BAR_H + 6, LCD_W, 14, C_BG);
-    lcd_text((LCD_W - 7 * (int)strlen(txt)) / 2, BAR_Y + BAR_H + 6, txt, C_FG, FONT_LARGE);
-    lcd_flush_rows(BAR_Y, BAR_H + 6 + 14);
+    lcd_fill_rect(0, PROG_Y + PROG_H + 6, LCD_W, 14, C_BG);
+    lcd_text((LCD_W - 7 * (int)strlen(txt)) / 2, PROG_Y + PROG_H + 6, txt, C_FG, FONT_LARGE);
+    lcd_flush_rows(PROG_Y, PROG_H + 6 + 14);
 }
 
 static void flash_and_run(void)
@@ -1947,7 +2023,7 @@ static void flash_and_run(void)
     }
     save_setting("last_file", s_sel_name);
 
-    lcd_text(MARGIN, BAR_Y + BAR_H + 30, "Done. Starting app...", C_OK, FONT_LARGE);
+    lcd_text(MARGIN, PROG_Y + PROG_H + 30, "Done. Starting app...", C_OK, FONT_LARGE);
     lcd_flush();
     sleep_ms(400);
     uf2_boot_installed();
@@ -2132,8 +2208,7 @@ void ui_key(int key)
         web_status_t st;
         webserver_status(&st);
         if (key == KEY_F4 || (key == KEY_ESC && st.state == WEB_FAILED)) {
-            lcd_fill_rect(0, FOOTER_Y + 1, LCD_W, LCD_H - FOOTER_Y - 1, C_BG);
-            lcd_text(MARGIN, FOOTER_Y + 19, "Stopping...", C_FG, FONT_SMALL);
+            draw_footer(NULL, C_FG, "Stopping...");
             lcd_flush();
             stop_web();
             break;
@@ -2169,21 +2244,71 @@ void ui_set_battery(int percent, bool charging)
     }
 }
 
+// ---- boot screen ------------------------------------------------------------------------------
+#define BOOT_LINES (4 + PICOMULTILOADER_WIFI)
+#define BOOT_Y     144
+#define BOOT_BAR_Y (BOOT_Y + 15 * 5 + 5)
+
+// "PML", 5x7 cells per letter, each row's bits from the left
+static const uint8_t LOGO[3][7] = {
+    {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10},
+    {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11},
+    {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F},
+};
+
+static void load_theme(void)
+{
+    char name[24];
+    theme_load(load_setting("theme", name, sizeof(name)) ? name : NULL);
+}
+
+void ui_boot(bool sd_ok)
+{
+    s_sd_ok = sd_ok;
+    load_theme();
+    s_boot_line = 0;
+    look_anim_reset();
+    lcd_fill_rect(0, 0, LCD_W, LCD_H, C_BG);
+    // the logo's cells are striped in the cycled colours, so it shimmers
+    for (int l = 0; l < 3; l++) {
+        for (int r = 0; r < 7; r++) {
+            for (int c = 0; c < 5; c++) {
+                if (LOGO[l][r] & (0x10 >> c)) {
+                    look_stripes(100 + 42 * l + 7 * c, 44 + 7 * r, 6, 6);
+                }
+            }
+        }
+    }
+    lcd_text((LCD_W - 15 * 7) / 2, 104, "PicoMultiLoader", C_BRIGHT, FONT_LARGE);
+    char sub[32];
+    snprintf(sub, sizeof(sub), "PicoCalc  %s", uf2_chip_name());
+    lcd_text((LCD_W - 6 * (int)strlen(sub)) / 2, 122, sub, C_DIM, FONT_SMALL);
+    ui_boot_check("SD card", sd_ok ? "OK" : "missing", sd_ok);
+}
+
+void ui_boot_check(const char *what, const char *result, bool ok)
+{
+    if (s_boot_line < 0 || s_boot_line >= BOOT_LINES) {
+        return;
+    }
+    int y = BOOT_Y + 15 * s_boot_line++;
+    for (int x = lcd_text(48, y, what, C_FG, FONT_SMALL) + 4; x < 196; x += 4) { // dotted leader
+        lcd_fill_rect(x, y + 7, 1, 1, C_LINE);
+    }
+    char r[20];
+    fit(r, result, sizeof(r) - 1);
+    lcd_text(200, y, r, ok ? C_OK : C_WARN, FONT_SMALL);
+    look_frame(48, BOOT_BAR_Y, 224, 8, C_LINE);
+    look_stripes(50, BOOT_BAR_Y + 2, 220 * s_boot_line / BOOT_LINES, 4);
+    lcd_flush();
+}
+
 void ui_init(bool sd_ok)
 {
-    lcd_set_palette(C_BG, RGB565(18, 20, 28));
-    lcd_set_palette(C_FG, RGB565(235, 235, 235));
-    lcd_set_palette(C_DIM, RGB565(140, 145, 160));
-    lcd_set_palette(C_ACCENT, RGB565(120, 200, 255));
-    lcd_set_palette(C_SEL_BG, RGB565(215, 215, 215));
-    lcd_set_palette(C_SEL_FG, RGB565(10, 10, 10));
-    lcd_set_palette(C_ERR, RGB565(255, 100, 100));
-    lcd_set_palette(C_OK, RGB565(110, 220, 110));
-    lcd_set_palette(C_WARN, RGB565(255, 190, 80));
-    lcd_set_palette(C_FIELD, RGB565(40, 44, 58));
-    lcd_set_palette(C_SIG_OFF, RGB565(70, 74, 90));
-
     s_sd_ok = sd_ok;
+    if (s_boot_line < 0) { // no boot screen
+        load_theme();
+    }
     s_screen = SCREEN_BROWSE;
     strlcpy(s_cwd, SDCARD_MOUNT_POINT, sizeof(s_cwd));
 
@@ -2216,12 +2341,26 @@ void ui_init(bool sd_ok)
     // Wi-Fi autostart: bring the web server up in the background (the top icon shows its state)
     char web_auto[4];
     s_web_auto = load_setting("web_auto", web_auto, sizeof(web_auto)) && web_auto[0] == '1';
+    bool web_ok = true;
     if (s_web_auto && sd_ok) {
         s_web_changes_seen = webserver_changes();
-        if (!webserver_start()) {
+        if (!(web_ok = webserver_start())) {
             printf("ui: Wi-Fi autostart failed\n");
         }
     }
+    ui_boot_check("Wi-Fi", !(s_web_auto && sd_ok) ? "off" : web_ok ? "starting" : "failed", web_ok);
 #endif
+    char where[PATH_MAX_LEN + 4];
+    sd_name(where, sizeof(where), s_cwd);
+    ui_boot_check("Start folder", where, sd_ok);
+    if (s_boot_line >= 0) { // let the logo shimmer for a moment
+        for (uint64_t until = time_us_64() + 500000; time_us_64() < until;) {
+            look_tick();
+#if PICOMULTILOADER_WIFI
+            webserver_poll();
+#endif
+        }
+        s_boot_line = -1;
+    }
     ui_redraw();
 }

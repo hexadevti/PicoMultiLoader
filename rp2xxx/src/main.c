@@ -123,15 +123,21 @@ int main(void)
     if (!lcd_init()) {
         printf("loader: LCD init failed\n");
     }
-    if (kbd_init()) {
+    ui_boot(sd_ok);
+    bool kbd_ok = kbd_init();
+    if (kbd_ok) {
         kbd_set_lcd_backlight(BACKLIGHT);
     } else {
         printf("loader: no keyboard - is the PicoCalc switched on? Serial input still works.\n");
     }
-    ui_init(sd_ok);
-    update_battery();
+    ui_boot_check("Keyboard", kbd_ok ? "OK" : "missing", kbd_ok);
     bool charging = false;
     int battery = kbd_battery(&charging);
+    char pct[20];
+    snprintf(pct, sizeof(pct), battery < 0 ? "unknown" : charging ? "%d%% charging" : "%d%%", battery);
+    ui_boot_check("Battery", pct, battery >= 0);
+    ui_init(sd_ok);
+    update_battery();
     printf("loader: ready: SD %s, keyboard %s, battery %d%%%s\n", sd_ok ? "mounted" : "missing",
            kbd_present() ? "found" : "missing", battery, charging ? " (charging)" : "");
 

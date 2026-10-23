@@ -8,7 +8,7 @@
 #include "hardware/spi.h"
 #include "uifont.h"
 
-#define CHUNK_ROWS 4
+#define CHUNK_ROWS 1 // each chunk buffer is RAM the RP2350 heap would otherwise get
 
 static uint8_t s_fb[LCD_W * LCD_H / 2]; // two pixels per byte: low nibble = even x
 static uint16_t s_palette[16];
@@ -193,6 +193,19 @@ void lcd_fill_rect(int x, int y, int w, int h, lcd_color_t color)
 void lcd_hline(int x, int y, int w, lcd_color_t color)
 {
     lcd_fill_rect(x, y, w, 1, color);
+}
+
+void lcd_checker(int y, int h, lcd_color_t color)
+{
+    uint8_t c = color & 15;
+    for (int j = y < 0 ? 0 : y; j < y + h && j < LCD_H; j++) {
+        // even rows: even pixels (low nibbles); odd rows: odd pixels (high nibbles)
+        uint8_t keep = (j & 1) ? 0x0F : 0xF0, set = (j & 1) ? (uint8_t)(c << 4) : c;
+        uint8_t *p = &s_fb[j * (LCD_W / 2)];
+        for (int i = 0; i < LCD_W / 2; i++) {
+            p[i] = (uint8_t)((p[i] & keep) | set);
+        }
+    }
 }
 
 int lcd_font_width(lcd_font_t font)

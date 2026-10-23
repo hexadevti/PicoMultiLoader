@@ -3,7 +3,13 @@
 
 #include <stdbool.h>
 
-/** Set up the palette, load the starting directory and draw the first screen. */
+/** Load the colour theme and show the boot screen, with the SD card as its first checklist line. */
+void ui_boot(bool sd_ok);
+
+/** Add a line to the boot screen's checklist: what was checked, what was found, and if that's good. */
+void ui_boot_check(const char *what, const char *result, bool ok);
+
+/** Load the theme (if ui_boot() didn't), the starting directory, and draw the first screen. */
 void ui_init(bool sd_ok);
 
 /** Handle one key (keyboard.h codes). May flash an app and reboot. */
