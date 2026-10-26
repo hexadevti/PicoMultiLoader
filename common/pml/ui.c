@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include "pico/stdlib.h"
+#include "plat.h"
 #include "apps.h"
 #include "clock.h"
 #include "config.h"
@@ -67,12 +67,6 @@ typedef enum {
     SCREEN_IMAGE,     // the BMP viewer
 } screen_t;
 
-// RP2350: the Wi-Fi firmware and the web page live in the last 256 KB of flash (uf2_image.h)
-#if PICOMULTILOADER_WIFI && !PICO_RP2040
-#define PML_RES 1
-#else
-#define PML_RES 0
-#endif
 
 static screen_t s_screen;
 static screen_t s_base; // SCREEN_HOME or SCREEN_BROWSE: where Esc goes back to
@@ -95,7 +89,7 @@ static char s_sel_path[PATH_MAX_LEN + 256];
 static char s_sel_name[64];
 static uf2_info_t s_info;
 static bool s_confirm_run; // the confirm screen's file is the installed app: Enter just starts it
-static char s_error[128];
+static char s_error[192];
 static const char *s_path_override; // shown in the header instead of s_cwd
 
 static char s_clip[PATH_MAX_LEN + 64]; // the folder the copied or cut items are in
@@ -178,7 +172,7 @@ static int cmp_entries(const void *a, const void *b)
 static bool has_uf2_ext(const char *name)
 {
     size_t len = strlen(name);
-    return len > 4 && strcasecmp(name + len - 4, ".uf2") == 0;
+    return len > 4 && strcasecmp(name + len - 4, PML_APP_EXT) == 0;
 }
 
 // Hidden files, macOS "._" files and "System Volume Information" aren't listed.
@@ -235,7 +229,7 @@ static void scan_dir(void)
     if (!s_sd_ok) {
         return;
     }
-    DIR dir;
+    FF_DIR dir;
     if (f_opendir(&dir, sd_path(s_cwd)) != FR_OK) {
         printf("ui: cannot open %s\n", sd_path(s_cwd));
         return;
@@ -573,7 +567,7 @@ static void pv_quick(const entry_t *e)
     }
     view_kind_t kind = view_kind(e->name);
     bool app = has_uf2_ext(e->name);
-    pv_add(app                    ? "App (.uf2)"
+    pv_add(app                    ? "App (" PML_APP_EXT ")"
            : kind == VIEW_IMAGE    ? "Image"
            : kind == VIEW_MARKDOWN ? "Markdown"
            : kind == VIEW_NONE     ? "File"
@@ -604,7 +598,7 @@ static bool pv_stop(void)
 
 static void pv_folder(const char *path)
 {
-    DIR dir;
+    FF_DIR dir;
     FILINFO fi;
     int items = 0;
     char line[24];
@@ -643,12 +637,12 @@ static void pv_app(const char *path, const entry_t *e)
     char err[96], buf[48], name[40], version[24];
     bool ok = uf2_inspect_stoppable(path, &info, pv_stop, err, sizeof(err));
     if (!ok && !err[0]) {
-        pv_retry("App (.uf2)");
+        pv_retry("App (" PML_APP_EXT ")");
         return;
     }
     s_pv_n = 0;
     if (!ok) {
-        pv_add("App (.uf2)", C_FG);
+        pv_add("App (" PML_APP_EXT ")", C_FG);
         pv_add("", C_DIM);
         pv_add(err, C_ERR);
         return;
@@ -1014,7 +1008,7 @@ static void draw_usb(void)
     case USBDRIVE_CONNECTED:
         status = "Connected to the PC";
         color = C_OK;
-        help = "The SD card is now a drive on your PC. Copy your .uf2 files, then eject "
+        help = "The SD card is now a drive on your PC. Copy your " PML_APP_EXT " files, then eject "
                "the drive on the PC to come back here.";
         break;
     case USBDRIVE_SUSPENDED:
@@ -1025,7 +1019,7 @@ static void draw_usb(void)
     default:
         status = "Waiting for the PC...";
         color = C_FG;
-        help = "Connect the Pico's micro-USB port to the PC. The PicoCalc's USB-C port is serial only.";
+        help = PML_USB_WAIT;
         break;
     }
     lcd_text(MARGIN, y, "Status", C_DIM, FONT_LARGE);
@@ -1305,14 +1299,16 @@ static void wf_message(const char *msg, lcd_color_t color)
 // "#" starts a heading, "" is a blank line; everything else is wrapped to the screen width.
 static const char *const HELP_TEXT[] = {
     "#What it does",
-#if PICO_RP2040
-    "Copy Raspberry Pi Pico (RP2040) programs (.uf2 files) to the SD card, pick one here, and the loader flashes it and boots it.",
+#if PML_RP2040
+    "Copy Raspberry Pi Pico (RP2040) programs (" PML_APP_EXT " files) to the SD card, pick one here, and the loader flashes it and boots it.",
+#elif PML_P4
+    "Copy ESP32-P4 firmware (" PML_APP_EXT " files) to the SD card, pick one here, and the loader flashes it and boots it.",
 #else
-    "Copy Raspberry Pi Pico 2 (RP2350) programs (.uf2 files) to the SD card, pick one here, and the loader flashes it and boots it.",
+    "Copy Raspberry Pi Pico 2 (RP2350) programs (" PML_APP_EXT " files) to the SD card, pick one here, and the loader flashes it and boots it.",
 #endif
     "",
     "#Home",
-    "The apps on the card: each folder in the root with an app.ini or a .uf2 in it, and each .uf2 in the root.",
+    "The apps on the card: each folder in the root with an app.ini or a " PML_APP_EXT " in it, and each " PML_APP_EXT " in the root.",
     "Arrows, PgUp/PgDn, Home/End: move. Tab: next tab (Favourites, Recent, All). It opens on the app run last.",
     "Type to search all the apps; Backspace deletes, Esc clears.",
     "Enter: run the app. The installed one (green dot) starts at once; any other is flashed first.",
@@ -1326,15 +1322,15 @@ static const char *const HELP_TEXT[] = {
     "",
     "#App folders",
     "An app.ini in the folder describes the app, one key = value per line: name, category (Emulators, Tools, Dev "
-    "or Media), icon (a 32x32 16-colour BMP, icon.bmp if not set), binary (the .uf2 to run), version, author, desc "
-    "and board (rp2040, rp2350 or any). A folder with several .uf2 files and no binary opens on Home: its apps and "
+    "or Media), icon (a 32x32 16-colour BMP, icon.bmp if not set), binary (the " PML_APP_EXT " to run), version, author, desc "
+    "and board (rp2040, rp2350, esp32p4 or any). A folder with several " PML_APP_EXT " files and no binary opens on Home: its apps and "
     "folders, and a Back tile (or Esc, Backspace) for the folder above; Tab goes straight back to the tabs.",
     "",
     "#Files (F3)",
-    "Up/Down, PgUp/PgDn, Home/End: move. Enter or Right: open a folder, or show a .uf2 file's details; Enter there "
+    "Up/Down, PgUp/PgDn, Home/End: move. Enter or Right: open a folder, or show a " PML_APP_EXT " file's details; Enter there "
     "flashes and runs it (or just runs it if it is installed; R reflashes).",
     "Backspace or Left: parent folder; at the top, back to Home. Esc or F3: Home.",
-    "Folders, .uf2 files and files the viewers open are listed; Tab > Show all files lists every file. The last "
+    "Folders, " PML_APP_EXT " files and files the viewers open are listed; Tab > Show all files lists every file. The last "
     "folder and file are remembered.",
     "",
     "#Text reader and image viewer",
@@ -1351,14 +1347,17 @@ static const char *const HELP_TEXT[] = {
     "Tab opens a menu: Copy, Cut (to move), Paste, Delete and Show all files.",
     "Shortcuts in the file list: Ctrl+C copy, Ctrl+X cut, Ctrl+V paste into the folder shown, Del delete. Esc forgets "
     "what was copied.",
-    "Copy or Cut, go to another folder, then Paste. Pasting a copy where the name is taken adds a number, e.g. app (2).uf2.",
+    "Copy or Cut, go to another folder, then Paste. Pasting a copy where the name is taken adds a number, e.g. app (2)" PML_APP_EXT ".",
     "Deleting a folder deletes everything in it.",
-#if !PICO_RP2040
+#if PML_MENU_FILES
     "pml2350.uf2 and pml2350-classic.uf2 in the root (the menus) can't be deleted or moved from here.",
 #endif
     "",
     "#Installing the loader",
-#if PICO_RP2040
+#if PML_P4
+    "Flash PicoMultiLoader-esp32p4.bin at 0x0 over the USB-C port (esptool or the web flasher): the loader sits in the "
+    "factory partition and the apps you pick go to the app partition, so the loader is never overwritten.",
+#elif PML_RP2040
     "PicoMultiLoader is the Pico's own firmware, no other bootloader needed: hold BOOTSEL, plug in USB and copy "
     "PicoMultiLoader-rp2040.uf2 to the drive that appears. PicoMultiLoader-rp2040-classic.uf2 is the classic menu "
     "(the file list of earlier versions) instead.",
@@ -1370,16 +1369,27 @@ static const char *const HELP_TEXT[] = {
 #endif
     "",
     "#Back to the loader",
+#if PML_P4
+    "Hold Up, F1 or F5 while pressing reset or switching on: this menu opens instead of the app. The board's BOOT "
+    "button also works: press it within 0.5 s after releasing RESET.",
+    "It also opens when no app is installed. Your own apps can call picomultiloader_reboot_to_menu() from loader_api.h.",
+#else
     "Hold Up, F1 or F5 while switching on: this menu opens instead of the app. "
     "It also opens when no app is installed, and when an app asks for it (the uf2loader way).",
+#endif
     "",
     "#Which files work",
-#if PICO_RP2040
+#if PML_P4
+    "App images for the ESP32-P4 (ESP-IDF, Arduino, MicroPython) built for this chip revision. Merged *.factory.bin "
+    "images work too: only the app part is used, and the bootloader is never overwritten.",
+#else
+#if PML_RP2040
     "UF2 files for the RP2040 built to run from flash (the normal Pico SDK build), up to 1788 KB.",
 #else
     "UF2 files for the RP2350 built to run from flash (the normal Pico SDK build), up to 4088 KB. RP2040 files are refused.",
 #endif
     "RAM-only (no_flash) apps are not supported. The installed app keeps working after a restart.",
+#endif
     "Each file is checked before flashing; an unsuitable one shows why.",
     "",
     "#Control center (F1)",
@@ -1390,9 +1400,12 @@ static const char *const HELP_TEXT[] = {
     "Idle screen: after that long without a key, a dim clock on black with the backlight turned down, to save the battery; "
     "10 minutes later the backlight goes off. Any key wakes it up, and does nothing else. Until the time is known it "
     "shows how long the loader has been on.",
-#if !PICO_RP2040
+#if PML_MENU_FILES
     "Menu style: Enter switches to the classic menu (the file list of earlier versions, pml2350-classic.uf2) and "
     "restarts. Its Setup switches back.",
+#elif PML_MENU_SWITCH
+    "Menu style: Enter switches to the classic menu (the file list of earlier versions) and restarts. Its Setup "
+    "switches back.",
 #endif
     "Setup: the settings below. The battery charge is at the bottom. Esc or F1 closes it.",
     "",
@@ -1409,7 +1422,11 @@ static const char *const HELP_TEXT[] = {
     "",
     "#Messages from apps",
     "An app can leave a message for the loader: the first line of " PML_DIR "/exit.txt is shown when the menu opens, then the "
+#if PML_P4
+    "file is deleted. Or call picomultiloader_exit_code() from loader_api.h before restarting.",
+#else
     "file is deleted. Or set watchdog scratch[2] to 0x504D4C58 and scratch[3] to an exit code before rebooting.",
+#endif
     "",
     "#Setup (F1 > Setup)",
 #if PICOMULTILOADER_WIFI
@@ -1430,14 +1447,14 @@ static const char *const HELP_TEXT[] = {
     "#Web file manager (F4)",
     "Joins your saved network and shows the address to open in a browser. http://" WEB_HOSTNAME ".local/ often works too.",
     "With no network saved, or if joining fails within 20 s, it makes its own network PicoMultiLoader-XXXX. Its password and the address http://192.168.4.1/ are shown on screen.",
-    "In the browser: upload (drag and drop works), download, rename, delete, new folder, and Flash a .uf2 straight away.",
+    "In the browser: upload (drag and drop works), download, rename, delete, new folder, and Flash a " PML_APP_EXT " straight away.",
     "There is no login: use it on trusted networks only.",
     "Esc goes back and keeps the server running. A Wi-Fi icon at the top shows it is on: green ready, blue starting, amber reconnecting, red failed. Home and Files refresh when the browser changes files.",
     "F4 shows the server screen again; F4 there stops it. Flashing a file or USB drive mode stops it too.",
     "",
 #endif
     "#Terminal (F5)",
-    "Type commands, Enter runs them: help lists them all. ls, cd, cat and pwd work on the SD card; run starts an app or a .uf2; "
+    "Type commands, Enter runs them: help lists them all. ls, cd, cat and pwd work on the SD card; run starts an app or a " PML_APP_EXT "; "
     "apps, recent, fav, theme, date, tz, battery, free, df, about and more.",
 #if PICOMULTILOADER_WIFI
     "wifi on / wifi off start and stop the web server; ip shows its address.",
@@ -1447,14 +1464,14 @@ static const char *const HELP_TEXT[] = {
     "Everything it prints also goes to the serial console, and you can type the commands there too.",
     "",
     "#USB drive mode (F1 > USB drive)",
-    "Shows the SD card on a PC as a USB drive. Needs a cable on the Pico's micro-USB port; the PicoCalc's USB-C port is serial only.",
+    "Shows the SD card on a PC as a USB drive. " PML_USB_HELP,
     "Eject the drive on the PC when done: the loader takes the card back by itself. Esc also leaves, but only press it after ejecting.",
 #if PICOMULTILOADER_WIFI
     "Starting USB drive mode stops the web server.",
 #endif
     "",
     "#Serial console",
-    "115200 baud on the PicoCalc's USB-C port. Arrows, Enter, Tab, Backspace, Del, Esc, F1-F5 and typing work like the PicoCalc keyboard. Ctrl+P dumps the screen.",
+    "115200 baud on the " PML_SERIAL_PORT ". Arrows, Enter, Tab, Backspace, Del, Esc, F1-F5 and typing work like the PicoCalc keyboard. Ctrl+P dumps the screen.",
     "",
     "#This help",
     "Up/Down: scroll. PgUp/PgDn: page. Home/End: top/bottom. Esc: back.",
@@ -1630,7 +1647,7 @@ static void pick_scan(void)
     }
     s_pick_count = 0;
     s_pick_sel = s_pick_top = 0;
-    DIR dir;
+    FF_DIR dir;
     if (f_opendir(&dir, sd_path(s_pick)) != FR_OK) {
         return;
     }
@@ -2215,11 +2232,11 @@ static entry_t *target(int *it)
 // The loader itself on the RP2350: the boot stub loads this menu from it.
 static bool protected_path(const char *path)
 {
-#if PICO_RP2040
+#if PML_MENU_FILES
+    return strcasecmp(path, UF2_LOADER_GUI) == 0 || strcasecmp(path, UF2_LOADER_CLASSIC) == 0;
+#else
     (void)path;
     return false;
-#else
-    return strcasecmp(path, UF2_LOADER_GUI) == 0 || strcasecmp(path, UF2_LOADER_CLASSIC) == 0;
 #endif
 }
 
@@ -2927,7 +2944,7 @@ static void draw_home(void)
                  C_DIM, FONT_LARGE);
         draw_wrapped(LIST_Y + 4 * ROW_H,
                      s_tab == TAB_FAVS  ? "F2 adds the selected app, or a file or folder in Files (F3)."
-                     : s_tab == TAB_ALL ? "Put .uf2 files, or folders with one in, in the root of the card."
+                     : s_tab == TAB_ALL ? "Put " PML_APP_EXT " files, or folders with one in, in the root of the card."
                                         : "",
                      C_DIM);
     }
@@ -3106,8 +3123,8 @@ static void web_key(void) // F4
 
 // ---- control center (F1) ----------------------------------------------------------------------
 // A panel over the dimmed Home or file list: one row per setting, the battery at the bottom.
-// RP2350: the classic menu instead of this one (the boot stub loads the one the "ui" setting picks)
-#define MENU_SWITCH (!PICO_RP2040)
+// The classic menu instead of this one (RP2350: the boot stub loads the one the "ui" setting picks)
+#define MENU_SWITCH PML_MENU_SWITCH
 enum {
     CC_WIFI, CC_USB, CC_LIGHT, CC_IDLE, CC_THEME,
 #if MENU_SWITCH
@@ -3343,8 +3360,12 @@ static void ctl_wifi(void)
 // The classic menu instead of this one: saved, then a restart loads it
 static void switch_menu(void)
 {
-    if (!s_sd_ok || !fileops_exists(UF2_LOADER_CLASSIC)) {
+    if (!s_sd_ok) {
+        toast("Insert the SD card first");
+#if PML_MENU_FILES
+    } else if (!fileops_exists(UF2_LOADER_CLASSIC)) {
         toast("Copy pml2350-classic.uf2 to the card");
+#endif
     } else if (!config_set("ui", "classic")) {
         toast("Could not save (SD card?)");
     } else {
@@ -3595,7 +3616,7 @@ static void term_run(const char *what)
     } else if (!shell_resolve(s_sel_path, sizeof(s_sel_path), what) || !has_uf2_ext(s_sel_path) ||
                !fileops_exists(s_sel_path)) {
         char buf[TERM_IN + 40];
-        snprintf(buf, sizeof(buf), found ? "run: %s has no single .uf2 to run" : "run: no app or .uf2 called %s", what);
+        snprintf(buf, sizeof(buf), found ? "run: %s has no single " PML_APP_EXT " to run" : "run: no app or " PML_APP_EXT " called %s", what);
         term_put(buf, 1);
         return;
     }
@@ -4337,11 +4358,11 @@ void ui_redraw(void)
     case SCREEN_IMAGE:
         draw_image(); // it flushes, and nothing goes over it
         return;
-#if PML_RES
     case SCREEN_RES:
+#if PML_RES
         draw_res();
-        break;
 #endif
+        break;
 #if PICOMULTILOADER_WIFI
     case SCREEN_WEB:
         draw_web();
@@ -4396,7 +4417,7 @@ static void flash_and_run(void)
     draw_header();
     lcd_text(MARGIN, LIST_Y + 4, "Flashing...", C_ACCENT, FONT_LARGE);
     draw_kv(LIST_Y + 4 + 2 * ROW_H, "File", s_sel_name);
-    char buf[72];
+    char buf[80];
     snprintf(buf, sizeof(buf), "%s %s", s_info.name[0] ? s_info.name : "(unnamed)", s_info.version);
     draw_kv(LIST_Y + 4 + 3 * ROW_H, "App", buf);
     draw_footer(NULL, C_FG, "Do not switch off");

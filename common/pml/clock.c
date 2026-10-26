@@ -4,9 +4,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "pico/stdlib.h"
+#include "plat.h"
 #include "config.h"
 #include "ff.h"
+#if PML_P4
+#include <sys/time.h>
+#include <time.h>
+#endif
 
 static bool s_known;
 static int64_t s_base_utc;   // UTC at s_base_us
@@ -17,17 +21,40 @@ static bool s_manual;        // "tz" set by hand
 static int s_manual_offset;
 static char s_manual_name[16];
 
+#if PML_P4
+// ESP-IDF's FatFs stamps files from time() and localtime_r() (its own get_fattime()): keep the
+// system clock and TZ in step with this one.
+static void sync_system(void)
+{
+    if (s_known) {
+        struct timeval tv = {.tv_sec = (time_t)clock_utc()};
+        settimeofday(&tv, NULL);
+    }
+    int off = clock_offset(), a = off < 0 ? -off : off;
+    char tz[16];
+    snprintf(tz, sizeof(tz), "UTC%c%02d:%02d", off < 0 ? '+' : '-', a / 3600, a / 60 % 60); // POSIX: west is +
+    setenv("TZ", tz, 1);
+    tzset();
+}
+#else
+static void sync_system(void)
+{
+}
+#endif
+
 void clock_set_utc(int64_t utc)
 {
     s_base_utc = utc;
     s_base_us = time_us_64();
     s_known = true;
+    sync_system();
 }
 
 void clock_set_zone(int offset_s, const char *name)
 {
     s_auto_offset = offset_s;
     strlcpy(s_auto_name, name ? name : "", sizeof(s_auto_name));
+    sync_system();
 }
 
 bool clock_known(void)
@@ -135,6 +162,7 @@ static void apply(const char *value)
         int a = off < 0 ? -off : off;
         snprintf(s_manual_name, sizeof(s_manual_name), "UTC%c%02d:%02d", off < 0 ? '-' : '+', a / 3600, a / 60 % 60);
     }
+    sync_system();
 }
 
 void clock_load_setting(void)
@@ -155,6 +183,7 @@ bool clock_set_setting(const char *value)
     return true;
 }
 
+#if !PML_P4
 // FatFs stamps the files it writes with this (FF_FS_NORTC = 0).
 DWORD get_fattime(void)
 {
@@ -165,3 +194,4 @@ DWORD get_fattime(void)
     return (DWORD)(tm.year - 1980) << 25 | (DWORD)tm.month << 21 | (DWORD)tm.day << 16 |
            (DWORD)tm.hour << 11 | (DWORD)tm.min << 5 | (DWORD)(tm.sec / 2);
 }
+#endif

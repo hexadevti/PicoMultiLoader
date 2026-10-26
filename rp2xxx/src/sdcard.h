@@ -5,6 +5,9 @@
 #include <stdint.h>
 #include "ff.h"
 
+// The ESP-IDF FatFs calls its directory object FF_DIR (DIR is <dirent.h>'s); the shared code uses that name
+typedef DIR FF_DIR;
+
 // FatFS paths are "/dir/file"; the UI keeps "" for the root so "<root>/<name>" works unchanged.
 #define SDCARD_MOUNT_POINT ""
 

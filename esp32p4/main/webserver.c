@@ -10,7 +10,7 @@
 //   POST /api/delete?path=/f       files, or folders with everything in them
 //   POST /api/rename?from=/a&to=/b
 //   POST /api/flash?path=/f.bin    hand the file to the loader to flash and boot
-//   POST /api/wifi                 body "ssid\npassword": the network to join (NVS, same as F1)
+//   POST /api/wifi                 body "ssid\npassword": the network to join (settings file, as Setup)
 //
 // Paths are relative to the SD card root, URL-encoded, and may not contain "." or ".." parts.
 #include "webserver.h"
@@ -38,7 +38,10 @@
 #include "esp_wifi.h"
 #include "mdns.h"
 #include "nvs.h"
+#include "config.h"
+#include "plat.h"
 #include "sdcard.h"
+#include "timesync.h"
 
 static const char *TAG = "web";
 
@@ -70,6 +73,9 @@ static httpd_handle_t s_httpd;
 static bool s_mdns;
 static char s_flash_path[VFS_PATH_LEN];
 static bool s_flash_pending;
+static char s_join_ssid[33], s_join_pass[65]; // for web_task, read on the main thread
+static char s_save_ssid[33], s_save_pass[65]; // from /api/wifi, saved by webserver_poll()
+static bool s_save_pending;
 
 // ---- status -----------------------------------------------------------------------------------
 #define LOCKED(code)                                  \
@@ -137,8 +143,8 @@ bool webserver_take_flash_request(char *path, size_t len)
     }
     xSemaphoreTake(s_lock, portMAX_DELAY);
     bool pending = s_flash_pending;
-    if (pending) {
-        strlcpy(path, s_flash_path, len);
+    if (pending) { // a card path: drop the VFS root
+        strlcpy(path, s_flash_path + strlen(SDCARD_VFS_ROOT), len);
         s_flash_pending = false;
     }
     xSemaphoreGive(s_lock);
@@ -208,7 +214,7 @@ static bool query_path(httpd_req_t *req, const char *key, char *vfs, size_t len)
     if (!path_ok(val)) {
         return false;
     }
-    snprintf(vfs, len, "%s%s", SDCARD_MOUNT_POINT, strcmp(val, "/") == 0 ? "" : val);
+    snprintf(vfs, len, "%s%s", SDCARD_VFS_ROOT, strcmp(val, "/") == 0 ? "" : val);
     return true;
 }
 
@@ -224,7 +230,7 @@ static long query_long(httpd_req_t *req, const char *key, long def)
 
 static const char *card_path(const char *vfs)
 {
-    const char *p = vfs + strlen(SDCARD_MOUNT_POINT);
+    const char *p = vfs + strlen(SDCARD_VFS_ROOT);
     return *p ? p : "/";
 }
 
@@ -353,7 +359,7 @@ static esp_err_t list_get(httpd_req_t *req)
 static esp_err_t info_get(httpd_req_t *req)
 {
     uint64_t total = 0, free_bytes = 0;
-    esp_vfs_fat_info(SDCARD_MOUNT_POINT, &total, &free_bytes);
+    esp_vfs_fat_info(SDCARD_VFS_ROOT, &total, &free_bytes);
     web_status_t st;
     webserver_status(&st);
     char buf[160];
@@ -444,7 +450,7 @@ static esp_err_t file_get(httpd_req_t *req)
 static esp_err_t upload_post(httpd_req_t *req)
 {
     char vfs[VFS_PATH_LEN];
-    if (!query_path(req, "path", vfs, sizeof(vfs)) || strcmp(vfs, SDCARD_MOUNT_POINT) == 0) {
+    if (!query_path(req, "path", vfs, sizeof(vfs)) || strcmp(vfs, SDCARD_VFS_ROOT) == 0) {
         return send_error(req, "400 Bad Request", "bad path");
     }
     struct stat st;
@@ -579,7 +585,7 @@ static int remove_tree(char *path, size_t cap, int depth)
 static esp_err_t delete_post(httpd_req_t *req)
 {
     char vfs[VFS_PATH_LEN + 260];
-    if (!query_path(req, "path", vfs, VFS_PATH_LEN) || strcmp(vfs, SDCARD_MOUNT_POINT) == 0) {
+    if (!query_path(req, "path", vfs, VFS_PATH_LEN) || strcmp(vfs, SDCARD_VFS_ROOT) == 0) {
         return send_error(req, "400 Bad Request", "bad path");
     }
     char name[64];
@@ -596,7 +602,7 @@ static esp_err_t rename_post(httpd_req_t *req)
 {
     char from[VFS_PATH_LEN], to[VFS_PATH_LEN];
     if (!query_path(req, "from", from, sizeof(from)) || !query_path(req, "to", to, sizeof(to)) ||
-        strcmp(from, SDCARD_MOUNT_POINT) == 0 || strcmp(to, SDCARD_MOUNT_POINT) == 0) {
+        strcmp(from, SDCARD_VFS_ROOT) == 0 || strcmp(to, SDCARD_VFS_ROOT) == 0) {
         return send_error(req, "400 Bad Request", "bad path");
     }
     struct stat st;
@@ -652,9 +658,12 @@ static esp_err_t wifi_post(httpd_req_t *req)
                           "The network name must be 1-32 characters, and the password 8-64 (or empty)");
     }
     body[ssid_len] = '\0';
-    if (web_wifi_save(body, nl ? nl + 1 : "") != ESP_OK) {
-        return send_error(req, "500 Internal Server Error", "could not save the settings");
-    }
+    // The settings file belongs to the main loop: webserver_poll() saves it
+    LOCKED({
+        strlcpy(s_save_ssid, body, sizeof(s_save_ssid));
+        strlcpy(s_save_pass, nl ? nl + 1 : "", sizeof(s_save_pass));
+        s_save_pending = true;
+    });
     set_activity("%s", "Saved Wi-Fi settings", -1);
     return send_ok(req);
 }
@@ -708,12 +717,12 @@ static esp_err_t wifi_init_once(void)
     return ESP_OK;
 }
 
-// ---- saved network (NVS) ----------------------------------------------------------------------
-bool web_wifi_load(char *ssid, size_t ssid_len, char *pass, size_t pass_len)
+// ---- saved network (the settings file; main thread only) ---------------------------------------
+// Older loaders kept it in NVS: read that once and move it to the settings file.
+static bool nvs_wifi_migrate(char *ssid, size_t ssid_len, char *pass, size_t pass_len)
 {
     nvs_handle_t h;
-    ssid[0] = pass[0] = '\0';
-    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
         return false;
     }
     size_t n = ssid_len;
@@ -722,34 +731,37 @@ bool web_wifi_load(char *ssid, size_t ssid_len, char *pass, size_t pass_len)
     if (ok && nvs_get_str(h, "wifi_pass", pass, &n) != ESP_OK) {
         pass[0] = '\0';
     }
+    if (ok && config_set("wifi_ssid", ssid) && config_set("wifi_pass", pass)) {
+        nvs_erase_key(h, "wifi_ssid");
+        nvs_erase_key(h, "wifi_pass");
+        nvs_commit(h);
+    }
     nvs_close(h);
     return ok;
 }
 
-esp_err_t web_wifi_save(const char *ssid, const char *pass)
+bool web_wifi_load(char *ssid, size_t ssid_len, char *pass, size_t pass_len)
+{
+    ssid[0] = pass[0] = '\0';
+    if (!config_get("wifi_ssid", ssid, ssid_len) || !ssid[0]) {
+        ssid[0] = '\0';
+        return nvs_wifi_migrate(ssid, ssid_len, pass, pass_len);
+    }
+    if (!config_get("wifi_pass", pass, pass_len)) {
+        pass[0] = '\0';
+    }
+    return true;
+}
+
+bool web_wifi_save(const char *ssid, const char *pass)
 {
     if (strlen(ssid) > 32 || strlen(pass) > 64 || (pass[0] && strlen(pass) < 8)) {
-        return ESP_ERR_INVALID_ARG;
+        return false;
     }
-    nvs_handle_t h;
-    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
-    if (err != ESP_OK) {
-        return err;
+    if (!ssid[0]) { // forget the network
+        return config_set("wifi_ssid", "") && config_set("wifi_pass", "");
     }
-    if (ssid[0]) {
-        err = nvs_set_str(h, "wifi_ssid", ssid);
-        if (err == ESP_OK) {
-            err = nvs_set_str(h, "wifi_pass", pass);
-        }
-    } else { // forget the network
-        nvs_erase_key(h, "wifi_ssid");
-        nvs_erase_key(h, "wifi_pass");
-    }
-    if (err == ESP_OK) {
-        err = nvs_commit(h);
-    }
-    nvs_close(h);
-    return err;
+    return config_set("wifi_ssid", ssid) && config_set("wifi_pass", pass);
 }
 
 static int cmp_rssi(const void *a, const void *b)
@@ -964,10 +976,9 @@ static void web_task(void *arg)
         goto done;
     }
 
-    char ssid[33], pass[65];
     bool joined = false;
-    if (web_wifi_load(ssid, sizeof(ssid), pass, sizeof(pass))) {
-        joined = try_station(ssid, pass);
+    if (s_join_ssid[0]) {
+        joined = try_station(s_join_ssid, s_join_pass);
     } else {
         ESP_LOGI(TAG, "No Wi-Fi network set up (F1), starting an access point");
     }
@@ -992,20 +1003,57 @@ done:
     vTaskDelete(NULL);
 }
 
-esp_err_t webserver_start(void)
+void webserver_poll(void)
+{
+    if (!s_lock) {
+        return;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool save = s_save_pending;
+    char ssid[33], pass[65];
+    if (save) {
+        strlcpy(ssid, s_save_ssid, sizeof(ssid));
+        strlcpy(pass, s_save_pass, sizeof(pass));
+        s_save_pending = false;
+    }
+    bool online = s_status.state == WEB_RUNNING && !s_status.ap_mode && s_status.ip[0];
+    xSemaphoreGive(s_lock);
+    if (save && !web_wifi_save(ssid, pass)) {
+        set_activity("%s", "Could not save the Wi-Fi settings", -1);
+    }
+    if (online) {
+        timesync_poll();
+    }
+}
+
+void webserver_wait_until(uint64_t until_us)
+{
+    // The radio and the server run in their own tasks: just sleep, waking now and then for polls
+    uint64_t now = time_us_64();
+    if (until_us > now) {
+        uint64_t ms = (until_us - now) / 1000;
+        sleep_ms(ms > 20 ? 20 : (ms ? ms : 1));
+    }
+}
+
+bool webserver_start(void)
 {
     if (!s_lock) {
         s_lock = xSemaphoreCreateMutex();
         s_events = xEventGroupCreate();
         if (!s_lock || !s_events) {
-            return ESP_ERR_NO_MEM;
+            return false;
         }
     }
     if (s_status.state != WEB_OFF) {
-        return ESP_ERR_INVALID_STATE;
+        return false;
+    }
+    if (!web_wifi_load(s_join_ssid, sizeof(s_join_ssid), s_join_pass, sizeof(s_join_pass))) {
+        s_join_ssid[0] = s_join_pass[0] = '\0';
     }
     s_stopping = false;
     s_flash_pending = false;
+    s_save_pending = false;
     xEventGroupClearBits(s_events, BIT_GOT_IP | BIT_STOP | BIT_DONE);
     LOCKED({
         memset(&s_status, 0, sizeof(s_status));
@@ -1014,9 +1062,9 @@ esp_err_t webserver_start(void)
     });
     if (xTaskCreate(web_task, "web_start", 6144, NULL, 5, NULL) != pdPASS) {
         set_state(WEB_OFF);
-        return ESP_ERR_NO_MEM;
+        return false;
     }
-    return ESP_OK;
+    return true;
 }
 
 void webserver_stop(void)
@@ -1025,6 +1073,7 @@ void webserver_stop(void)
         return;
     }
     s_stopping = true;
+    timesync_stop();
     xEventGroupSetBits(s_events, BIT_STOP);
     xEventGroupWaitBits(s_events, BIT_DONE, pdFALSE, pdTRUE, portMAX_DELAY);
     if (s_mdns) {

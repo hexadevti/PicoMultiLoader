@@ -87,7 +87,7 @@ static FRESULT tree_size(char *path, int depth, uint64_t *total)
         free(fi);
         return fr;
     }
-    DIR dir;
+    FF_DIR dir;
     if (depth > MAX_DEPTH || (fr = f_opendir(&dir, path)) != FR_OK) {
         free(fi);
         return depth > MAX_DEPTH ? FR_INVALID_NAME : fr;
@@ -161,7 +161,7 @@ static FRESULT copy_tree(copy_job_t *job, char *src, char *dst, int depth)
         free(fi);
         return fr;
     }
-    DIR dir;
+    FF_DIR dir;
     if (fr != FR_OK || depth > MAX_DEPTH || (fr = f_mkdir(dst)) != FR_OK || (fr = f_opendir(&dir, src)) != FR_OK) {
         free(fi);
         return fr != FR_OK ? fr : FR_INVALID_NAME;
@@ -234,7 +234,7 @@ static FRESULT remove_tree(char *path, int depth)
     size_t len = strlen(path);
     while (depth <= MAX_DEPTH) {
         // reopen after each removal: deleting while iterating a FAT directory skips entries
-        DIR dir;
+        FF_DIR dir;
         if ((fr = f_opendir(&dir, path)) != FR_OK) {
             break;
         }

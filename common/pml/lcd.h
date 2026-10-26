@@ -33,8 +33,11 @@ void lcd_pixel(int x, int y, lcd_color_t color);
 /** Copy the framebuffer to the panel. */
 void lcd_flush(void);
 
-/** Copy rows y..y+h-1 of the framebuffer to the panel. */
+/** Copy rows y..y+h-1 of the framebuffer to the panel (the platform's lcd_bus.c). */
 void lcd_flush_rows(int y, int h);
+
+/** For lcd_flush_rows(): rows y..y+rows-1 as RGB565 pixels (native byte order). */
+void lcd_expand_rows(uint16_t *out, int y, int rows);
 
 void lcd_fill_rect(int x, int y, int w, int h, lcd_color_t color);
 void lcd_hline(int x, int y, int w, lcd_color_t color);

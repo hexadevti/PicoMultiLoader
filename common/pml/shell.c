@@ -2,14 +2,12 @@
 #include "shell.h"
 
 #include <ctype.h>
-#include <malloc.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include "pico/stdlib.h"
-#include "hardware/watchdog.h"
+#include "plat.h"
 #include "apps.h"
 #include "clock.h"
 #include "config.h"
@@ -32,7 +30,7 @@ typedef struct {
 static const cmd_t CMDS[] = {
     {"help", "[command]", "list the commands, or explain one"},
     {"apps", "", "list the apps on Home"},
-    {"run", "<app or file.uf2>", "run an app, or flash and run a file"},
+    {"run", "<app or file" PML_APP_EXT ">", "run an app, or flash and run a file"},
     {"ls", "[folder]", "list a folder"},
     {"cd", "[folder]", "change folder (no folder: the root)"},
     {"pwd", "", "show the folder you are in"},
@@ -197,7 +195,7 @@ static void cmd_ls(int argc, char **argv, shell_out_t out)
     if (!arg_path(path, sizeof(path), "ls", argc > 1 ? argv[1] : "", out)) {
         return;
     }
-    DIR dir;
+    FF_DIR dir;
     if (f_opendir(&dir, sd_path(path)) != FR_OK) {
         outf(out, true, "ls: no folder %s", argc > 1 ? argv[1] : "/");
         return;
@@ -334,10 +332,8 @@ static void cmd_battery(shell_out_t out)
 
 static void cmd_free(shell_out_t out)
 {
-    extern char __end__, __HeapLimit;
-    struct mallinfo mi = mallinfo();
-    size_t total = (size_t)(&__HeapLimit - &__end__);
-    size_t free_bytes = total - mi.arena + mi.fordblks;
+    size_t total, free_bytes;
+    plat_heap(&free_bytes, &total);
     outf(out, false, "Memory: %u KB free of %u KB (heap)", (unsigned)(free_bytes / 1024), (unsigned)(total / 1024));
 }
 
@@ -451,9 +447,7 @@ bool shell_run(int argc, char **argv, shell_out_t out)
     } else if (strcasecmp(cmd, "reboot") == 0) {
         out("Restarting...", false);
         sleep_ms(100); // let the console catch up
-        watchdog_reboot(0, 0, 0);
-        for (;;) {
-        }
+        plat_reboot();
     } else {
         return false;
     }
@@ -522,7 +516,7 @@ void shell_complete(char *line, size_t cap, shell_out_t out)
         char dir_arg[PATH_CAP], dir_path[PATH_CAP];
         size_t dl = slash ? (size_t)(slash - word) + 1 : 0; // keeps the "/"
         snprintf(dir_arg, sizeof(dir_arg), "%.*s", (int)dl, word);
-        DIR dir;
+        FF_DIR dir;
         if (!shell_resolve(dir_path, sizeof(dir_path), dir_arg) || f_opendir(&dir, sd_path(dir_path)) != FR_OK) {
             return;
         }

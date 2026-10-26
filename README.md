@@ -8,13 +8,295 @@ boots it. Hold **Up** (or F1/F5) while resetting to come back. It runs on three 
 | Raspberry Pi Pico / Pico W (RP2040) | `.uf2` | no | [rp2xxx/](rp2xxx/) | `PicoMultiLoader-rp2040.uf2` (or `-classic`), flashed through BOOTSEL |
 | Raspberry Pi Pico 2 W (RP2350) | `.uf2` | yes (CYW43439) | [rp2xxx/](rp2xxx/) | `PicoMultiLoader-rp2350.uf2` (boot stub) flashed through BOOTSEL + `pml2350.uf2` and/or `pml2350-classic.uf2` in the SD root |
 
-All three have the same screens and keys: file list, app details, Setup (F1), web file manager
-(F4, Wi-Fi boards), USB drive mode (F5), on-screen help, and the serial console. The browser page
-is shared ([common/web/index.html](common/web/index.html)). Most of this README describes the
-ESP32-P4 build; the RP2040 / RP2350 build is described in
+All three run the same menus, built from [common/pml/](common/pml/): the graphical one (Home,
+Files, control center, terminal, viewers; see [The menu](#the-menu)) and the
+[classic](#the-classic-menu) file list. Each board folder only adds its drivers (`plat.h`, LCD and
+keyboard buses, SD card, flashing, USB drive, Wi-Fi). The browser page is shared too
+([common/web/index.html](common/web/index.html)). The first half of this README covers the
+ESP32-P4 board; the RP2040 / RP2350 one is in
 [Raspberry Pi Pico / Pico 2 W build](#raspberry-pi-pico--pico-2-w-build-rp2040--rp2350).
 
 ## Screenshots
+
+The graphical menu looks the same on all three boards (these are from a Pico 2 W build). More
+screens, and what every key and option does, are in [The menu](#the-menu).
+
+| <img src="docs/screenshots/gui/home.png" width="260" alt="Home, Favourites tab"> | <img src="docs/screenshots/gui/home-all.png" width="260" alt="Home, All tab"> | <img src="docs/screenshots/gui/details.png" width="260" alt="An app's details before flashing"> |
+|:---:|:---:|:---:|
+| Home: favourites | Home: all the apps, with their icons | An app's details before flashing |
+| <img src="docs/screenshots/gui/files.png" width="260" alt="Files with the preview pane"> | <img src="docs/screenshots/gui/files-preview.png" width="260" alt="Files previewing a text file"> | <img src="docs/screenshots/gui/files-marked.png" width="260" alt="Files with two marked items copied"> |
+| Files (F3) with the preview pane | Previewing a text file | Marked items, copied with Ctrl+C |
+| <img src="docs/screenshots/gui/control-center.png" width="260" alt="Control center"> | <img src="docs/screenshots/gui/setup.png" width="260" alt="Setup"> | <img src="docs/screenshots/gui/web.png" width="260" alt="Web file manager screen"> |
+| Control center (F1) | Setup: Wi-Fi, start folder, time zone | Web file manager (F4) |
+| <img src="docs/screenshots/gui/terminal.png" width="260" alt="Terminal"> | <img src="docs/screenshots/gui/text-reader.png" width="260" alt="Text reader"> | <img src="docs/screenshots/gui/idle.png" width="260" alt="Idle clock"> |
+| Terminal (F5) | Text reader | Idle screen |
+
+<p align="center">
+  <img src="docs/screenshots/web-browser.png" width="820" alt="Web file manager in a browser"><br>
+  <em>The web file manager (F4) in a browser</em>
+</p>
+
+## The menu
+
+All three boards have this menu ([common/pml/ui.c](common/pml/ui.c)). Apps are `.uf2` files on
+the Picos and `.bin` files on the ESP32-P4. The classic file list of earlier versions is still
+available: see [The classic menu](#the-classic-menu).
+
+### Keys
+
+| Key | Does |
+|---|---|
+| Arrows, PgUp / PgDn, Home / End | Move |
+| Enter | Run the app, open the folder or file |
+| Esc / Backspace | Back |
+| Tab | Next tab on Home; the action menu in Files |
+| F1 | Control center: Wi-Fi, USB drive mode, backlight, idle screen, theme, menu style, and Setup |
+| F2 | Add or remove a favourite |
+| F3 | Files: the SD card, with copy / move / delete. Press again to go back to Home |
+| F4 | Wi-Fi and the web file manager (Pico 2 W, ESP32-P4) |
+| F5 | Terminal |
+| F10 (Shift+F5) | Screenshot to `/pml/shots/shot-NNN.bmp` |
+
+The serial console (115200 baud, see [Usage](#usage)) accepts the same keys, so the menu also
+works from a PC without the PicoCalc keyboard.
+
+### Start-up
+
+<img src="docs/screenshots/gui/boot.png" width="260" align="right" alt="Start-up screen">
+
+At switch-on the menu shows its logo and checks the SD card, the keyboard, the battery, Wi-Fi
+(with autostart on) and how many apps are on the card. A missing part is shown in red; the menu
+still opens. With no card, insert one and press Enter.
+
+<br clear="right">
+
+### Home
+
+Home is the start screen. It shows the apps on the card as a grid of icons, four to a row, with
+the selected app's version and description at the bottom.
+
+* **What is an app:** every top-level folder with an `app.ini` or an app file in it, and every app
+  file in the root. An `app.ini` gives the name, icon, category, version, author, description,
+  which file to run and which boards it is for. The format and the icon rules are in
+  [docs/apps.md](docs/apps.md). Without one, the folder name and a generic icon are shown.
+* **Tabs** (Tab): **Favourites**, **Recent** (the apps run lately) and **All**. Home opens on the
+  app run last.
+* **Favourites:** F2 adds or removes the selected app; favourites have a yellow star. Both lists
+  are plain text files, `/pml/favourites.txt` and `/pml/recents.txt`.
+* **Search:** type to filter all the apps by name. Backspace deletes a letter, Esc clears.
+* **Run:** Enter. The app already in flash has a green dot and starts at once; any other app is
+  checked and flashed first (see [App details](#app-details)).
+* **Folders of apps:** a folder with several apps and no `app.ini` saying which one to run opens
+  on Home, with a **Back** tile. Back, Esc or Backspace go to the folder above; Tab goes straight
+  back to the tabs. F3 opens that folder in Files.
+
+| <img src="docs/screenshots/gui/home-search.png" width="260" alt="Searching the apps"> | <img src="docs/screenshots/gui/home-folder.png" width="260" alt="A folder of apps on Home"> |
+|:---:|:---:|
+| Typing searches all the apps | A folder with several apps, and the Back tile |
+
+### App details
+
+<img src="docs/screenshots/gui/details.png" width="260" align="right" alt="App details">
+
+Before an app is flashed, the menu reads the file and shows what it is: the program name, version
+and build date (from the UF2's `binary_info`, or the ESP-IDF app descriptor), its size, the chip
+it was built for and how much of the app area it takes. **Enter** flashes and runs it, with a
+progress bar; **Esc** goes back. For the app that is already installed, Enter just runs it and
+**R** flashes it again. A file that can't run here (wrong chip or revision, too big, RAM-only
+build) is not flashed: the screen says why.
+
+<br clear="right">
+
+### Files (F3)
+
+The SD card as a file list, with a **preview pane** on the right: what is in a folder, the start
+of a text file, a picture's size and format, or an app's details. The bar at the bottom shows how
+full the card is.
+
+* Enter or Right opens a folder or a file; Backspace or Left goes up, and at the top, back to
+  Home. Esc or F3 also go back to Home. The last folder and file are remembered.
+* Apps flash (through [App details](#app-details)); `.txt`, `.md`, `.log`, `.ini`, `.csv`, `.py`,
+  `.bas` and `.pal` open in the text reader; `.bmp` in the image viewer.
+* Only folders, apps and files the viewers open are listed, unless **Show all files** is on (Tab
+  menu). Files that are only listed with it are dimmed.
+* **Copy, move, delete:** Space marks items. **Ctrl+C** copies and **Ctrl+X** cuts the marked
+  items (or the selected one), **Ctrl+V** pastes them into the folder shown, **Del** deletes after
+  asking. Folders are copied and deleted with everything in them. Pasting a copy where the name is
+  taken adds a number, e.g. `app (2).uf2`. Esc unmarks, then forgets what was copied.
+* **Tab** opens the same actions as a menu: Copy, Cut (to move), Paste, Delete, Show all files.
+* On the RP2350, the two menu files in the root (`pml2350.uf2`, `pml2350-classic.uf2`) can't be
+  deleted or moved from here.
+
+| <img src="docs/screenshots/gui/files-menu.png" width="260" alt="The Tab menu in Files"> | <img src="docs/screenshots/gui/files-delete.png" width="260" alt="Deleting a folder"> |
+|:---:|:---:|
+| The Tab menu | Deleting asks first |
+
+### Text reader and image viewer
+
+* **Text reader:** pages of text, Up/Down or PgUp/PgDn turn them, Home/End jump to the first and
+  last. Markdown headings are shown in colour.
+* **Image viewer:** a `.bmp` (uncompressed, 1, 4, 8, 16, 24 or 32 bits) on the whole screen,
+  scaled to fit. Pictures with up to 16 colours are shown as they are; others are dithered to the
+  16-colour screen. **G** toggles grey, Left/Right show the previous or next picture in the folder.
+* Both close with Esc. In the terminal, `view <file>` opens them too.
+
+| <img src="docs/screenshots/gui/text-reader.png" width="260" alt="Text reader"> | <img src="docs/screenshots/gui/image-viewer.png" width="260" alt="Image viewer"> |
+|:---:|:---:|
+| Text reader | Image viewer (a 24-bit BMP, dithered) |
+
+### Control center (F1)
+
+A panel over Home or Files. Up/Down pick a row, Left/Right change it, Enter opens or toggles it,
+Esc closes. The battery charge is shown at the bottom, and the web address while Wi-Fi is on.
+
+| Row | Options |
+|---|---|
+| Wi-Fi | On / Off: the web file manager (Pico 2 W, ESP32-P4), see [Web file manager](#web-file-manager-f4) |
+| USB drive | Share the SD card with a PC as a USB drive, see [USB drive mode](#usb-drive-mode) |
+| Backlight | 10–100 %, in 10 % steps (default 80 %) |
+| Idle screen | After 1, 2, 5, 10 or 30 minutes without a key, or never (default 5 minutes) |
+| Theme | Graphite, Phosphor, Amber, Paper, Clockwork, and your own (see [Themes](#themes)) |
+| Menu style | Graphical / Classic: restarts into the [classic menu](#the-classic-menu) (ESP32-P4, RP2350) |
+| Setup | Wi-Fi network, Wi-Fi autostart, start folder, time zone, and the on-screen help |
+
+Every setting is saved in `picomultiloader.cfg` in the root of the SD card.
+
+| <img src="docs/screenshots/gui/control-center.png" width="260" alt="Control center"> | <img src="docs/screenshots/gui/usb-drive.png" width="260" alt="USB drive mode"> |
+|:---:|:---:|
+| Control center, Wi-Fi on | USB drive mode |
+
+### Setup and help
+
+**Setup** (control center > Setup) has these rows; the Wi-Fi ones are explained under
+[Setup](#setup):
+
+| Row | Does |
+|---|---|
+| Network, Password | The Wi-Fi network the web server joins (type them in) |
+| Show password | Show the password instead of `*****` |
+| Scan for networks... | Pick a network from a list, strongest first |
+| Save / Forget this network | Store the network, or remove it |
+| Wi-Fi autostart | ON: start the web file manager in the background at switch-on |
+| Start folder | Where Files opens: *last used*, or a folder you pick |
+| Time zone | *auto* (from the web), or UTC−12:00 to UTC+14:00 |
+| Help: how to use the loader | The on-screen guide |
+
+The **help** is a scrollable guide to the whole menu: Home, app folders, Files, the viewers,
+copying and deleting, installing the loader, getting back to it from an app, Wi-Fi, USB drive mode
+and the serial console. Up/Down scroll, PgUp/PgDn page, Esc goes back.
+
+| <img src="docs/screenshots/gui/setup.png" width="260" alt="Setup"> | <img src="docs/screenshots/gui/help.png" width="260" alt="On-screen help"> |
+|:---:|:---:|
+| Setup | On-screen help |
+
+### Terminal (F5)
+
+A command line on the SD card. Tab completes names, Up/Down recall earlier commands, Esc clears the
+line, and F5 or `exit` closes it. `help <command>` explains one command.
+
+| Command | Does |
+|---|---|
+| `ls`, `cd`, `pwd` | List a folder, change folder (no folder: the root), show where you are |
+| `cat`, `view` | Show a text file; read it in pages, or show a `.bmp` |
+| `apps`, `recent`, `fav` | The apps on Home, the ones run lately, the favourites |
+| `run <app or file>` | Run an app, or flash and run a file |
+| `files`, `home`, `ctl` | Open Files in this folder, go to Home, open the control center |
+| `theme [name \| next]` | Show or change the theme |
+| `date`, `tz [auto \| +hh:mm]` | The date and time; show or set the time zone |
+| `wifi [on \| off]`, `ip` | Wi-Fi and the web server, its address (Pico 2 W, ESP32-P4) |
+| `usb` | USB drive mode |
+| `battery`, `free`, `df` | Battery charge, free memory, free space on the card |
+| `about`, `uname` | The loader, the chip and the installed app; the system's name |
+| `shot` | Save a screenshot in `/pml/shots` |
+| `echo`, `history`, `clear` | Print text, the last commands, clear the screen |
+| `reboot` | Restart: the installed app starts |
+
+| <img src="docs/screenshots/gui/terminal.png" width="260" alt="Terminal"> | <img src="docs/screenshots/gui/terminal-help.png" width="260" alt="Terminal help"> |
+|:---:|:---:|
+| `about`, `df`, `free`, `date` | `help` |
+
+### Web file manager
+
+<img src="docs/screenshots/gui/web.png" width="260" align="right" alt="Web file manager screen">
+
+On the Pico 2 W and the ESP32-P4, **F4** (or control center > Wi-Fi) starts Wi-Fi and a file
+manager in the browser: upload, download, rename, delete, new folders, and flash an app from the
+browser. The screen shows the address to open. Esc leaves it running in the background, with
+green Wi-Fi bars in the status bar; F4 on this screen stops it. Details are in
+[Web file manager (F4)](#web-file-manager-f4).
+
+<br clear="right">
+
+### Idle screen and clock
+
+<img src="docs/screenshots/gui/idle.png" width="260" align="right" alt="Idle screen">
+
+* **Idle screen:** after the time set in the control center without a key press, a dim clock on
+  black with the backlight turned down, redrawn once a minute. 10 minutes later the backlight goes
+  off. Any key wakes it (and does nothing else). Between keyboard polls the loader sleeps the CPU
+  (WFE on the Picos, the FreeRTOS idle task on the ESP32-P4), so it draws little power when
+  nothing is happening.
+* **Date and time** (Pico 2 W, ESP32-P4): once Wi-Fi has joined your network, the loader sends one
+  HTTP request to `ip-api.com`. The reply's `Date` header gives the time, and the body gives your
+  connection's time zone, with summer time included. It syncs again every 6 hours, and the time
+  shows in the middle of the status bar. You can set the time zone by hand under
+  **Setup > Time zone**, or with `tz +01:00` in the terminal (`tz auto` goes back to automatic).
+  Files the loader writes get real dates once the time is known.
+
+<br clear="right">
+
+### Themes
+
+The control center's **Theme** row (or `theme next` in the terminal) cycles through five built-in
+colour themes:
+
+| <img src="docs/screenshots/gui/theme-graphite.png" width="180" alt="Graphite theme"> | <img src="docs/screenshots/gui/theme-phosphor.png" width="180" alt="Phosphor theme"> | <img src="docs/screenshots/gui/theme-amber.png" width="180" alt="Amber theme"> | <img src="docs/screenshots/gui/theme-paper.png" width="180" alt="Paper theme"> | <img src="docs/screenshots/gui/theme-clockwork.png" width="180" alt="Clockwork theme"> |
+|:---:|:---:|:---:|:---:|:---:|
+| Graphite (default) | Phosphor | Amber | Paper | Clockwork |
+
+To add your own, put a `<name>.pal` file in `/pml/themes/` on the card. It holds 13 colours, as
+`#rrggbb` or RGB565 `0x1234`, in this order: background, panel, field, line, dim, text, bright,
+accent, dark accent, OK, warning, error, second accent. `;` starts a comment. The theme then shows
+up in the cycle under its file name. App icons use the same roles (see [docs/apps.md](docs/apps.md)),
+so they follow the theme.
+
+### Screenshots and messages from apps
+
+* **F10** (Shift+F5) or `shot` in the terminal saves the screen as `/pml/shots/shot-NNN.bmp`.
+* **Messages from apps:** an app can leave a line in `/pml/exit.txt`, which the menu shows once
+  when it opens. Alternatively, on the Picos it can set watchdog scratch 2 = `0x504D4C58` and
+  scratch 3 = an exit code before rebooting into the menu; on the ESP32-P4 it calls
+  `picomultiloader_exit_code()` from `loader_api.h`.
+
+## The classic menu
+
+Each build also makes a **classic** menu: the plain file list of earlier versions, without Home,
+Files, the terminal or the viewers (about 45 KB more free RAM on the RP2350). It has the same flashing,
+USB drive mode, Wi-Fi and web file manager.
+
+Switching between the two:
+
+* **ESP32-P4:** both menus are in the one loader. `ui=classic` in `picomultiloader.cfg` picks the
+  classic one at switch-on. **Control center (F1) > Menu style** (graphical) and **Setup > Menu
+  style** (classic) save the other one and restart into it.
+* **RP2350:** both menus are files on the SD card, `pml2350.uf2` and `pml2350-classic.uf2`. The boot
+  stub loads the classic one if `picomultiloader.cfg` has the line `ui=classic`, otherwise the
+  graphical one; if the chosen file is missing it loads the other. Switch in the menu itself:
+  **Control center (F1) > Menu style** in the graphical menu, **Setup > Menu style** in the classic
+  one. Each restarts into the other, and refuses if the other file isn't on the card.
+* **RP2040:** the loader is in flash, so flash the one you want through BOOTSEL:
+  `PicoMultiLoader-rp2040.uf2` or `PicoMultiLoader-rp2040-classic.uf2`.
+
+Its keys:
+
+| Key | Does |
+|---|---|
+| Up / Down, PgUp / PgDn, Home / End | Move the selection |
+| Enter / Right | Open a folder, or show the file's details; Enter there flashes and runs it |
+| Backspace / Left | Parent folder / back |
+| F1 | Setup: Wi-Fi network, start folder, menu style, and the on-screen help |
+| F4 | Web file manager over Wi-Fi |
+| F5 | USB drive mode |
 
 | <img src="docs/screenshots/file-list.png" width="400" alt="File list on the SD card"> | <img src="docs/screenshots/details.png" width="400" alt="Details of a .bin before flashing"> |
 |:---:|:---:|
@@ -23,11 +305,6 @@ ESP32-P4 build; the RP2040 / RP2350 build is described in
 | Web file manager (F4) | Setup (F1): Wi-Fi network and start folder |
 | <img src="docs/screenshots/help.png" width="400" alt="On-screen help"> | <img src="docs/screenshots/usb-drive.png" width="400" alt="USB drive mode"> |
 | On-screen help | USB drive mode (F5) |
-
-<p align="center">
-  <img src="docs/screenshots/web-browser.png" width="820" alt="Web file manager in a browser"><br>
-  <em>The web file manager (F4) in a browser</em>
-</p>
 
 ## How it works
 
@@ -41,8 +318,8 @@ ESP32-P4 build; the RP2040 / RP2350 build is described in
 0xC20000  storage ~20M FAT data partition, free for apps to use      (32 MB flash)
 ```
 
-* **Loader** (`esp32p4/main/`): draws a file browser on the PicoCalc LCD, lists folders and `*.bin`
-  files on the SD card, and checks the selected image (ESP32-P4 chip ID, chip revision, app
+* **Loader** (`esp32p4/main/` + `common/pml/`): the menu on the PicoCalc LCD lists the apps,
+  folders and `*.bin` files on the SD card, and checks the selected image (ESP32-P4 chip ID, chip revision, app
   descriptor). It then writes the image to `ota_0` with the ESP-IDF OTA API, which verifies
   the checksum and SHA256, marks it bootable and reboots.
 * **Bootloader** (`esp32p4/bootloader_components/main`): the stock ESP-IDF bootloader plus a check
@@ -156,30 +433,19 @@ family, and the loader rejects ones that aren't.
 1. Format a microSD card as FAT32 and copy `.bin` files to it, in any folder.
 2. Switch the PicoCalc on. The loader starts when nothing is installed yet. Otherwise,
    **hold Up (or F1/F5) and press reset / power-cycle**.
-3. Keys:
-
-   | Key | Action |
-   |---|---|
-   | Up / Down, PgUp / PgDn, Home / End | move the selection |
-   | Enter / Right | open a folder, or show the file's details |
-   | Enter (on the details screen) | flash and run it |
-   | Backspace / Left | parent folder / back |
-   | F1 | Setup: Wi-Fi network, and the on-screen help (below) |
-   | F4 | web file manager over Wi-Fi (below) |
-   | F5 | USB drive mode (below) |
-
-   Esc in the file list does nothing: the installed app only starts after flashing, or on
-   reset / power-on. The serial console accepts the same keys (arrows, Enter, Backspace, Esc,
-   F1/F4/F5 and typed text), so it works without the PicoCalc keyboard too. Ctrl+P prints the
-   screen as text; `tools/screenshots/` turns that into the pictures above.
-4. The loader remembers the last folder, and preselects the file you flashed last.
+3. The keys and screens are described in [The menu](#the-menu) (and
+   [The classic menu](#the-classic-menu)). The serial console on the USB-C port (115200 baud)
+   accepts the same keys (arrows, Enter, Backspace, Esc, F1-F5 and typed text), so it works
+   without the PicoCalc keyboard too. Ctrl+P prints the screen as text; `tools/screenshots/`
+   turns that into pictures like the [classic menu](#the-classic-menu) ones.
 
 The board's BOOT button also works: press it within 0.5 s *after* releasing RESET. Holding
 it *while* releasing RESET enters ROM download mode instead, because GPIO35 is a strapping pin.
 
-### USB drive mode (F5)
+### USB drive mode
 
-Press **F5** in the file list to share the SD card with a PC. It needs the board's **4-pin USB
+Choose **USB drive** in the control center (F1; F5 in the classic menu) to share the SD card
+with a PC. It needs the board's **4-pin USB
 OTG 2.0 HS header** (VBUS, D-, D+, GND) wired to a USB cable going to the PC. The board's USB-C
 port goes to the CH343 USB-to-serial chip and can't carry USB storage. The card then appears as
 a USB drive. The screen shows *Waiting for the PC*, *Connected* or *Cable unplugged*.
@@ -192,13 +458,16 @@ a USB drive. The screen shows *Waiting for the PC*, *Connected* or *Cable unplug
   are in `esp32p4/main/usb_drive.c` and pass raw SD sectors through. esp_tinyusb's own storage layer is
   deliberately not used, because it formats the card if it fails to mount it.
 
-### Setup (F1)
+### Setup
 
-Press **F1** in the file list to choose the Wi-Fi network the web server joins:
+**Setup** (control center > Setup; F1 in the classic menu) chooses the Wi-Fi network the web
+server joins:
 
 * Type the **Network** name and **Password** (Backspace deletes; *Show password* toggles the
   mask), or pick **Scan for networks...** and choose one from the list.
-* **Save** stores them in NVS on the board's flash. **Forget this network** removes them.
+* **Save** stores them in `picomultiloader.cfg` on the SD card, with the other settings.
+  **Forget this network** removes them. (Earlier versions kept the network in NVS; it is moved to
+  the card the first time it is read.)
 * Up/Down or Tab move between rows; Home/End jump to the first/last row.
 * **Wi-Fi autostart** (ON/OFF, Enter toggles) starts the web file manager in the background at
   switch-on, as if you pressed F4 and then Esc. It is OFF by default.
@@ -217,7 +486,7 @@ and the serial console. Up/Down scroll, PgUp/PgDn page, Esc goes back.
 
 ### Web file manager (F4)
 
-Press **F4** in the file list to manage the SD card from a browser over Wi-Fi:
+Press **F4** to manage the SD card from a browser over Wi-Fi:
 
 1. If a network is set up (F1), the loader joins it and shows `http://<ip>/`. On most networks
    `http://picocalc.local/` works too.
@@ -253,6 +522,10 @@ Copy `esp32p4/main/loader_api.h` into your project and call `picomultiloader_reb
 (the old name `binloader_reboot_to_menu()` still works). It writes
 a magic value to `LP_SYSTEM_REG_LP_STORE15_REG`, which survives a software reset, and then
 restarts. This is the equivalent of the PicoCalc UF2 Loader's watchdog-scratch command.
+
+To leave a message for the menu, call `picomultiloader_exit_code(code)` first: the menu shows the
+code once when it opens (LP_SYSTEM store registers 13 and 14). Writing a line to `/pml/exit.txt`
+on the card works too.
 
 ## Building apps to load
 
@@ -386,51 +659,6 @@ drive goes into the app partition at `0x2000`.
   through BOOTSEL. (On the RP2350 the app's first sector is written last, so a half-written app
   is never started.)
 
-### The menu (RP2040 / RP2350)
-
-The Pico builds have a newer menu than the ESP32-P4 build described under [Usage](#usage). Some keys
-are different:
-
-| Key | Does |
-|---|---|
-| F1 | Control center: Wi-Fi, USB drive mode, backlight, idle screen, theme, and Setup |
-| F2 | Add or remove a favourite |
-| F3 | Files: the SD card. `.uf2` files flash; `.txt`, `.md`, `.log`, `.ini`, `.csv` open in a reader; `.bmp` in an image viewer. Space marks items; Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste them, Del deletes. Tab: the same, plus Show all files |
-| F4 | Wi-Fi and the web file manager on/off (Pico 2 W) |
-| F5 | Terminal: `help` lists the commands (`ls`, `cd`, `cat`, `view`, `run`, `apps`, `date`, `tz`, `wifi`, `free`, `df`, `about`, ...) |
-| F10 (Shift+F5) | Screenshot to `/pml/shots/shot-NNN.bmp` |
-
-* **Home** is the start screen. It shows every top-level folder on the card that has an `app.ini` or a
-  `.uf2` in it, plus loose `.uf2` files in the root. Tabs: Favourites, Recent, All. It opens on the app run last.
-  A folder with no single `.uf2` to run opens on Home too, showing its `.uf2` files and folders
-  after a **Back** tile; Back (or Esc / Backspace) goes to the folder above, and Tab straight back to the tabs.
-* **Idle screen:** after a while without a key press (set in the control center: 1-30 minutes or never),
-  a dim clock on black with the backlight turned down, redrawn once a minute; 10 minutes later the
-  backlight goes off. Between keyboard polls the loader sleeps the CPU (WFE), so it draws little
-  power when nothing is happening.
-* **Date and time** (Pico 2 W): once Wi-Fi has joined your network, the loader sends one HTTP request
-  to `ip-api.com`. The reply's `Date` header gives the time, and the body gives your connection's time
-  zone, with summer time included. It syncs again every 6 hours, and the time shows in the middle of the status bar. You can set the time zone by hand under
-  **Setup > Time zone**, or with `tz +01:00` in the terminal (`tz auto` goes back to automatic). Files the
-  loader writes get real dates once the time is known.
-* **Messages from apps:** an app can leave a line in `/pml/exit.txt`, which the menu shows once when
-  it opens. Alternatively, it can set watchdog scratch 2 = `0x504D4C58` and scratch 3 = an exit code
-  before rebooting into the menu.
-
-### The classic menu
-
-Each build also makes a **classic** menu: the plain file list of earlier versions, without Home,
-Files, the terminal or the viewers (about 45 KB more free RAM on the RP2350). It has the same flashing,
-USB drive mode, Wi-Fi and web file manager.
-
-* **RP2350:** both menus are files on the SD card, `pml2350.uf2` and `pml2350-classic.uf2`. The boot
-  stub loads the classic one if `picomultiloader.cfg` has the line `ui=classic`, otherwise the
-  graphical one; if the chosen file is missing it loads the other. Switch in the menu itself:
-  **Control center (F1) > Menu style** in the graphical menu, **Setup > Menu style** in the classic
-  one. Each restarts into the other, and refuses if the other file isn't on the card.
-* **RP2040:** the loader is in flash, so flash the one you want through BOOTSEL:
-  `PicoMultiLoader-rp2040.uf2` or `PicoMultiLoader-rp2040-classic.uf2`.
-
 ### Build
 
 Needs the [Pico SDK](https://github.com/raspberrypi/pico-sdk) 2.1 or later, the Arm GNU
@@ -451,7 +679,8 @@ point the build at a working one with `-DPICOTOOL_EXE=/path/to/picotool`.
 ### Differences from the ESP32-P4 build
 
 * **Settings** (Wi-Fi network, AP password, start folder, autostart, last folder, theme, idle
-  screen, time zone) are kept in `/picomultiloader.cfg` on the SD card instead of NVS.
+  screen, time zone) are kept in `/picomultiloader.cfg` on the SD card, as on the ESP32-P4
+  (which keeps only its access point password in NVS).
 * **USB drive mode** (control center, F1) uses the Pico's own micro-USB port (full speed, 12 Mbit/s). The serial
   console is on the PicoCalc's USB-C port (UART0, 115200).
 * **Web file manager (F4)**, Pico 2 W only: lwIP and the CYW43439 driver from the Pico SDK, with

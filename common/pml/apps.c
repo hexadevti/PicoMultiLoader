@@ -4,15 +4,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include "pico/stdlib.h"
+#include "plat.h"
 #include "ff.h"
 #include "lcd.h"
 #include "look.h"
 #include "sdcard.h"
 #include "uf2_image.h"
 
-#if PICO_RP2040
+#if PML_RP2040
 #define BOARD "rp2040"
+#elif PML_P4
+#define BOARD "esp32p4"
 #else
 #define BOARD "rp2350"
 #endif
@@ -39,7 +41,7 @@ const char *apps_cat_name(int cat)
 static bool has_uf2_ext(const char *name)
 {
     size_t len = strlen(name);
-    return len > 4 && strcasecmp(name + len - 4, ".uf2") == 0;
+    return len > 4 && strcasecmp(name + len - 4, PML_APP_EXT) == 0;
 }
 
 static bool hidden(const FILINFO *fi)
@@ -300,7 +302,7 @@ static bool add_app(apps_t *a, const char *path, const char *title, const char *
 // The one .uf2 in a folder: returns how many there are (0, 1, or 2 for "several").
 static int find_uf2(const char *dir, char *out, size_t len)
 {
-    DIR d;
+    FF_DIR d;
     FILINFO fi;
     int n = 0;
     if (f_opendir(&d, sd_path(dir)) != FR_OK) {
@@ -446,7 +448,7 @@ void apps_scan_dir(apps_t *a, const char *dir)
 {
     bool root = !dir[0];
     a->count = a->used = 0;
-    DIR d;
+    FF_DIR d;
     FILINFO fi;
     if (f_opendir(&d, sd_path(dir)) == FR_OK) {
         while (f_readdir(&d, &fi) == FR_OK && fi.fname[0]) {
@@ -458,7 +460,7 @@ void apps_scan_dir(apps_t *a, const char *dir)
             if (fi.fattrib & AM_DIR) {
                 add_dir(a, path, root ? 0 : APP_EXTRA);
             } else if (has_uf2_ext(fi.fname)
-#if !PICO_RP2040
+#if PML_MENU_FILES
                        && !(root && (strcasecmp(fi.fname, UF2_LOADER_GUI + 1) == 0 || // the loader itself
                                      strcasecmp(fi.fname, UF2_LOADER_CLASSIC + 1) == 0))
 #endif

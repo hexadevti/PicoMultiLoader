@@ -22,10 +22,10 @@ static volatile bool s_ejected;
 static sdmmc_card_t *s_card;
 static SemaphoreHandle_t s_lock; // held while a USB transfer touches the card
 
-esp_err_t usbdrive_start(void)
+bool usbdrive_start(void)
 {
     if (s_exposed) {
-        return ESP_OK;
+        return true;
     }
     if (!s_lock) {
         s_lock = xSemaphoreCreateMutex();
@@ -33,7 +33,7 @@ esp_err_t usbdrive_start(void)
     esp_err_t err = sdcard_open_raw(&s_card);
     if (err != ESP_OK) {
         sdcard_mount();
-        return err;
+        return false;
     }
     s_ejected = false;
     s_exposed = true;
@@ -44,14 +44,19 @@ esp_err_t usbdrive_start(void)
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "USB driver install failed: %s", esp_err_to_name(err));
             usbdrive_stop();
-            return err;
+            return false;
         }
         s_installed = true;
     } else {
         tud_connect();
     }
     ESP_LOGI(TAG, "SD card exposed over USB (%u MB)", (unsigned)usbdrive_size_mb());
-    return ESP_OK;
+    return true;
+}
+
+void usbdrive_task(void)
+{
+    // TinyUSB runs in its own task here
 }
 
 void usbdrive_stop(void)

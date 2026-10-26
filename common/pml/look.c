@@ -4,13 +4,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include "pico/stdlib.h"
-#include "ff.h"
+#include "plat.h"
+#include "sdcard.h"
 
 #define HEX565(v)   RGB565(((v) >> 16) & 0xFF, ((v) >> 8) & 0xFF, (v) & 0xFF)
 #define THEME_COLS  13 // entries 0..12; the rest are cycled
 #define CYCLE_US    120000
-#define NAME_MAX    24
+#define THEME_NAME_MAX    24
 
 typedef struct {
     const char *name;
@@ -36,7 +36,7 @@ static const theme_t THEMES[] = {
 };
 #define NTHEMES ((int)(sizeof(THEMES) / sizeof(THEMES[0])))
 
-static char s_name[NAME_MAX];
+static char s_name[THEME_NAME_MAX];
 static uint16_t s_ramp[3]; // accent, between, dark accent
 static int s_phase;
 static uint16_t s_pal[THEME_COLS]; // the loaded theme
@@ -58,7 +58,7 @@ static int builtin_index(const char *name)
 // anything; ";" starts a comment. Needs all 13; more are ignored.
 static bool read_pal(const char *name, uint16_t *out)
 {
-    char path[sizeof(THEME_DIR) + NAME_MAX + 6], buf[384];
+    char path[sizeof(THEME_DIR) + THEME_NAME_MAX + 6], buf[384];
     FIL f;
     UINT n;
     snprintf(path, sizeof(path), THEME_DIR "/%s.pal", name);
@@ -100,7 +100,7 @@ bool theme_load(const char *name)
     uint16_t pal[THEME_COLS];
     int i = name ? builtin_index(name) : -1;
     bool ok = true;
-    if (name && strlen(name) < NAME_MAX && read_pal(name, pal)) {
+    if (name && strlen(name) < THEME_NAME_MAX && read_pal(name, pal)) {
         strlcpy(s_name, i >= 0 ? THEMES[i].name : name, sizeof(s_name));
     } else {
         ok = i >= 0;
@@ -144,12 +144,12 @@ void theme_next(char *out, size_t len)
     // The .pal files in folder order: the first one after the last built-in theme, else the one
     // after the loaded file.
     bool take = i >= 0;
-    DIR d;
+    FF_DIR d;
     FILINFO fi;
     if (f_opendir(&d, THEME_DIR) == FR_OK) {
         while (f_readdir(&d, &fi) == FR_OK && fi.fname[0]) {
             size_t n = strlen(fi.fname);
-            if ((fi.fattrib & AM_DIR) || n < 5 || n - 4 >= NAME_MAX || strcasecmp(fi.fname + n - 4, ".pal") != 0) {
+            if ((fi.fattrib & AM_DIR) || n < 5 || n - 4 >= THEME_NAME_MAX || strcasecmp(fi.fname + n - 4, ".pal") != 0) {
                 continue;
             }
             fi.fname[n - 4] = '\0';

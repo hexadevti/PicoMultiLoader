@@ -107,21 +107,26 @@ else()
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
 endif()
 
+# The menus and the drivers they share with the ESP32-P4 build; src/ has this platform's side (plat.h)
+set(PML ${CMAKE_CURRENT_LIST_DIR}/../common/pml)
+
 foreach(LOADER ${LOADER_NAME} ${LOADER_CLASSIC})
     if (LOADER STREQUAL LOADER_CLASSIC)
-        set(UI_SOURCES src/ui_classic.c)
+        set(UI_SOURCES ${PML}/ui_classic.c)
         set(UI_CLASSIC 1)
     else()
-        set(UI_SOURCES src/ui.c src/apps.c src/look.c src/shell.c src/viewer.c)
+        set(UI_SOURCES ${PML}/ui.c ${PML}/apps.c ${PML}/look.c ${PML}/shell.c ${PML}/viewer.c)
         set(UI_CLASSIC 0)
     endif()
     add_executable(${LOADER}
         src/main.c
-        src/clock.c
-        src/config.c
-        src/fileops.c
-        src/keyboard.c
-        src/lcd.c
+        src/kbd_bus.c
+        src/lcd_bus.c
+        ${PML}/clock.c
+        ${PML}/config.c
+        ${PML}/fileops.c
+        ${PML}/keyboard.c
+        ${PML}/lcd.c
         src/sdcard.c
         src/uf2_image.c
         src/usb_descriptors.c
@@ -134,6 +139,7 @@ foreach(LOADER ${LOADER_NAME} ${LOADER_CLASSIC})
     target_include_directories(${LOADER} PRIVATE
         src
         lib/fatfs
+        ${PML}
         ${CMAKE_CURRENT_LIST_DIR}/../common
     )
 

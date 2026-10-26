@@ -9,6 +9,7 @@
 // Without PicoMultiLoader installed, this is a plain restart.
 #pragma once
 
+#include <stdint.h>
 #include "esp_system.h"
 #include "soc/soc.h"
 #include "soc/lp_system_reg.h"
@@ -20,6 +21,18 @@ static inline void picomultiloader_reboot_to_menu(void)
 {
     REG_WRITE(PICOMULTILOADER_MAGIC_REG, PICOMULTILOADER_MAGIC);
     esp_restart();
+}
+
+// An exit code for the loader: shown when its menu opens next. Then call
+// picomultiloader_reboot_to_menu() (or restart some other way).
+#define PICOMULTILOADER_EXIT_MAGIC_REG LP_SYSTEM_REG_LP_STORE13_REG
+#define PICOMULTILOADER_EXIT_CODE_REG  LP_SYSTEM_REG_LP_STORE14_REG
+#define PICOMULTILOADER_EXIT_MAGIC     0x504D4C58u // "PMLX"
+
+static inline void picomultiloader_exit_code(int32_t code)
+{
+    REG_WRITE(PICOMULTILOADER_EXIT_CODE_REG, (uint32_t)code);
+    REG_WRITE(PICOMULTILOADER_EXIT_MAGIC_REG, PICOMULTILOADER_EXIT_MAGIC);
 }
 
 // Names from before the project was called PicoMultiLoader, so older apps still build.

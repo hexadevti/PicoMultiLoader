@@ -59,3 +59,9 @@ int kbd_battery(bool *charging);
 
 /** Set the LCD backlight (0..255). */
 void kbd_set_lcd_backlight(uint8_t level);
+
+// ---- the platform's I2C to the keyboard controller (kbd_bus.c) ----
+void kbd_bus_init(void);
+/** Read a register (2 bytes), with the turnaround the STM32 needs. */
+bool kbd_bus_read(uint8_t reg, uint8_t out[2]);
+bool kbd_bus_write(uint8_t reg, uint8_t value);
