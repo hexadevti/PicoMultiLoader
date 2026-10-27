@@ -71,8 +71,18 @@ bool kbd_present(void)
     return s_present;
 }
 
+static bool s_repeat_more; // kbd_repeat_more()
+
+void kbd_repeat_more(bool on)
+{
+    s_repeat_more = on;
+}
+
 static bool is_repeatable(int key)
 {
+    if (s_repeat_more && (key == KEY_LEFT || key == KEY_RIGHT || key == KEY_BACKSPACE || key == KEY_DEL)) {
+        return true;
+    }
     return key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN;
 }
 

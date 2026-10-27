@@ -54,6 +54,9 @@ bool kbd_boot_key_held(uint32_t window_ms);
 /** Return the next pressed key (press and auto-repeat events), or KEY_NONE. */
 int kbd_poll(void);
 
+/** Also auto-repeat Left, Right, Backspace and Del (Up, Down, PgUp and PgDn always do); for apps. */
+void kbd_repeat_more(bool on);
+
 /** Battery charge in percent (0..100), or -1. Sets *charging if non-NULL. */
 int kbd_battery(bool *charging);
 

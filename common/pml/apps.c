@@ -251,6 +251,11 @@ static bool board_ok(const char *boards)
         low[i] = (char)(boards[i] >= 'A' && boards[i] <= 'Z' ? boards[i] + 32 : boards[i]);
     }
     low[i] = '\0';
+#if PML_P4
+    if (strstr(low, "p4")) { // "p4" is short for "esp32p4"
+        return true;
+    }
+#endif
     return !low[0] || strstr(low, "any") || strstr(low, BOARD);
 }
 

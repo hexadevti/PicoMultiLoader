@@ -527,7 +527,39 @@ To leave a message for the menu, call `picomultiloader_exit_code(code)` first: t
 code once when it opens (LP_SYSTEM store registers 13 and 14). Writing a line to `/pml/exit.txt`
 on the card works too.
 
+## Bundled apps
+
+[apps/](apps/) holds a few basic tools for the PicoCalc with a Pico (RP2040) or Pico 2 / 2 W (RP2350).
+Each one is its own app, with an `app.ini` and an icon (see [docs/apps.md](docs/apps.md)), so it shows
+on Home with the others and Esc goes back to the menu.
+
+| App | What it does |
+| --- | --- |
+| **Music Player** | Plays PCM WAV files (8 or 16 bits, mono or stereo, 8 to 48 kHz) through the speakers or headphones. It has a folder browser, a playlist made from the folder, seeking, volume, repeat and shuffle. It starts in `/Music` if there is one. |
+| **Text Editor** | Edits text files of up to 95 KB (RP2040) or 255 KB (RP2350). It has line numbers, auto-indent, find, go to line, and line cut, copy and paste. Files keep their LF or CRLF line ends. |
+| **Image Editor** | Views BMP pictures (1 to 32 bits) fitted or zoomed, with the next and previous picture in the folder. It paints with a pen, lines, rectangles, ellipses, fill and a colour picker, and has undo. It saves 24-bit BMP files. Big pictures are scaled down to fit in memory. |
+| **Calculator** | A scientific calculator with variables, functions, degrees or radians, hex, binary and octal output, and a history you can recall. |
+
+They are built apart from the loader, for both chips at once:
+
+```sh
+cd apps
+cmake -B build-rp2040 -G Ninja -DPICO_BOARD=pico
+cmake -B build-rp2350 -G Ninja -DPICO_BOARD=pico2
+cmake --build build-rp2040
+cmake --build build-rp2350
+```
+
+The builds fill `apps/dist/`, one folder per app (`MusicPlayer`, `TextEditor`, `ImageEditor`,
+`Calculator`) with its `app.ini`, `icon.bmp` and both `.uf2` files. Copy those folders to the root
+of the SD card. Each app keeps its settings in its own folder. To add an app, see
+[apps/README.md](apps/README.md).
+
 ## Building apps to load
+
+To give your app an icon, name, version and description on Home, package it as a folder with an
+`app.ini`: see [docs/apps.md](docs/apps.md), the [app template](examples/app-template/) and
+`tools/pml_app.py`, which makes icons and checks app folders.
 
 Any ESP32-P4 app image works. The rules are the same for ESP-IDF and the Arduino IDE:
 
