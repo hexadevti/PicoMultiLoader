@@ -9,9 +9,10 @@
 //   version  = 1.4.0
 //   category = Emulators          ; Emulators | Tools | Dev | Media
 //   icon     = icon.bmp           ; 32x32, 4-bit BMP: pixel value = palette role (look.h), 0 = clear
-//   binary   = picocalc-nes.uf2   ; binary.rp2040 / binary.rp2350 win over it
-//   board    = rp2350             ; p4 | rp2040 | rp2350 | any (a list is fine); other boards hide it
+//   binary   = picocalc-nes.uf2   ; binary.rp2040 / binary.rp2350 / binary.esp32p4 win over it
+//   board    = rp2350             ; esp32p4 (or p4) | rp2040 | rp2350 | any (a list is fine); other boards hide it
 //   desc     = NES emulator with save states.
+// Only the first 512 bytes are read. The full format is in docs/apps.md.
 #pragma once
 
 #include <stdbool.h>

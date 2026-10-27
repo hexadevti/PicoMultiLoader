@@ -5,3 +5,7 @@ managed_components/
 dependencies.lock
 build-rp2040/
 build-rp2350/
+apps/build-rp2040/
+apps/build-rp2350/
+apps/dist/
+tools/__pycache__/
