@@ -5,6 +5,9 @@
 #include <stdint.h>
 #include "ff.h"
 
+// The ESP-IDF FatFs calls its directory object FF_DIR (DIR is <dirent.h>'s); the shared code uses that name
+typedef DIR FF_DIR;
+
 // FatFS paths are "/dir/file"; the UI keeps "" for the root so "<root>/<name>" works unchanged.
 #define SDCARD_MOUNT_POINT ""
 
@@ -18,6 +21,10 @@ void sdcard_unmount(void);
 
 /** Free and total space in bytes (false if not mounted). */
 bool sdcard_space(uint64_t *total, uint64_t *free_bytes);
+
+/** sdcard_space() a little at a time, for a card whose free space isn't known yet (counting it reads
+ *  the whole FAT): 1 = done, filled in; 0 = not yet, call again; -1 = can't tell. */
+int sdcard_space_step(uint64_t *total, uint64_t *free_bytes);
 
 /** Unmount the filesystem and open the card for raw sector access (USB drive mode). */
 bool sdcard_open_raw(uint32_t *sector_count);

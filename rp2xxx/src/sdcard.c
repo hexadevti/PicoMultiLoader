@@ -33,6 +33,11 @@ static bool s_block_addr; // SDHC/SDXC: addresses are sector numbers
 static uint32_t s_sectors;
 static bool s_mounted;
 static FATFS s_fs;
+// The free-space count in progress: the next FAT sector to read, and the free clusters so far.
+static DWORD s_count_at, s_count_free;
+static bool s_counting;
+
+void *uf2_scratch(size_t *len); // uf2_image.h: its names clash with diskio.h
 
 // ---- SPI --------------------------------------------------------------------------------------
 static inline uint8_t xfer(uint8_t b)
@@ -293,6 +298,7 @@ bool sdcard_mount(void)
         printf("sd: no card\n");
         return false;
     }
+    s_counting = false;
     FRESULT fr = f_mount(&s_fs, "", 1);
     if (fr != FR_OK) {
         printf("sd: mount failed (%d)\n", fr);
@@ -322,6 +328,50 @@ bool sdcard_space(uint64_t *total, uint64_t *free_bytes)
     *total = (uint64_t)(fs->n_fatent - 2) * cluster;
     *free_bytes = (uint64_t)free_clusters * cluster;
     return true;
+}
+
+int sdcard_space_step(uint64_t *total, uint64_t *free_bytes)
+{
+    FATFS *fs = &s_fs;
+    if (!s_mounted) {
+        s_counting = false;
+        return -1;
+    }
+    if (fs->free_clst <= fs->n_fatent - 2 || (fs->fs_type != FS_FAT32 && fs->fs_type != FS_FAT16)) {
+        s_counting = false; // known already (FSINFO), or left to FatFs
+        return sdcard_space(total, free_bytes) ? 1 : -1;
+    }
+    if (!s_counting) {
+        s_counting = true;
+        s_count_at = s_count_free = 0;
+    }
+    size_t len;
+    uint8_t *buf = uf2_scratch(&len); // idle in between: nothing else reads the card meanwhile
+    bool fat32 = fs->fs_type == FS_FAT32;
+    DWORD per_sector = fat32 ? 128 : 256, entries = fs->n_fatent;
+    DWORD sectors = (entries + per_sector - 1) / per_sector;
+    for (int step = 0; step < 8 && s_count_at < sectors; step++) {
+        UINT n = sectors - s_count_at < len / 512 ? (UINT)(sectors - s_count_at) : (UINT)(len / 512);
+        if (disk_read(fs->pdrv, buf, fs->fatbase + s_count_at, n) != RES_OK) {
+            s_counting = false;
+            return -1;
+        }
+        for (DWORD i = 0; i < n * per_sector; i++) {
+            DWORD e = s_count_at * per_sector + i;
+            if (e >= 2 && e < entries) {
+                const uint8_t *p = buf + i * (fat32 ? 4 : 2);
+                DWORD v = fat32 ? (p[0] | p[1] << 8 | p[2] << 16 | (DWORD)(p[3] & 0x0F) << 24) : (DWORD)(p[0] | p[1] << 8);
+                s_count_free += v == 0;
+            }
+        }
+        s_count_at += n;
+    }
+    if (s_count_at < sectors) {
+        return 0;
+    }
+    s_counting = false;
+    fs->free_clst = s_count_free; // FatFs keeps it up to date from here on
+    return sdcard_space(total, free_bytes) ? 1 : -1;
 }
 
 bool sdcard_open_raw(uint32_t *sector_count)

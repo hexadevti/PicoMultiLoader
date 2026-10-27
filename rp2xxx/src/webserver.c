@@ -27,9 +27,11 @@
 #include "lwip/apps/mdns.h"
 #include "lwip/tcp.h"
 #include "config.h"
+#include "timesync.h"
 #include "dhcpserver.h"
 #include "index_html.h"
 #include "sdcard.h"
+#include "uf2_image.h"
 
 #define CONNECT_TIMEOUT_MS 20000
 #define AP_SSID_PREFIX     "PicoMultiLoader"
@@ -1097,6 +1099,12 @@ static bool radio_init(void)
     if (s_radio_ready) {
         return true;
     }
+#if !PICO_RP2040
+    if (!uf2_res_ready()) { // the radio firmware lives in the flash resource area
+        printf("web: the Wi-Fi files are not installed in flash\n");
+        return false;
+    }
+#endif
     int err = cyw43_arch_init();
     if (err) {
         printf("web: cyw43_arch_init failed (%d)\n", err);
@@ -1268,6 +1276,12 @@ static void join_failed(const char *fmt)
 static void start_step(void)
 {
     if (!radio_init()) {
+#if !PICO_RP2040
+        if (!uf2_res_ready()) {
+            fail("The Wi-Fi files are not installed in flash", -1);
+            return;
+        }
+#endif
         fail("The CYW43 Wi-Fi chip did not start", -1);
         return;
     }
@@ -1356,9 +1370,21 @@ void webserver_poll(void)
         break;
     case WEB_RUNNING:
         link_step();
+        if (!s_status.ap_mode && s_status.ip[0]) {
+            timesync_poll();
+        }
         break;
     default:
         break;
+    }
+}
+
+void webserver_wait_until(uint64_t until_us)
+{
+    if (s_radio_ready) {
+        cyw43_arch_wait_for_work_until(from_us_since_boot(until_us));
+    } else {
+        sleep_until(from_us_since_boot(until_us));
     }
 }
 
@@ -1380,6 +1406,7 @@ void webserver_stop(void)
     if (s_status.state == WEB_OFF) {
         return;
     }
+    timesync_stop();
     while (s_conns) {
         conn_close(s_conns, true);
     }

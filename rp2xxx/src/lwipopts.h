@@ -22,7 +22,7 @@
 #define LWIP_IPV6                     0
 #define LWIP_TCP                      1
 #define LWIP_UDP                      1
-#define LWIP_DNS                      0
+#define LWIP_DNS                      1 // timesync.c (servers from DHCP)
 #define LWIP_DHCP                     1
 #define LWIP_IGMP                     1
 #define LWIP_AUTOIP                   0

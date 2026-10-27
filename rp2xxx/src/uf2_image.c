@@ -31,7 +31,9 @@
 #define APP_SIZE      RECORD_OFFSET
 #else
 #define APP_OFFSET    0x002000u // the stub's partition; the bootrom maps it to XIP_BASE
-#define APP_SIZE      (PICO_FLASH_SIZE_BYTES - APP_OFFSET)
+#define RES_SIZE      0x40000u  // the loader's resources (Wi-Fi firmware, web page), at the end
+#define RES_OFFSET    (PICO_FLASH_SIZE_BYTES - RES_SIZE)
+#define APP_SIZE      (RES_OFFSET - APP_OFFSET)
 #define APP_CONFIG_KEY "app"    // file name of the installed app, in the settings file
 #endif
 #define APP_END       (XIP_BASE + APP_SIZE) // end of the app's own address range
@@ -62,6 +64,16 @@ typedef struct {
 #define BI_ID_PROGRAM_DATE     0x9da22254
 #define BI_MARKER_START        0x7188ebf2
 #define BI_MARKER_END          0xe71aa390
+
+bool uf2_exit_code(int32_t *code)
+{
+    if (watchdog_hw->scratch[2] != PML_EXIT_MAGIC) {
+        return false;
+    }
+    watchdog_hw->scratch[2] = 0;
+    *code = (int32_t)watchdog_hw->scratch[3];
+    return true;
+}
 
 // ---- platform ---------------------------------------------------------------------------------
 uint32_t uf2_flash_capacity(void)
@@ -112,7 +124,6 @@ static bool in_ram(uint32_t addr)
     return addr >= SRAM_BASE && addr + 256 <= SRAM_END;
 }
 
-#if PICO_RP2040
 static uint32_t crc32(const uint8_t *p, size_t n)
 {
     uint32_t crc = 0xffffffffu;
@@ -125,6 +136,7 @@ static uint32_t crc32(const uint8_t *p, size_t n)
     return ~crc;
 }
 
+#if PICO_RP2040
 static uint32_t first_sector_crc(uint32_t size)
 {
     return crc32((const uint8_t *)(XIP_BASE + APP_OFFSET), size < FLASH_SECTOR_SIZE ? size : FLASH_SECTOR_SIZE);
@@ -242,7 +254,7 @@ void uf2_boot_or_menu(void)
 #endif
 
 // ---- walking a UF2 file -----------------------------------------------------------------------
-#define CHUNK_BLOCKS 8
+#define CHUNK_BLOCKS 4
 
 typedef struct uf2_walk uf2_walk_t;
 typedef bool (*block_fn_t)(uf2_walk_t *w, const struct uf2_block *b);
@@ -251,15 +263,23 @@ struct uf2_walk {
     FIL f;
     uf2_info_t *info;
     block_fn_t on_block; // called for each accepted block; false stops the walk
+    bool (*stop)(void);  // asked now and then while checking; true gives up (err "")
     uf2_progress_cb_t progress;
     char *err;
     size_t err_len;
     uint32_t first_index; // file block index of the first accepted block
     uint8_t erased[512];  // sector bitmap (flashing)
     uint32_t written;
+    uint32_t first_pages; // RP2350: pages of the app's first sector, programmed last
 };
 
 static struct uf2_block s_chunk[CHUNK_BLOCKS] __attribute__((aligned(256)));
+
+void *uf2_scratch(size_t *len)
+{
+    *len = sizeof(s_chunk);
+    return s_chunk;
+}
 static uint8_t s_page[256] __attribute__((aligned(256)));
 
 static bool fail(uf2_walk_t *w, const char *msg)
@@ -294,6 +314,11 @@ static bool walk(const char *path, uf2_walk_t *w)
     for (uint32_t idx = 0; ok && idx < total;) {
         UINT n = 0;
         uint32_t want = total - idx < CHUNK_BLOCKS ? total - idx : CHUNK_BLOCKS;
+        if (w->stop && idx % (4 * CHUNK_BLOCKS) == 0 && idx && w->stop()) {
+            w->err[0] = '\0';
+            ok = false;
+            break;
+        }
         if (f_read(&w->f, s_chunk, want * 512, &n) != FR_OK || n != want * 512) {
             ok = fail(w, "Read error on the SD card.");
             break;
@@ -521,9 +546,15 @@ static uf2_walk_t s_walk;
 
 bool uf2_inspect(const char *path, uf2_info_t *info, char *err, size_t err_len)
 {
+    return uf2_inspect_stoppable(path, info, NULL, err, err_len);
+}
+
+bool uf2_inspect_stoppable(const char *path, uf2_info_t *info, bool (*stop)(void), char *err, size_t err_len)
+{
     uf2_walk_t *w = &s_walk;
     memset(w, 0, sizeof(*w));
     w->info = info;
+    w->stop = stop;
     w->err = err;
     w->err_len = err_len;
     if (!walk(path, w)) {
@@ -552,9 +583,6 @@ bool uf2_inspect(const char *path, uf2_info_t *info, char *err, size_t err_len)
 #if PICO_RP2040
 extern const uint8_t __boot2_start__[];
 static uint8_t s_boot2[256] __attribute__((aligned(4)));
-#else
-// The app's first sector, written last (see app_present())
-static uint8_t s_first[FLASH_SECTOR_SIZE] __attribute__((aligned(256)));
 #endif
 
 // Offsets are physical flash offsets. Nothing may run from flash meanwhile, so no interrupts.
@@ -581,8 +609,8 @@ static bool flash_block(uf2_walk_t *w, const struct uf2_block *b)
         return fail(w, "Address beyond 16 MB.");
     }
 #if !PICO_RP2040
-    if (sector == 0) {
-        memcpy(&s_first[addr - XIP_BASE], b->data, 256);
+    if (sector == 0) { // written last, by write_first_sector()
+        w->first_pages++;
         w->written++;
         return true;
     }
@@ -628,6 +656,246 @@ static bool write_record(const uf2_info_t *info, const char *path)
     memcpy(s_page, &r, sizeof(r));
     return program_page(RECORD_OFFSET, s_page);
 }
+#else
+// The app's first sector holds its boot block (see app_present()), so it is programmed last, in a
+// second pass over the file: the app only looks complete once everything else is in flash.
+static bool write_first_sector(const char *path, uf2_walk_t *w, char *err, size_t err_len)
+{
+    uint32_t left = w->first_pages;
+    if (f_open(&w->f, sd_path(path), FA_READ) != FR_OK || f_lseek(&w->f, (FSIZE_t)w->first_index * 512) != FR_OK) {
+        f_close(&w->f);
+        snprintf(err, err_len, "Cannot open the file again.");
+        return false;
+    }
+    bool ok = true;
+    for (uint32_t idx = w->first_index, total = w->info->file_size / 512; ok && left && idx < total;) {
+        UINT n = 0;
+        uint32_t want = total - idx < CHUNK_BLOCKS ? total - idx : CHUNK_BLOCKS;
+        if (f_read(&w->f, s_chunk, want * 512, &n) != FR_OK || n != want * 512) {
+            snprintf(err, err_len, "Read error on the SD card.");
+            ok = false;
+            break;
+        }
+        for (uint32_t i = 0; ok && left && i < want; i++, idx++) {
+            const struct uf2_block *b = &s_chunk[i];
+            if ((b->flags & UF2_FLAG_NOT_MAIN_FLASH) || !(b->flags & UF2_FLAG_FAMILY_ID_PRESENT) ||
+                b->file_size != w->info->family || b->target_addr - XIP_BASE >= FLASH_SECTOR_SIZE) {
+                continue; // the same blocks walk() took for sector 0
+            }
+            memcpy(s_page, b->data, 256);
+            if (!program_page(APP_OFFSET + (b->target_addr - XIP_BASE), s_page)) {
+                snprintf(err, err_len, "Flash write failed at 0x%08lx.", (unsigned long)b->target_addr);
+                ok = false;
+            }
+            left--;
+        }
+    }
+    f_close(&w->f);
+    if (ok && left) {
+        snprintf(err, err_len, "The first sector changed while flashing.");
+        ok = false;
+    }
+    return ok;
+}
+#endif
+
+#if !PICO_RP2040
+// ---- resources in flash -----------------------------------------------------------------------
+// The Wi-Fi firmware and the web page are linked into the last 256 KB of flash (.pml_res, see
+// CMakeLists.txt) to leave RAM for the loader. pml2350.uf2 carries them as blocks of RES_FAMILY
+// after its RAM blocks (add_res.py); the stub skips those, and uf2_res_install() copies them here.
+// pml2350-classic.uf2 carries the same ones, so either file will do.
+#define RES_MAGIC  0x52574d50u // "PMWR"
+#define RES_FAMILY 0x504d4c52u
+
+typedef struct {
+    uint32_t magic;
+    uint32_t size;  // bytes after the header
+    uint32_t crc;   // CRC-32 of those bytes
+    uint32_t check; // magic ^ size ^ crc ^ 0xffffffff; 0xffffffff while being installed
+} res_hdr_t;
+
+_Static_assert(PML_RES_BASE == XIP_BASE + RES_OFFSET, "PML_RES_BASE must be the last 256 KB of flash");
+
+// The start of .pml_res; add_res.py fills it in.
+__attribute__((section(".pml_res.0hdr"), used)) const res_hdr_t s_res_hdr = {RES_MAGIC, 0, 0, 0};
+
+// The header of the resources this build was linked with. add_res.py finds the marker in the RAM
+// image and writes the header over it.
+static const volatile res_hdr_t s_res_want __attribute__((aligned(16))) = {
+    0x4d4c4d50u, 0x57534552u, 0x5f544e41u, 0x52444448u};
+
+#define RES_FLASH ((const res_hdr_t *)(XIP_BASE + RES_OFFSET))
+
+static bool res_hdr_valid(const res_hdr_t *h)
+{
+    return h->magic == RES_MAGIC && h->size <= RES_SIZE - sizeof(*h) &&
+           h->check == (h->magic ^ h->size ^ h->crc ^ 0xffffffffu);
+}
+
+static bool res_payload_ok(const res_hdr_t *h)
+{
+    return crc32((const uint8_t *)(h + 1), h->size) == h->crc;
+}
+
+static int s_res_state = -1; // cached uf2_res_check(); -1 until the first check
+
+res_state_t uf2_res_check(void)
+{
+    if (s_res_state >= 0) {
+        return (res_state_t)s_res_state;
+    }
+    const res_hdr_t *f = RES_FLASH;
+    res_state_t st;
+    if (s_res_want.magic != RES_MAGIC) {
+        st = RES_NO_FILE; // built without add_res.py
+    } else if (f->magic == s_res_want.magic && f->size == s_res_want.size && f->crc == s_res_want.crc &&
+               f->check == s_res_want.check && res_payload_ok(f)) {
+        st = RES_OK;
+    } else {
+        const uint32_t *p = (const uint32_t *)f;
+        unsigned i = 0;
+        while (i < RES_SIZE / 4 && p[i] == 0xffffffffu) {
+            i++;
+        }
+        if (i == RES_SIZE / 4) {
+            st = RES_BLANK;
+        } else if (f->magic == RES_MAGIC && ((res_hdr_valid(f) && res_payload_ok(f)) || f->check == 0xffffffffu)) {
+            st = RES_OLD; // another loader version's, or an interrupted install
+        } else {
+            st = RES_USED; // an app keeps its data there
+        }
+    }
+    s_res_state = st;
+    return st;
+}
+
+bool uf2_res_ready(void)
+{
+    return uf2_res_check() == RES_OK;
+}
+
+static bool res_install_from(const char *file, uf2_progress_cb_t progress, char *err, size_t err_len)
+{
+    FIL f;
+    if (f_open(&f, sd_path(file), FA_READ) != FR_OK) {
+        snprintf(err, err_len, "Cannot open %s.", file);
+        return false;
+    }
+    s_res_state = -1;
+    UINT n = 0;
+    struct uf2_block *b = &s_chunk[0];
+    uint32_t total_blocks = (uint32_t)(f_size(&f) / 512), idx = 0;
+    // The loader's own blocks come first: skip them in one go
+    if (f_read(&f, b, 512, &n) == FR_OK && n == 512 && b->magic_start0 == UF2_MAGIC_START0 &&
+        b->num_blocks < total_blocks && f_lseek(&f, (FSIZE_t)b->num_blocks * 512) == FR_OK) {
+        idx = b->num_blocks;
+    } else {
+        f_close(&f);
+        snprintf(err, err_len, "%s is not a UF2 file.", file);
+        return false;
+    }
+    uint64_t erased = 0; // one bit per 4 KB sector of the area
+    uint32_t done = 0, want_pages = (sizeof(res_hdr_t) + s_res_want.size + 255) / 256;
+    bool ok = true, got_hdr = false;
+    for (; ok && idx < total_blocks;) {
+        uint32_t chunk = total_blocks - idx < CHUNK_BLOCKS ? total_blocks - idx : CHUNK_BLOCKS;
+        if (f_read(&f, s_chunk, chunk * 512, &n) != FR_OK || n != chunk * 512) {
+            snprintf(err, err_len, "Read error on the SD card.");
+            ok = false;
+            break;
+        }
+        for (uint32_t i = 0; ok && i < chunk; i++, idx++) {
+            b = &s_chunk[i];
+            uint32_t off = b->target_addr - PML_RES_BASE;
+            if (b->magic_start0 != UF2_MAGIC_START0 || b->magic_start1 != UF2_MAGIC_START1 ||
+                b->magic_end != UF2_MAGIC_END || !(b->flags & UF2_FLAG_FAMILY_ID_PRESENT) ||
+                b->file_size != RES_FAMILY) {
+                continue;
+            }
+            if (b->payload_size != 256 || off >= RES_SIZE || (off & 0xFF)) {
+                snprintf(err, err_len, "Bad resource block at 0x%08lx.", (unsigned long)b->target_addr);
+                ok = false;
+                break;
+            }
+            memcpy(s_page, b->data, 256);
+            if (off == 0) { // the header: it must be the one this loader was linked with
+                const res_hdr_t *h = (const res_hdr_t *)s_page;
+                if (h->magic != s_res_want.magic || h->size != s_res_want.size || h->crc != s_res_want.crc ||
+                    h->check != s_res_want.check) {
+                    snprintf(err, err_len, "%s on the card is not the loader that is running.", file);
+                    ok = false;
+                    break;
+                }
+                ((res_hdr_t *)s_page)->check = 0xffffffffu; // written at the end
+                got_hdr = true;
+            }
+            uint32_t sector = off / FLASH_SECTOR_SIZE;
+            if (!(erased & (1ull << sector))) {
+                erase_sector(RES_OFFSET + sector * FLASH_SECTOR_SIZE);
+                erased |= 1ull << sector;
+            }
+            if (!program_page(RES_OFFSET + off, s_page)) {
+                snprintf(err, err_len, "Flash write failed at 0x%08lx.", (unsigned long)b->target_addr);
+                ok = false;
+                break;
+            }
+            done++;
+            if (progress) {
+                progress(done, want_pages);
+            }
+        }
+    }
+    f_close(&f);
+    if (ok && (!got_hdr || done != want_pages)) {
+        snprintf(err, err_len, "%s has %lu of %lu resource blocks.", file, (unsigned long)done,
+                 (unsigned long)want_pages);
+        ok = false;
+    }
+    if (ok) { // complete: now the header's check (programming only clears bits, so this works)
+        memcpy(s_page, (const void *)RES_FLASH, 256);
+        ((res_hdr_t *)s_page)->check = s_res_want.check;
+        if (!program_page(RES_OFFSET, s_page)) {
+            snprintf(err, err_len, "Could not finish the resource header.");
+            ok = false;
+        }
+    }
+    s_res_state = -1;
+    if (ok && uf2_res_check() != RES_OK) {
+        snprintf(err, err_len, "The resources in flash failed their check.");
+        ok = false;
+    }
+    return ok;
+}
+
+bool uf2_res_install(uf2_progress_cb_t progress, char *err, size_t err_len)
+{
+    if (s_res_want.magic != RES_MAGIC) {
+        snprintf(err, err_len, "This loader was built without its resources (add_res.py).");
+        return false;
+    }
+    if (res_install_from(PML_LOADER_FILE, progress, err, err_len)) {
+        return true;
+    }
+    char other_err[96]; // the other menu's file, if this one is missing or of another version
+    if (res_install_from(PML_UI_CLASSIC ? UF2_LOADER_GUI : UF2_LOADER_CLASSIC, progress, other_err,
+                         sizeof(other_err))) {
+        return true;
+    }
+    return false; // the first error says more
+}
+
+void uf2_restart_menu(void)
+{
+    printf("boot: restarting the menu\n");
+    stdio_flush();
+    watchdog_hw->scratch[1] = 1; // uf2loader's "menu" mode: the stub loads the loader again
+    watchdog_hw->scratch[0] = BL_MAGIC;
+    watchdog_reboot(0, 0, 0);
+    for (;;) {
+        tight_loop_contents();
+    }
+}
 #endif
 
 bool uf2_flash(const char *path, const uf2_info_t *info, uf2_progress_cb_t progress, char *err, size_t err_len)
@@ -641,7 +909,6 @@ bool uf2_flash(const char *path, const uf2_info_t *info, uf2_progress_cb_t progr
     erase_sector(RECORD_OFFSET); // until the new app is complete there is none
 #else
     erase_sector(APP_OFFSET); // until the new app is complete there is none
-    memset(s_first, 0xFF, sizeof(s_first));
 #endif
     uf2_walk_t *w = &s_walk;
     memset(w, 0, sizeof(*w));
@@ -668,11 +935,8 @@ bool uf2_flash(const char *path, const uf2_info_t *info, uf2_progress_cb_t progr
         return false;
     }
 #else
-    for (uint32_t off = 0; off < sizeof(s_first); off += 256) {
-        if (!program_page(APP_OFFSET + off, &s_first[off])) {
-            snprintf(err, err_len, "Flash write failed at 0x%08lx.", (unsigned long)(XIP_BASE + off));
-            return false;
-        }
+    if (!write_first_sector(path, w, err, err_len)) {
+        return false;
     }
     const char *base = strrchr(path, '/');
     config_set(APP_CONFIG_KEY, base ? base + 1 : path);

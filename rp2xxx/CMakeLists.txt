@@ -2,6 +2,7 @@
 #
 #   cmake -B build-rp2040 -G Ninja -DPICO_BOARD=pico     # -> PicoMultiLoader-rp2040.uf2 (no Wi-Fi)
 #   cmake -B build-rp2350 -G Ninja -DPICO_BOARD=pico2_w  # -> PicoMultiLoader-rp2350.uf2 (Wi-Fi web file manager)
+#   Each also builds the classic menu (ui_classic.c): PicoMultiLoader-rp2040-classic.uf2 / pml2350-classic.uf2.
 #   cmake --build build-rp2350
 #
 # Flash layout:
@@ -9,7 +10,8 @@
 #            PicoMultiLoader-rp2040.uf2 is all of it (flash it once through BOOTSEL).
 #   RP2350:  0x10000000 boot stub + partition table | 0x10002000 apps (to the end of flash), the
 #            same layout as pelrun's uf2loader. PicoMultiLoader-rp2350.uf2 is the stub (BOOTSEL);
-#            the loader itself, pml2350.uf2, goes in the root of the SD card and runs from RAM.
+#            the loader itself, pml2350.uf2 (or pml2350-classic.uf2, see stub/stub.c), goes in the
+#            root of the SD card and runs from RAM.
 cmake_minimum_required(VERSION 3.13)
 
 set(CMAKE_C_STANDARD 11)
@@ -41,61 +43,20 @@ endif()
 
 pico_sdk_init()
 
+# Two loaders from the same drivers: the graphical one (ui.c: Home, Files, the control center...)
+# and the classic file list of earlier versions (ui_classic.c). On the RP2350 the boot stub loads
+# one or the other (the "ui" setting, see stub/stub.c); on the RP2040, flash the one you want.
 if (PICO_PLATFORM MATCHES "rp2040")
     set(LOADER_NAME PicoMultiLoader-rp2040)
 else()
     set(LOADER_NAME pml2350)
 endif()
+set(LOADER_CLASSIC ${LOADER_NAME}-classic)
 
 set(LOADER_WIFI 0)
 if (PICO_CYW43_SUPPORTED AND NOT PICO_PLATFORM MATCHES "rp2040")
     set(LOADER_WIFI 1)
 endif()
-
-add_executable(${LOADER_NAME}
-    src/main.c
-    src/config.c
-    src/fileops.c
-    src/keyboard.c
-    src/lcd.c
-    src/sdcard.c
-    src/uf2_image.c
-    src/ui.c
-    src/usb_descriptors.c
-    src/usb_drive.c
-    lib/fatfs/ff.c
-    lib/fatfs/ffunicode.c
-)
-
-target_include_directories(${LOADER_NAME} PRIVATE
-    src
-    lib/fatfs
-    ${CMAKE_CURRENT_LIST_DIR}/../common
-)
-
-target_compile_definitions(${LOADER_NAME} PRIVATE
-    PICOMULTILOADER_WIFI=${LOADER_WIFI}
-    PICO_STDIO_UART=1
-    PICO_PRINTF_SUPPORT_FLOAT=0
-    PICO_PRINTF_SUPPORT_EXPONENTIAL=0
-    # The heap is only ~10 KB: a failed malloc must return NULL (callers handle it), not panic.
-    PICO_MALLOC_PANIC=0
-)
-
-target_compile_options(${LOADER_NAME} PRIVATE -Wall -Wno-unused-function)
-
-target_link_libraries(${LOADER_NAME}
-    pico_stdlib
-    pico_unique_id
-    hardware_spi
-    hardware_i2c
-    hardware_dma
-    hardware_flash
-    hardware_watchdog
-    tinyusb_device
-    tinyusb_board
-    boot_uf2_headers
-)
 
 if (LOADER_WIFI)
     # The browser page is compiled in as a C string.
@@ -106,14 +67,7 @@ if (LOADER_WIFI)
         COMMAND ${CMAKE_COMMAND} -DIN=${INDEX_HTML} -DOUT=${INDEX_H} -P ${CMAKE_CURRENT_LIST_DIR}/embed.cmake
         DEPENDS ${INDEX_HTML} ${CMAKE_CURRENT_LIST_DIR}/embed.cmake
     )
-    target_sources(${LOADER_NAME} PRIVATE src/webserver.c src/dhcpserver.c ${INDEX_H})
-    target_include_directories(${LOADER_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
-    target_compile_definitions(${LOADER_NAME} PRIVATE CYW43_HOST_NAME="picocalc")
-    target_link_libraries(${LOADER_NAME}
-        pico_cyw43_arch_lwip_poll
-        pico_lwip_mdns
-        pico_rand
-    )
+    add_custom_target(index_html DEPENDS ${INDEX_H})
 endif()
 
 if (PICO_PLATFORM MATCHES "rp2040")
@@ -129,17 +83,133 @@ if (PICO_PLATFORM MATCHES "rp2040")
         message(FATAL_ERROR "Could not place .boot2 in memmap_default.ld")
     endif()
     file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/memmap_pml.ld "${memmap}")
-    pico_set_linker_script(${LOADER_NAME} ${CMAKE_CURRENT_BINARY_DIR}/memmap_pml.ld)
 
     # Our boot2 enters the loader rather than the app
     pico_define_boot_stage2(pml_boot2 ${CMAKE_CURRENT_LIST_DIR}/boot/boot2_pml.S)
     target_include_directories(pml_boot2 PRIVATE ${PICO_SDK_PATH}/src/rp2040/boot_stage2)
     target_compile_definitions(pml_boot2 PRIVATE PML_LOADER_BASE=${LOADER_BASE})
-    pico_set_boot_stage2(${LOADER_NAME} pml_boot2)
 else()
-    # The loader runs from RAM; the boot stub loads it from the SD card.
-    pico_set_binary_type(${LOADER_NAME} no_flash)
+    # Resources in flash: the Wi-Fi firmware and the web page are linked into the last 256 KB of
+    # flash instead of RAM. The section isn't loaded (INFO); add_res.py appends it to the .uf2 as
+    # blocks the stub skips, and the loader copies them into flash (uf2_image.c).
+    set(RES_BASE 0x103C0000) # the last 256 KB of the Pico 2 W's 4 MB
+    file(READ ${PICO_SDK_PATH}/src/rp2_common/pico_crt0/rp2350/memmap_no_flash.ld memmap)
+    string(REPLACE "SCRATCH_Y(rwx) : ORIGIN = 0x20081000, LENGTH = 4k"
+        "SCRATCH_Y(rwx) : ORIGIN = 0x20081000, LENGTH = 4k\n    PMLRES(r) : ORIGIN = ${RES_BASE}, LENGTH = 256k"
+        memmap "${memmap}")
+    string(REPLACE "SECTIONS\n{"
+        "SECTIONS\n{\n    .pml_res (INFO) : { KEEP(*(.pml_res.0hdr)) KEEP(*(.pml_res*)) } > PMLRES\n"
+        memmap "${memmap}")
+    if (NOT memmap MATCHES "PMLRES[(]r[)]" OR NOT memmap MATCHES "> PMLRES")
+        message(FATAL_ERROR "Could not add the resource section to memmap_no_flash.ld")
+    endif()
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/memmap_pml.ld "${memmap}")
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+endif()
 
+# The menus and the drivers they share with the ESP32-P4 build; src/ has this platform's side (plat.h)
+set(PML ${CMAKE_CURRENT_LIST_DIR}/../common/pml)
+
+foreach(LOADER ${LOADER_NAME} ${LOADER_CLASSIC})
+    if (LOADER STREQUAL LOADER_CLASSIC)
+        set(UI_SOURCES ${PML}/ui_classic.c)
+        set(UI_CLASSIC 1)
+    else()
+        set(UI_SOURCES ${PML}/ui.c ${PML}/apps.c ${PML}/look.c ${PML}/shell.c ${PML}/viewer.c)
+        set(UI_CLASSIC 0)
+    endif()
+    add_executable(${LOADER}
+        src/main.c
+        src/kbd_bus.c
+        src/lcd_bus.c
+        ${PML}/clock.c
+        ${PML}/config.c
+        ${PML}/fileops.c
+        ${PML}/keyboard.c
+        ${PML}/lcd.c
+        src/sdcard.c
+        src/uf2_image.c
+        src/usb_descriptors.c
+        src/usb_drive.c
+        lib/fatfs/ff.c
+        lib/fatfs/ffunicode.c
+        ${UI_SOURCES}
+    )
+
+    target_include_directories(${LOADER} PRIVATE
+        src
+        lib/fatfs
+        ${PML}
+        ${CMAKE_CURRENT_LIST_DIR}/../common
+    )
+
+    target_compile_definitions(${LOADER} PRIVATE
+        PICOMULTILOADER_WIFI=${LOADER_WIFI}
+        PML_UI_CLASSIC=${UI_CLASSIC}
+        PML_LOADER_FILE="/${LOADER}.uf2"
+        PICO_STDIO_UART=1
+        PICO_PRINTF_SUPPORT_FLOAT=0
+        PICO_PRINTF_SUPPORT_EXPONENTIAL=0
+        # The heap is small: a failed malloc must return NULL (callers handle it), not panic.
+        PICO_MALLOC_PANIC=0
+    )
+
+    target_compile_options(${LOADER} PRIVATE -Wall -Wno-unused-function)
+
+    target_link_libraries(${LOADER}
+        pico_stdlib
+        pico_unique_id
+        hardware_spi
+        hardware_i2c
+        hardware_dma
+        hardware_flash
+        hardware_watchdog
+        tinyusb_device
+        tinyusb_board
+        boot_uf2_headers
+    )
+
+    if (LOADER_WIFI)
+        target_sources(${LOADER} PRIVATE src/webserver.c src/dhcpserver.c src/timesync.c)
+        add_dependencies(${LOADER} index_html)
+        target_include_directories(${LOADER} PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+        target_compile_definitions(${LOADER} PRIVATE CYW43_HOST_NAME="picocalc")
+        target_link_libraries(${LOADER}
+            pico_cyw43_arch_lwip_poll
+            pico_lwip_mdns
+            pico_rand
+        )
+    endif()
+
+    pico_set_linker_script(${LOADER} ${CMAKE_CURRENT_BINARY_DIR}/memmap_pml.ld)
+    if (PICO_PLATFORM MATCHES "rp2040")
+        pico_set_boot_stage2(${LOADER} pml_boot2)
+    else()
+        # The loader runs from RAM; the boot stub loads it from the SD card.
+        pico_set_binary_type(${LOADER} no_flash)
+        target_compile_definitions(${LOADER} PRIVATE
+            PML_RES_BASE=${RES_BASE}
+            "PML_RES_ATTR=__attribute__((section(\".pml_res.data\"),aligned(4)))"
+            "CYW43_RESOURCE_ATTRIBUTE=__attribute__((section(\".pml_res.fw\"),aligned(4)))")
+    endif()
+
+    pico_enable_stdio_uart(${LOADER} 1)
+    pico_enable_stdio_usb(${LOADER} 0)
+    target_link_options(${LOADER} PRIVATE -Wl,--print-memory-usage)
+    pico_add_extra_outputs(${LOADER})
+    if (NOT PICO_PLATFORM MATCHES "rp2040")
+        # after pico_add_extra_outputs' own POST_BUILD steps, which write the .uf2
+        set(RES_BIN ${CMAKE_CURRENT_BINARY_DIR}/${LOADER}_res.bin)
+        add_custom_command(TARGET ${LOADER} POST_BUILD
+            COMMAND ${CMAKE_OBJCOPY} --dump-section .pml_res=${RES_BIN} $<TARGET_FILE:${LOADER}>
+                ${CMAKE_CURRENT_BINARY_DIR}/${LOADER}_res_dump.elf
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/add_res.py ${RES_BIN} ${RES_BASE}
+                $<TARGET_FILE_DIR:${LOADER}>/${LOADER}.uf2
+            VERBATIM)
+    endif()
+endforeach()
+
+if (NOT PICO_PLATFORM MATCHES "rp2040")
     # Boot stub: the first 8 KB of flash. Its RAM is the scratch banks, so it can load the loader
     # into main RAM.
     set(STUB_NAME PicoMultiLoader-rp2350)
@@ -201,8 +271,3 @@ else()
             $<TARGET_FILE_DIR:${STUB_NAME}>/${STUB_NAME}.bin $<TARGET_FILE_DIR:${STUB_NAME}>/${STUB_NAME}.uf2
         VERBATIM)
 endif()
-
-pico_enable_stdio_uart(${LOADER_NAME} 1)
-pico_enable_stdio_usb(${LOADER_NAME} 0)
-target_link_options(${LOADER_NAME} PRIVATE -Wl,--print-memory-usage)
-pico_add_extra_outputs(${LOADER_NAME})

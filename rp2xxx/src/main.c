@@ -5,7 +5,7 @@
  * menu when Up, F1 or F5 is held, an app asked for it, or no app is installed.
  *
  * The serial console (PicoCalc USB-C, UART0) works as a second keyboard: arrows, PgUp/PgDn, Enter,
- * Backspace, Esc, F1, F4, F5.
+ * Backspace, Esc, F1-F5 and typing (the terminal, F5).
  */
 #include <stdio.h>
 #include "pico/stdlib.h"
@@ -22,7 +22,6 @@
 #define POLL_US          20000
 #define BATTERY_EVERY_US (10 * 1000 * 1000)
 #define REPROBE_EVERY_US (1000 * 1000)
-#define BACKLIGHT        200
 
 // Read one console byte if one is waiting, else -1.
 static int console_getc(void)
@@ -58,6 +57,10 @@ static int console_key(void)
     case 0x10: // Ctrl+P: dump the screen for screenshots
         lcd_dump();
         return KEY_NONE;
+    case KEY_CTRL_C:
+    case KEY_CTRL_V:
+    case KEY_CTRL_X:
+        return c;
     default:
         return c >= 0x20 && c < 0x7F ? c : KEY_NONE; // typed text (Wi-Fi settings)
     }
@@ -76,6 +79,7 @@ static int console_key(void)
     case 'F': return KEY_END;
     case 'P': return KEY_F1;
     case 'Q': return KEY_F2;
+    case 'R': return KEY_F3;
     case 'S': return KEY_F4; // ESC O S
     case 'T': return KEY_F5; // ESC O T (some terminals)
     default:
@@ -98,6 +102,7 @@ static int console_key(void)
     case 6: return KEY_PAGE_DOWN;
     case 11: return KEY_F1;
     case 12: return KEY_F2;
+    case 13: return KEY_F3;
     case 14: return KEY_F4;
     case 15: return KEY_F5;
     default: return KEY_NONE;
@@ -123,15 +128,21 @@ int main(void)
     if (!lcd_init()) {
         printf("loader: LCD init failed\n");
     }
-    if (kbd_init()) {
-        kbd_set_lcd_backlight(BACKLIGHT);
+    ui_boot(sd_ok);
+    bool kbd_ok = kbd_init();
+    if (kbd_ok) {
+        kbd_set_lcd_backlight(ui_backlight());
     } else {
         printf("loader: no keyboard - is the PicoCalc switched on? Serial input still works.\n");
     }
-    ui_init(sd_ok);
-    update_battery();
+    ui_boot_check("Keyboard", kbd_ok ? "OK" : "missing", kbd_ok);
     bool charging = false;
     int battery = kbd_battery(&charging);
+    char pct[20];
+    snprintf(pct, sizeof(pct), battery < 0 ? "unknown" : charging ? "%d%% charging" : "%d%%", battery);
+    ui_boot_check("Battery", pct, battery >= 0);
+    ui_init(sd_ok);
+    update_battery();
     printf("loader: ready: SD %s, keyboard %s, battery %d%%%s\n", sd_ok ? "mounted" : "missing",
            kbd_present() ? "found" : "missing", battery, charging ? " (charging)" : "");
 
@@ -146,6 +157,15 @@ int main(void)
 #endif
         uint64_t now = time_us_64();
         if (now < next_poll) {
+            // Nothing to do before the next keyboard poll: sleep (WFE) rather than spin, unless the
+            // USB drive needs tud_task() all the time. Wi-Fi traffic wakes it at once.
+            if (usbdrive_state() == USBDRIVE_OFF) {
+#if PICOMULTILOADER_WIFI
+                webserver_wait_until(next_poll);
+#else
+                sleep_until(from_us_since_boot(next_poll));
+#endif
+            }
             continue;
         }
         next_poll = now + POLL_US;
@@ -161,7 +181,7 @@ int main(void)
             if (kbd_init()) {
                 printf("loader: keyboard found\n");
                 lcd_init();
-                kbd_set_lcd_backlight(BACKLIGHT);
+                kbd_set_lcd_backlight(ui_backlight());
                 ui_redraw();
                 update_battery();
             }
