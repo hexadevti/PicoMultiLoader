@@ -115,7 +115,7 @@ foreach(LOADER ${LOADER_NAME} ${LOADER_CLASSIC})
         set(UI_SOURCES ${PML}/ui_classic.c)
         set(UI_CLASSIC 1)
     else()
-        set(UI_SOURCES ${PML}/ui.c ${PML}/apps.c ${PML}/look.c ${PML}/shell.c ${PML}/viewer.c)
+        set(UI_SOURCES ${PML}/ui.c ${PML}/apps.c ${PML}/look.c ${PML}/shell.c ${PML}/viewer.c ${PML}/editor.c)
         set(UI_CLASSIC 0)
     endif()
     add_executable(${LOADER}

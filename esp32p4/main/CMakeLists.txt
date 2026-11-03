@@ -6,7 +6,7 @@ idf_component_register(SRCS "main.c" "ui_dispatch.c" "kbd_bus.c" "lcd_bus.c" "sd
                             "image_flash.c" "usb_drive.c" "webserver.c" "timesync.c"
                             "${PML}/apps.c" "${PML}/clock.c" "${PML}/config.c" "${PML}/fileops.c"
                             "${PML}/keyboard.c" "${PML}/lcd.c" "${PML}/look.c" "${PML}/shell.c"
-                            "${PML}/ui.c" "${PML}/ui_classic.c" "${PML}/viewer.c"
+                            "${PML}/ui.c" "${PML}/ui_classic.c" "${PML}/viewer.c" "${PML}/editor.c"
                     INCLUDE_DIRS "." "../../common" "${PML}"
                     EMBED_TXTFILES "../../common/web/index.html"
                     REQUIRES app_update bootloader_support esp_app_format esp_partition

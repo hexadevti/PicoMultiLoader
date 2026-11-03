@@ -10,6 +10,7 @@
 #include "apps.h"
 #include "clock.h"
 #include "config.h"
+#include "editor.h"
 #include "fileops.h"
 #include "keyboard.h"
 #include "lcd.h"
@@ -60,11 +61,13 @@ typedef enum {
     SCREEN_PICK,      // choose the start folder (from Setup)
     SCREEN_FILES,     // Tab: copy / move / delete / paste
     SCREEN_DELETE,    // confirm a delete
+    SCREEN_OPEN_WITH, // a file with no viewer: open it in the text editor or the image viewer?
     SCREEN_RES,       // RP2350: confirm installing the Wi-Fi files over an app's data
     SCREEN_CTL,       // F1: the control center (Wi-Fi, USB drive, backlight, theme, battery)
     SCREEN_TERM,      // F5: the terminal
     SCREEN_TEXT,      // the text reader (.txt, .md, ...)
     SCREEN_IMAGE,     // the BMP viewer
+    SCREEN_EDIT,      // the text editor (Home > Tools, E in the reader, Tab > Edit in Files)
 } screen_t;
 
 
@@ -403,7 +406,7 @@ static void draw_header(void)
     lcd_hline(MARGIN - 4, PATH_Y + 16, LCD_W - 2 * (MARGIN - 4), C_LINE);
 }
 
-static const char *const KEY_NAMES[] = {"Enter", "Esc", "Left", "Del", "Tab", "R", "Spc", "^C", "^V", "^X",
+static const char *const KEY_NAMES[] = {"Enter", "Esc", "Left", "Del", "Tab", "E", "N", "R", "Spc", "^C", "^V", "^X",
                                         "Up/Down", "Left/Right", "PgUp/PgDn", "Home/End"};
 
 // `keys` is "Enter Open  F1 Control  Esc Back": items two spaces apart, each a key and what it does.
@@ -1309,8 +1312,9 @@ static const char *const HELP_TEXT[] = {
     "",
     "#Home",
     "The apps on the card: each folder in the root with an app.ini or a " PML_APP_EXT " in it, and each " PML_APP_EXT " in the root.",
-    "Arrows, PgUp/PgDn, Home/End: move. Tab: next tab (Favourites, Recent, All). It opens on the app run last.",
+    "Arrows, PgUp/PgDn, Home/End: move. Tab: next tab (Favourites, Recent, All, Tools). It opens on the app run last.",
     "Type to search all the apps; Backspace deletes, Esc clears.",
+    "Tools: the text editor, the image viewer, Files and the terminal, built into the loader.",
     "Enter: run the app. The installed one (green dot) starts at once; any other is flashed first.",
     "F2: add to or remove from Favourites (yellow star). F3: Files.",
 #if PICOMULTILOADER_WIFI
@@ -1331,7 +1335,7 @@ static const char *const HELP_TEXT[] = {
     "flashes and runs it (or just runs it if it is installed; R reflashes).",
     "Backspace or Left: parent folder; at the top, back to Home. Esc or F3: Home.",
     "Folders, " PML_APP_EXT " files and files the viewers open are listed; Tab > Show all files lists every file. The last "
-    "folder and file are remembered.",
+    "folder and file are remembered. Enter on a file with no viewer (.json, .cfg...) offers to open it in the text editor or the image viewer.",
     "",
     "#Text reader and image viewer",
     "Enter on a .txt, .md, .log, .ini, .csv, .py or .bas file reads it in pages: Up/Down or PgUp/PgDn turn them, "
@@ -1340,6 +1344,21 @@ static const char *const HELP_TEXT[] = {
     "Pictures with up to 16 colours are shown as they are; others are dithered. G: grey. Left/Right: the previous "
     "or next picture in the folder. Esc: back.",
     "In the terminal, view <file> opens them too.",
+    "",
+    "#Text editor",
+    "Home > Tools > Text editor opens the file edited last, E in the text reader edits the file shown, and Tab > Edit "
+    "in Files edits the selected one.",
+    "Arrows move; Home/End: start/end of the line; PgUp/PgDn: a screen. Enter keeps the indentation; Tab adds spaces "
+    "to the next 4-column stop. Ctrl+X / Ctrl+C cut / copy the line (again: add the next), Ctrl+V pastes above the cursor.",
+    "F2 or Ctrl+S: save. F7 (Shift+F2): save as. F3 or Ctrl+O: open. Ctrl+N: new. F4 or Ctrl+F: find, F5: find the next. "
+    "Ctrl+G: go to a line (0: the end). Esc: close; it asks about unsaved changes.",
+#if PML_RP2040
+    "Files keep their line ends (LF or CRLF). The editor holds files up to 31 KB.",
+#elif PML_P4
+    "Files keep their line ends (LF or CRLF). The editor holds files up to 511 KB.",
+#else
+    "Files keep their line ends (LF or CRLF). The editor holds files up to 95 KB.",
+#endif
     "",
     "#Copy, move and delete (Tab)",
     "Space marks or unmarks the selected item and moves on; Copy, Cut and Delete act on the marked items, or on the "
@@ -2202,8 +2221,8 @@ static void rescan_dir(void)
 }
 
 // ---- copy / move / delete (Tab) ---------------------------------------------------------------
-enum { FA_COPY, FA_CUT, FA_PASTE, FA_DELETE, FA_FORGET, FA_SHOW_ALL };
-static int s_fa_items[6], s_fa_count, s_fa_sel;
+enum { FA_EDIT, FA_COPY, FA_CUT, FA_PASTE, FA_DELETE, FA_FORGET, FA_SHOW_ALL };
+static int s_fa_items[7], s_fa_count, s_fa_sel;
 static char s_fa_path[PATH_MAX_LEN + 64]; // the first item the delete screen is about
 static bool s_fa_is_dir;
 static int s_del_n;                       // how many items it is about
@@ -2330,6 +2349,52 @@ static void draw_delete(void)
                      C_FG);
     }
     draw_footer(NULL, C_FG, "Enter Delete  Esc Cancel");
+}
+
+// A file with no viewer (.json, .cfg, a picture under another name...): open it with a tool. The
+// first bytes pick the one suggested: "BM" is a picture; a zero byte warns that it isn't text.
+enum { OW_EDIT, OW_IMAGE, OW_COUNT };
+static int s_ow_sel;
+static bool s_ow_binary;
+
+static void open_with(void)
+{
+    bool bmp = false;
+    s_ow_binary = false;
+    FIL *f = malloc(sizeof(FIL));
+    char *buf = malloc(512);
+    UINT n = 0;
+    if (f && buf && f_open(f, s_sel_path, FA_READ) == FR_OK) {
+        if (f_read(f, buf, 512, &n) == FR_OK) {
+            s_ow_binary = memchr(buf, '\0', n) != NULL;
+            bmp = n >= 2 && buf[0] == 'B' && buf[1] == 'M';
+        }
+        f_close(f);
+    }
+    free(buf);
+    free(f);
+    s_ow_sel = bmp ? OW_IMAGE : OW_EDIT;
+    s_screen = SCREEN_OPEN_WITH;
+}
+
+static void draw_open_with(void)
+{
+    draw_dialog(150);
+    int y = LIST_Y + 4;
+    lcd_text(MARGIN, y, "No viewer for this file", C_ACCENT, FONT_LARGE);
+    y += 2 * ROW_H;
+    draw_kv(y, "File", s_sel_name);
+    y += 2 * ROW_H;
+    draw_option(y, "Open in the text editor", s_ow_sel == OW_EDIT);
+    y += WF_ROW_H;
+    draw_option(y, "Open in the image viewer", s_ow_sel == OW_IMAGE);
+    y += WF_ROW_H + 6;
+    if (s_ow_sel == OW_IMAGE) {
+        draw_wrapped(y, "The image viewer shows BMP pictures.", C_DIM);
+    } else if (s_ow_binary) {
+        draw_wrapped(y, "It looks like a binary file: editing it as text may damage it.", C_WARN);
+    }
+    draw_footer(NULL, C_FG, "Up/Down Choose  Enter Open  Esc Cancel");
 }
 
 static void do_delete(void)
@@ -2522,7 +2587,11 @@ static void enter_files(void)
 {
     int it = 0;
     bool any = target(&it) != NULL;
+    entry_t *e = !marked_count() && item_count() ? item_entry(s_sel) : NULL;
     s_fa_count = 0;
+    if (e && !e->is_dir && !has_uf2_ext(e->name) && view_kind(e->name) != VIEW_IMAGE) {
+        s_fa_items[s_fa_count++] = FA_EDIT;
+    }
     if (any) {
         s_fa_items[s_fa_count++] = FA_COPY;
         s_fa_items[s_fa_count++] = FA_CUT;
@@ -2560,6 +2629,9 @@ static void draw_files(void)
     for (int i = 0; i < s_fa_count; i++, y += WF_ROW_H) {
         char label[COLS + 1];
         switch (s_fa_items[i]) {
+        case FA_EDIT:
+            strlcpy(buf, "Edit in the text editor", sizeof(buf));
+            break;
         case FA_COPY:
             strlcpy(buf, "Copy  (Ctrl+C)", sizeof(buf));
             break;
@@ -2592,6 +2664,17 @@ static void draw_files(void)
     draw_footer(NULL, C_FG, "Up/Down Move  Enter Select  Esc Back");
 }
 
+static void edit_open(const char *path);
+
+// Tab > Edit: the selected file in the text editor.
+static void edit_selected(void)
+{
+    entry_t *e = item_entry(s_sel);
+    snprintf(s_sel_path, sizeof(s_sel_path), "%s/%s", s_cwd, e->name);
+    strlcpy(s_sel_name, e->name, sizeof(s_sel_name));
+    edit_open(s_sel_path);
+}
+
 static bool files_key(int key)
 {
     switch (key) {
@@ -2615,6 +2698,9 @@ static bool files_key(int key)
     }
     s_screen = SCREEN_BROWSE;
     switch (s_fa_items[s_fa_sel]) {
+    case FA_EDIT:
+        edit_selected();
+        break;
     case FA_COPY:
         mark(false);
         break;
@@ -2638,7 +2724,7 @@ static bool files_key(int key)
 }
 
 // ---- Home: the apps ---------------------------------------------------------------------------
-enum { TAB_FAVS, TAB_RECENT, TAB_ALL, TABS };
+enum { TAB_FAVS, TAB_RECENT, TAB_ALL, TAB_TOOLS, TABS };
 #define TAB_Y      (BAR_H + 4)
 #define GRID_Y     40
 #define GRID_COLS  4
@@ -2649,6 +2735,17 @@ enum { TAB_FAVS, TAB_RECENT, TAB_ALL, TABS };
 #define RUN_KEY    "run_path" // "size.date.time|path" of the .uf2 flashed last, to know it is installed
 
 #define HOME_BACK  0xFF               // in s_shown: the Back tile of a folder
+#define HOME_TOOL  0xF0               // in s_shown: HOME_TOOL + TOOL_..., a tile on the Tools tab
+
+// The Tools tab: what is built into the loader
+enum { TOOL_EDITOR, TOOL_IMAGE, TOOL_FILES, TOOL_TERM, TOOLS };
+static const char *const TOOL_NAMES[TOOLS] = {"Text editor", "Image viewer", "Files", "Terminal"};
+static const char *const TOOL_DESCS[TOOLS] = {
+    "Write and change text files on the card",
+    "BMP pictures on the card, Left/Right for the next",
+    "Browse, copy, move and delete files (F3)",
+    "Commands for the card and the apps (F5)",
+};
 
 static uint8_t s_shown[APPS_MAX + 1]; // the apps on the tab (indexes into s_apps.list), in order
 static int s_tab, s_hsel, s_htop;     // s_htop: the first grid row shown
@@ -2693,7 +2790,7 @@ static bool is_installed(const char *path)
 
 static const char *tab_name(int tab)
 {
-    return tab == TAB_ALL ? "All" : tab == TAB_RECENT ? "Recent" : "Favourites";
+    return tab == TAB_TOOLS ? "Tools" : tab == TAB_ALL ? "All" : tab == TAB_RECENT ? "Recent" : "Favourites";
 }
 
 static bool contains(const char *s, const char *part) // ignoring case
@@ -2720,6 +2817,8 @@ static bool on_tab(const app_t *e)
         return !(e->flags & APP_EXTRA);
     case TAB_RECENT:
         return e->recent >= 0;
+    case TAB_TOOLS:
+        return false;
     default:
         return e->flags & APP_FAV;
     }
@@ -2727,7 +2826,14 @@ static bool on_tab(const app_t *e)
 
 static int home_index(void) // the selected app in s_apps.list, -1 = none (or the Back tile)
 {
-    return s_hsel < s_shown_n && s_shown[s_hsel] != HOME_BACK ? s_shown[s_hsel] : -1;
+    return s_hsel < s_shown_n && s_shown[s_hsel] < HOME_TOOL ? s_shown[s_hsel] : -1;
+}
+
+static int home_tool(void) // the selected tool, -1 = none
+{
+    return s_hsel < s_shown_n && s_shown[s_hsel] >= HOME_TOOL && s_shown[s_hsel] < HOME_TOOL + TOOLS
+               ? s_shown[s_hsel] - HOME_TOOL
+               : -1;
 }
 
 static bool home_on_back(void)
@@ -2741,6 +2847,11 @@ static void home_build(int keep)
     s_shown_n = 0;
     if (s_hdir[0] && !s_filter[0]) {
         s_shown[s_shown_n++] = HOME_BACK;
+    }
+    if (s_tab == TAB_TOOLS && !s_filter[0] && !s_hdir[0]) {
+        for (int t = 0; t < TOOLS; t++) {
+            s_shown[s_shown_n++] = (uint8_t)(HOME_TOOL + t);
+        }
     }
     for (int i = 0; i < s_apps.count; i++) {
         if (on_tab(&s_apps.list[i])) {
@@ -2812,7 +2923,7 @@ static void go_home(void)
 static void home_select(const char *path)
 {
     for (int i = 0; i < s_shown_n; i++) {
-        if (s_shown[i] != HOME_BACK && strcasecmp(apps_str(&s_apps, s_apps.list[s_shown[i]].path), path) == 0) {
+        if (s_shown[i] < HOME_TOOL && strcasecmp(apps_str(&s_apps, s_apps.list[s_shown[i]].path), path) == 0) {
             s_hsel = i;
             return;
         }
@@ -2865,6 +2976,52 @@ static void draw_back_icon(int x, int y)
         lcd_fill_rect(x + 8 + i, y + 18 - i, 1, 2 * i + 1, C_BRIGHT);
     }
     lcd_fill_rect(x + 14, y + 17, 11, 3, C_BRIGHT);
+}
+
+// The Tools tab's icons, 32x32 like the apps', in the theme's colours.
+static void draw_tool_icon(int tool, int x, int y)
+{
+    switch (tool) {
+    case TOOL_EDITOR: // a page of text with a pencil across it
+        lcd_fill_rect(x + 5, y + 3, 20, 26, C_FIELD);
+        look_frame(x + 5, y + 3, 20, 26, C_LINE);
+        for (int i = 0; i < 5; i++) {
+            lcd_fill_rect(x + 8, y + 7 + 4 * i, i % 2 ? 10 : 14, 2, C_DIM);
+        }
+        for (int i = 0; i < 12; i++) { // the pencil: lead, wood, then the body up to the rubber
+            lcd_fill_rect(x + 14 + i, y + 26 - i, 3, 3, i < 1 ? C_FG : i < 3 ? C_WARN : i < 10 ? C_ACCENT : C_ERR);
+        }
+        break;
+    case TOOL_IMAGE: // a picture: hills under a sun
+        lcd_fill_rect(x + 2, y + 4, 28, 24, C_ACCDK);
+        look_frame(x + 2, y + 4, 28, 24, C_LINE);
+        lcd_fill_rect(x + 21, y + 8, 5, 5, C_WARN);
+        for (int i = 0; i < 9; i++) {
+            int r = x + 22 + i > x + 28 ? x + 28 : x + 22 + i;
+            lcd_fill_rect(x + 22 - i, y + 18 + i, r - (x + 22 - i) + 1, 1, C_ACC2);
+        }
+        for (int i = 0; i < 13; i++) {
+            int l = x + 11 - i < x + 3 ? x + 3 : x + 11 - i;
+            lcd_fill_rect(l, y + 14 + i, x + 11 + i - l + 1, 1, C_OK);
+        }
+        break;
+    case TOOL_FILES: // a folder with a list in it
+        lcd_fill_rect(x + 2, y + 6, 12, 4, C_ACCENT);
+        lcd_fill_rect(x + 2, y + 9, 28, 19, C_ACCDK);
+        look_frame(x + 2, y + 9, 28, 19, C_ACCENT);
+        for (int i = 0; i < 3; i++) {
+            lcd_fill_rect(x + 7, y + 13 + 5 * i, 2, 2, C_WARN);
+            lcd_fill_rect(x + 11, y + 13 + 5 * i, i == 1 ? 10 : 14, 2, C_BRIGHT);
+        }
+        break;
+    default: // a terminal window with a prompt
+        lcd_fill_rect(x + 2, y + 4, 28, 24, C_BG);
+        look_frame(x + 2, y + 4, 28, 24, C_LINE);
+        lcd_fill_rect(x + 3, y + 5, 26, 4, C_ACC2);
+        lcd_text(x + 6, y + 12, ">", C_OK, FONT_LARGE);
+        lcd_fill_rect(x + 14, y + 22, 7, 2, C_OK);
+        break;
+    }
 }
 
 // Show the file list in s_cwd, with the file flashed last selected if it is there.
@@ -2968,6 +3125,12 @@ static void draw_home(void)
             lcd_text(cx + (CELL_W - 6 * 4) / 2, cy + 41, "Back", sel ? C_BRIGHT : C_FG, FONT_SMALL);
             continue;
         }
+        if (idx >= HOME_TOOL) {
+            const char *name = TOOL_NAMES[idx - HOME_TOOL];
+            draw_tool_icon(idx - HOME_TOOL, cx + (CELL_W - 32) / 2, cy + 5);
+            lcd_text(cx + (CELL_W - 6 * (int)strlen(name)) / 2, cy + 41, name, sel ? C_BRIGHT : C_FG, FONT_SMALL);
+            continue;
+        }
         const app_t *e = &s_apps.list[idx];
         apps_draw_icon(&s_apps, e, cx + (CELL_W - 32) / 2, cy + 5);
         if (e->flags & APP_FAV) {
@@ -2992,6 +3155,8 @@ static void draw_home(void)
     if (s_note[0]) {
         strlcpy(buf, s_note, sizeof(buf));
         color = s_note_color;
+    } else if (home_tool() >= 0) {
+        strlcpy(buf, TOOL_DESCS[home_tool()], sizeof(buf));
     } else if (home_on_back()) {
         if (strcasecmp(s_hdir, s_hentry) == 0) {
             snprintf(buf, sizeof(buf), "Enter goes back to %s", tab_name(s_tab));
@@ -3044,6 +3209,10 @@ static void run_installed(void)
     uf2_boot_installed();
 }
 
+static void enter_term(void);
+static void edit_last(void);
+static void image_tool(void);
+
 static void home_open(void)
 {
     if (!s_sd_ok) {
@@ -3052,6 +3221,20 @@ static void home_open(void)
     }
     if (home_on_back()) {
         home_up();
+        return;
+    }
+    switch (home_tool()) {
+    case TOOL_EDITOR:
+        edit_last();
+        return;
+    case TOOL_IMAGE:
+        image_tool();
+        return;
+    case TOOL_FILES:
+        go_files();
+        return;
+    case TOOL_TERM:
+        enter_term();
         return;
     }
     int idx = home_index();
@@ -3789,6 +3972,38 @@ static screen_t s_view_from; // where Esc goes back to
 static bool s_image_drawn;   // the image is on screen (redraws would decode it again)
 static bool s_image_grey;
 
+#define IMAGE_LAST "image_last" // the picture shown last, opened by Home > Tools > Image viewer
+
+// Show s_sel_path in the image viewer (whatever its name: the viewer checks it is a BMP).
+static void show_image(screen_t from)
+{
+    s_view_from = from;
+    s_image_drawn = false;
+    s_screen = SCREEN_IMAGE;
+    save_setting(IMAGE_LAST, s_sel_path);
+}
+
+// Home > Tools > Image viewer: the picture shown last, from its folder in Files (Left/Right go
+// through the others there, Esc to the list); no picture yet: Files, to pick one.
+static void image_tool(void)
+{
+    char path[PATH_MAX_LEN];
+    FILINFO fi;
+    char *name;
+    if (!load_setting(IMAGE_LAST, path, sizeof(path)) || f_stat(path, &fi) != FR_OK || !(name = strrchr(path, '/'))) {
+        go_files();
+        note(C_DIM, "%s", "Pick a .bmp picture: Enter shows it.");
+        return;
+    }
+    *name++ = '\0';
+    strlcpy(s_cwd, path, sizeof(s_cwd));
+    go_files();
+    select_name(name);
+    snprintf(s_sel_path, sizeof(s_sel_path), "%s/%s", s_cwd, name);
+    strlcpy(s_sel_name, name, sizeof(s_sel_name));
+    show_image(SCREEN_BROWSE);
+}
+
 // Open s_sel_path in its viewer. False if there is none for it.
 static bool open_viewer(screen_t from)
 {
@@ -3798,8 +4013,7 @@ static bool open_viewer(screen_t from)
     }
     s_view_from = from;
     if (kind == VIEW_IMAGE) {
-        s_image_drawn = false;
-        s_screen = SCREEN_IMAGE;
+        show_image(from);
         return true;
     }
     char err[64];
@@ -3835,7 +4049,7 @@ static void draw_text(void)
     } else {
         snprintf(line, sizeof(line), "Page %d  %d%%", text_page() + 1, text_percent());
     }
-    draw_footer(line, C_DIM, "Up/Down Page  Home/End  Esc Close");
+    draw_footer(line, C_DIM, "Up/Down Page  Home/End  E Edit  Esc Close");
 }
 
 static bool text_key(int key)
@@ -3857,6 +4071,11 @@ static bool text_key(int key)
         draw_footer("Finding the end...", C_DIM, "");
         lcd_flush();
         text_end();
+        return true;
+    case 'e':
+    case 'E':
+        close_viewer();
+        edit_open(s_sel_path);
         return true;
     case KEY_ESC:
     case KEY_BACKSPACE:
@@ -3932,6 +4151,302 @@ static bool image_key(int key)
         return true;
     default:
         return false;
+    }
+}
+
+// ---- text editor ------------------------------------------------------------------------------
+// editor.c edits; this is the screen around it: the file's name, the text, and in the footer the
+// status line, a prompt (save as, open, find, go to line) or the question about unsaved changes.
+#define KEY_CTRL(c) ((c) & 0x1F)
+#define ED_LAST     "edit_last" // the file edited last, opened by Home > Tools > Text editor
+
+typedef enum { EP_NONE, EP_SAVE_AS, EP_OPEN, EP_FIND, EP_LINE } ed_prompt_t;
+typedef enum { ET_NONE, ET_CLOSE, ET_NEW, ET_OPEN } ed_then_t; // what waits for the unsaved changes
+
+static ed_prompt_t s_ed_prompt;
+static ed_then_t s_ed_then;
+static bool s_ed_ask;              // asking: save the changes first?
+static bool s_ed_saved;            // a file was saved: the file list needs reading again
+static char s_ed_in[PATH_MAX_LEN]; // what is typed at the prompt
+static char s_ed_find[64];
+
+static void edit_fail(const char *what, const char *err)
+{
+    char msg[sizeof(s_toast)];
+    snprintf(msg, sizeof(msg), "%s: %s", what, err);
+    toast(msg);
+}
+
+// Edit `path`; a new text if it is "" or can't be opened (a toast says why).
+static void edit_open(const char *path)
+{
+    char err[64];
+    s_ed_prompt = EP_NONE;
+    s_ed_then = ET_NONE;
+    s_ed_ask = false;
+    s_screen = SCREEN_EDIT;
+    if (path[0] && ed_open(path, TEXT_COLS, TEXT_ROWS, err, sizeof(err))) {
+        save_setting(ED_LAST, path);
+        return;
+    }
+    if (path[0]) {
+        edit_fail("Open", err);
+    }
+    if (!ed_open("", TEXT_COLS, TEXT_ROWS, err, sizeof(err))) {
+        edit_fail("Editor", err);
+        s_screen = s_base;
+    }
+}
+
+// Home > Tools > Text editor: the file edited last, if it is still there.
+static void edit_last(void)
+{
+    char path[PATH_MAX_LEN];
+    FILINFO fi;
+    if (!load_setting(ED_LAST, path, sizeof(path)) || f_stat(path, &fi) != FR_OK) {
+        path[0] = '\0';
+    }
+    edit_open(path);
+}
+
+static void edit_prompt(ed_prompt_t kind, const char *start)
+{
+    s_ed_prompt = kind;
+    strlcpy(s_ed_in, start, sizeof(s_ed_in));
+}
+
+// The file's folder (Files' folder for a new text) with a "/" after it.
+static void edit_folder(char *out, size_t len)
+{
+    strlcpy(out, ed_path()[0] ? ed_path() : s_cwd, len);
+    if (ed_path()[0]) {
+        *strrchr(out, '/') = '\0';
+    }
+    strlcat(out, "/", len);
+}
+
+static void edit_then(ed_then_t then)
+{
+    s_ed_then = ET_NONE;
+    switch (then) {
+    case ET_CLOSE:
+        ed_close();
+        s_screen = s_base;
+        if (s_ed_saved && s_base == SCREEN_BROWSE) {
+            rescan_dir();
+        }
+        s_ed_saved = false;
+        break;
+    case ET_NEW:
+        edit_open("");
+        break;
+    case ET_OPEN: {
+        char folder[PATH_MAX_LEN];
+        edit_folder(folder, sizeof(folder));
+        edit_prompt(EP_OPEN, folder);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+// Close, start a new text or open another: first ask about unsaved changes.
+static void edit_leave(ed_then_t then)
+{
+    if (ed_modified()) {
+        s_ed_then = then;
+        s_ed_ask = true;
+    } else {
+        edit_then(then);
+    }
+}
+
+static bool edit_save(const char *path)
+{
+    char err[64];
+    if (!ed_save(path, err, sizeof(err))) {
+        edit_fail("Save", err);
+        return false;
+    }
+    save_setting(ED_LAST, ed_path());
+    s_ed_saved = true;
+    toast("Saved");
+    return true;
+}
+
+static void edit_save_as(void)
+{
+    char path[PATH_MAX_LEN];
+    if (ed_path()[0]) {
+        strlcpy(path, ed_path(), sizeof(path));
+    } else {
+        edit_folder(path, sizeof(path));
+        strlcat(path, "untitled.txt", sizeof(path));
+    }
+    edit_prompt(EP_SAVE_AS, path);
+}
+
+// F2: save (asking for a name if it has none), then whatever was waiting for it.
+static void edit_save_key(void)
+{
+    if (!ed_path()[0]) {
+        edit_save_as();
+    } else if (edit_save(NULL)) {
+        edit_then(s_ed_then);
+    } else {
+        s_ed_then = ET_NONE;
+    }
+}
+
+// Enter at the prompt.
+static void edit_prompt_done(void)
+{
+    ed_prompt_t kind = s_ed_prompt;
+    s_ed_prompt = EP_NONE;
+    if (!s_ed_in[0]) {
+        s_ed_then = ET_NONE;
+        return;
+    }
+    char path[PATH_MAX_LEN + 1];
+    snprintf(path, sizeof(path), "%s%s", s_ed_in[0] == '/' ? "" : "/", s_ed_in);
+    switch (kind) {
+    case EP_SAVE_AS:
+        if (edit_save(path)) {
+            edit_then(s_ed_then);
+        } else {
+            s_ed_then = ET_NONE;
+        }
+        break;
+    case EP_OPEN:
+        edit_open(path);
+        break;
+    case EP_FIND:
+        strlcpy(s_ed_find, s_ed_in, sizeof(s_ed_find));
+        if (!ed_find(s_ed_find)) {
+            toast("Not found");
+        }
+        break;
+    case EP_LINE:
+        ed_goto_line(strtol(s_ed_in, NULL, 10));
+        break;
+    default:
+        break;
+    }
+}
+
+static void draw_edit(void)
+{
+    static const char *const LABELS[] = {"", "Save as: ", "Open: ", "Find: ", "Go to line (0: the end): "};
+    draw_bar();
+    char title[COLS + 1], name[80];
+    const char *path = ed_path();
+    snprintf(name, sizeof(name), "%s%s", path[0] ? strrchr(path, '/') + 1 : "untitled", ed_modified() ? " *" : "");
+    fit(title, name, COLS);
+    lcd_text(MARGIN, PATH_Y, title, C_ACCENT, FONT_LARGE);
+    lcd_hline(MARGIN - 4, PATH_Y + 16, LCD_W - 2 * (MARGIN - 4), C_LINE);
+    ed_draw(TEXT_X, TEXT_Y, TEXT_LH);
+
+    char line[PATH_MAX_LEN + 40];
+    if (s_ed_ask) {
+        draw_footer("Save the changes first?", C_WARN, "Enter Save  N Don't save  Esc Cancel");
+    } else if (s_ed_prompt) {
+        // keep the end (where you type) in view
+        int cols = (LCD_W - 2 * MARGIN) / 6 - (int)strlen(LABELS[s_ed_prompt]) - 1, n = (int)strlen(s_ed_in);
+        snprintf(line, sizeof(line), "%s%s_", LABELS[s_ed_prompt], n > cols ? s_ed_in + n - cols : s_ed_in);
+        draw_footer(line, C_BRIGHT, "Enter OK  Esc Cancel");
+    } else {
+        ed_status(line, sizeof(line));
+        draw_footer(line, C_DIM, "F2 Save  F3 Open  F4 Find  F7 Save as  Esc Close");
+    }
+}
+
+static bool edit_ask_key(int key)
+{
+    s_ed_ask = false;
+    if (key == KEY_ENTER || key == 'y' || key == 'Y') {
+        edit_save_key();
+    } else if (key == 'n' || key == 'N') {
+        edit_then(s_ed_then);
+    } else if (key == KEY_ESC) {
+        s_ed_then = ET_NONE;
+    } else {
+        s_ed_ask = true;
+        return false;
+    }
+    return true;
+}
+
+static bool edit_prompt_key(int key)
+{
+    size_t len = strlen(s_ed_in);
+    if (key == KEY_ENTER) {
+        edit_prompt_done();
+    } else if (key == KEY_ESC) {
+        s_ed_prompt = EP_NONE;
+        s_ed_then = ET_NONE;
+    } else if (key == KEY_BACKSPACE || key == KEY_DEL) {
+        s_ed_in[len - (len > 0)] = '\0';
+    } else if (key >= 0x20 && key < 0x7F && len + 1 < sizeof(s_ed_in) &&
+               (s_ed_prompt != EP_LINE || (key >= '0' && key <= '9'))) {
+        s_ed_in[len] = (char)key;
+        s_ed_in[len + 1] = '\0';
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static bool edit_key(int key)
+{
+    if (s_ed_ask) {
+        return edit_ask_key(key);
+    }
+    if (s_ed_prompt) {
+        return edit_prompt_key(key);
+    }
+    switch (key) {
+    case KEY_F2:
+    case KEY_CTRL('s'):
+        edit_save_key();
+        return true;
+    case KEY_F7:
+        edit_save_as();
+        return true;
+    case KEY_F3:
+    case KEY_CTRL('o'):
+        edit_leave(ET_OPEN);
+        return true;
+    case KEY_CTRL('n'):
+        edit_leave(ET_NEW);
+        return true;
+    case KEY_F4:
+    case KEY_CTRL('f'):
+        edit_prompt(EP_FIND, s_ed_find);
+        return true;
+    case KEY_F5:
+        if (!s_ed_find[0]) {
+            edit_prompt(EP_FIND, "");
+        } else if (!ed_find(s_ed_find)) {
+            toast("Not found");
+        }
+        return true;
+    case KEY_CTRL('g'):
+        edit_prompt(EP_LINE, "");
+        return true;
+    case KEY_ESC:
+        edit_leave(ET_CLOSE);
+        return true;
+    default: {
+        if (!ed_key(key)) {
+            return false;
+        }
+        const char *msg = ed_take_message();
+        if (msg) {
+            toast(msg);
+        }
+        return true;
+    }
     }
 }
 
@@ -4346,6 +4861,9 @@ void ui_redraw(void)
     case SCREEN_DELETE:
         draw_delete();
         break;
+    case SCREEN_OPEN_WITH:
+        draw_open_with();
+        break;
     case SCREEN_CTL:
         draw_ctl();
         break;
@@ -4354,6 +4872,9 @@ void ui_redraw(void)
         break;
     case SCREEN_TEXT:
         draw_text();
+        break;
+    case SCREEN_EDIT:
+        draw_edit();
         break;
     case SCREEN_IMAGE:
         draw_image(); // it flushes, and nothing goes over it
@@ -4486,7 +5007,7 @@ static void open_selected(void)
     if (has_uf2_ext(e->name)) {
         inspect_file();
     } else {
-        note(C_DIM, "%s: no viewer for this kind of file.", e->name);
+        open_with();
     }
 }
 
@@ -4644,11 +5165,34 @@ void ui_key(int key)
             return;
         }
         break;
+    case SCREEN_EDIT:
+        if (!edit_key(key)) {
+            return;
+        }
+        break;
     case SCREEN_IMAGE:
         if (!image_key(key)) {
             return;
         }
         break;
+    case SCREEN_OPEN_WITH:
+        if (key == KEY_UP || key == KEY_DOWN) {
+            s_ow_sel = (s_ow_sel + 1) % OW_COUNT;
+            break;
+        }
+        if (key == KEY_ENTER || key == KEY_RIGHT) {
+            if (s_ow_sel == OW_IMAGE) {
+                show_image(SCREEN_BROWSE);
+            } else {
+                edit_open(s_sel_path);
+            }
+            break;
+        }
+        if (key == KEY_ESC || key == KEY_BACKSPACE || key == KEY_LEFT) {
+            s_screen = SCREEN_BROWSE;
+            break;
+        }
+        return;
     case SCREEN_DELETE:
         if (key == KEY_ENTER) {
             do_delete();
