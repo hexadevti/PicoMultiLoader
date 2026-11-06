@@ -1,0 +1,4 @@
+# build output of the start kits (dist/ is kept: the ready-built SD card folders)
+build/
+sdkconfig
+sdkconfig.old

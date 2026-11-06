@@ -561,6 +561,21 @@ To give your app an icon, name, version and description on Home, package it as a
 `app.ini`: see [docs/apps.md](docs/apps.md), the [app template](examples/app-template/) and
 `tools/pml_app.py`, which makes icons and checks app folders.
 
+### Start kits
+
+Two small C projects to start a PicoCalc app from, in [examples/app-template/](examples/app-template/):
+
+| Kit | Board | Build | Ready-built SD card folder |
+| --- | --- | --- | --- |
+| [rp2350/](examples/app-template/rp2350/) | Pico 2 / Pico 2 W | Pico SDK: `cmake -B build -G Ninja`, `cmake --build build` | [dist/StartKit/](examples/app-template/rp2350/dist/StartKit/) |
+| [esp32p4/](examples/app-template/esp32p4/) | Waveshare ESP32-P4-WIFI6 | ESP-IDF 5.5: `idf.py build` | [dist/StartKitP4/](examples/app-template/esp32p4/dist/StartKitP4/) |
+
+Both build the same demo: four pages of text, shapes, animation and charts (F1 to F4), and Esc
+back to the menu. Each kit has a 320 x 320 frame buffer, a small drawing library with two fonts,
+the keyboard, the battery and the return to the loader. Only one file, the board port, differs
+between them. To try a kit without building it, copy its `dist` folder to the root of the SD card.
+See [examples/app-template/README.md](examples/app-template/README.md).
+
 Any ESP32-P4 app image works. The rules are the same for ESP-IDF and the Arduino IDE:
 
 * **Chip revision:** build for the same revision family as the loader (v3.x by default, see

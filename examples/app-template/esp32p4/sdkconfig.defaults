@@ -1,0 +1,16 @@
+CONFIG_IDF_TARGET="esp32p4"
+
+# Chip revision: v3.x silicon is the default. For older v1.x boards uncomment:
+# CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+
+CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+# Only used when flashing the app on its own with idf.py flash. Started from PicoMultiLoader,
+# the app runs in the loader's 10 MB "ota_0" partition.
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# GPIO24/25 (the USB-Serial-JTAG pads) are the PicoCalc LCD's DC/RST: the console stays on UART0.
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+# 1 ms ticks, so pc_sleep_ms() is accurate
+CONFIG_FREERTOS_HZ=1000
