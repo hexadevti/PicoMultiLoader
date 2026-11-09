@@ -8,6 +8,7 @@
  * F1-F5 and typing (the terminal).
  */
 #include <stdio.h>
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "keyboard.h"
@@ -130,8 +131,21 @@ static void update_battery(void)
     }
 }
 
+// Keep the Wi-Fi co-processor (ESP32-C6, EN on GPIO54) in reset until Wi-Fi is wanted: webserver.c
+// wakes it on first use. Booting it alongside the P4, LCD and SD card is a current spike the
+// batteries can't always supply, so the PicoCalc wouldn't start without USB power.
+static void wifi_chip_off(void)
+{
+    gpio_config_t io = { .pin_bit_mask = 1ull << CONFIG_ESP_HOSTED_HOST_RESET_GPIO,
+                         .mode = GPIO_MODE_OUTPUT };
+    gpio_set_level(CONFIG_ESP_HOSTED_HOST_RESET_GPIO, 0);
+    gpio_config(&io);
+    gpio_set_level(CONFIG_ESP_HOSTED_HOST_RESET_GPIO, 0);
+}
+
 void app_main(void)
 {
+    wifi_chip_off();
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();

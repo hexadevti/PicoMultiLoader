@@ -12,7 +12,8 @@ idf_component_register(SRCS "main.c" "ui_dispatch.c" "kbd_bus.c" "lcd_bus.c" "sd
                     REQUIRES app_update bootloader_support esp_app_format esp_partition
                              fatfs sdmmc esp_driver_sdspi esp_driver_spi esp_driver_i2c esp_driver_gpio
                              esp_lcd esp_hw_support esp_timer nvs_flash hal esp_system esp_rom espressif__esp_tinyusb
-                             esp_netif esp_event esp_http_server espressif__esp_wifi_remote espressif__mdns lwip)
+                             esp_netif esp_event esp_http_server espressif__esp_wifi_remote espressif__esp_hosted
+                             espressif__mdns lwip)
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE PICOMULTILOADER_WIFI=1)
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-unused-function)

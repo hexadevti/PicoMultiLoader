@@ -7,3 +7,16 @@ menu "PicoMultiLoader"
             Pins for the PicoCalc LCD, keyboard and SD card are in main/board.h.
 
 endmenu
+
+# The registry manifest of espressif/esp_hosted makes its USB-host dependencies conditional on these
+# symbols, but no Kconfig in the component defines them. The component manager then keeps asking
+# CMake to re-run ("Missing required kconfig option after retry"). They are compared with 1, so int; we use SDIO, so 0.
+config ESP_HOSTED_HOST_USB_CDC_ACM_MANIFEST
+    int "esp_hosted: pull in the USB CDC-ACM host component (1 = yes, unused)"
+    default 0
+config ESP_HOSTED_HOST_USB_CHERRYUSB_MANIFEST
+    int "esp_hosted: pull in the USB CherryUSB host component (1 = yes, unused)"
+    default 0
+config ESP_HOSTED_HOST_USB_RNDIS_MANIFEST
+    int "esp_hosted: pull in the USB RNDIS host component (1 = yes, unused)"
+    default 0

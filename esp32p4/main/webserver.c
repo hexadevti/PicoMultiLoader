@@ -35,6 +35,7 @@
 #include "esp_random.h"
 #include "esp_netif.h"
 #include "esp_vfs_fat.h"
+#include "esp_hosted.h"
 #include "esp_wifi.h"
 #include "mdns.h"
 #include "nvs.h"
@@ -693,6 +694,13 @@ static esp_err_t wifi_init_once(void)
 {
     if (s_wifi_ready) {
         return ESP_OK;
+    }
+    // The ESP32-C6 is held in reset from switch-on (main.c) and only woken here, on first use:
+    // its boot and RF calibration draw current spikes that, on top of the P4's own start-up, the
+    // PicoCalc's batteries can't supply. (CONFIG_ESP_HOSTED_AUTO_CALL_INIT_BEFORE_APP_MAIN is off.)
+    if (esp_hosted_init() != 0 || esp_hosted_connect_to_slave() != 0) {
+        ESP_LOGE(TAG, "ESP32-C6 not responding");
+        return ESP_FAIL;
     }
     esp_err_t err = esp_netif_init();
     if (err != ESP_OK) {
