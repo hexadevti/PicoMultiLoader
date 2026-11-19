@@ -15,6 +15,10 @@
 #endif
 #define PML_P4 0
 
+// The bundled apps stay separate .uf2 builds here (apps/): no 8-bit mode, no built-in apps
+#define PML_LCD8         0
+#define PML_BUILTIN_APPS 0
+
 // The Wi-Fi firmware and the web page in the last 256 KB of flash, installed from the loader file
 // (uf2_res_*, RP2350 with Wi-Fi only)
 #define PML_RES (PICOMULTILOADER_WIFI && PML_RP2350)

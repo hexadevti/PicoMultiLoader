@@ -12,6 +12,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+// The Pico pins; on the ESP32-P4 board they are GPIO 23 and 22 (esp32p4/main/audio_p4.c)
 #define AUDIO_LEFT_PIN  26
 #define AUDIO_RIGHT_PIN 27
 #define AUDIO_FRAMES    1024 // per buffer

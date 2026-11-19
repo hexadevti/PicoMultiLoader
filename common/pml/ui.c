@@ -8,6 +8,7 @@
 #include <strings.h>
 #include "plat.h"
 #include "apps.h"
+#include "builtin.h"
 #include "clock.h"
 #include "config.h"
 #include "editor.h"
@@ -1314,7 +1315,11 @@ static const char *const HELP_TEXT[] = {
     "The apps on the card: each folder in the root with an app.ini or a " PML_APP_EXT " in it, and each " PML_APP_EXT " in the root.",
     "Arrows, PgUp/PgDn, Home/End: move. Tab: next tab (Favourites, Recent, All, Tools). It opens on the app run last.",
     "Type to search all the apps; Backspace deletes, Esc clears.",
+#if PML_BUILTIN_APPS
+    "Tools: the text editor, the image viewer and editor, the music player, the calculator, Files and the terminal, built into the loader.",
+#else
     "Tools: the text editor, the image viewer, Files and the terminal, built into the loader.",
+#endif
     "Enter: run the app. The installed one (green dot) starts at once; any other is flashed first.",
     "F2: add to or remove from Favourites (yellow star). F3: Files.",
 #if PICOMULTILOADER_WIFI
@@ -2738,6 +2743,20 @@ enum { TAB_FAVS, TAB_RECENT, TAB_ALL, TAB_TOOLS, TABS };
 #define HOME_TOOL  0xF0               // in s_shown: HOME_TOOL + TOOL_..., a tile on the Tools tab
 
 // The Tools tab: what is built into the loader
+#if PML_BUILTIN_APPS // with the bundled apps built in (builtin.h)
+enum { TOOL_EDITOR, TOOL_IMAGE, TOOL_PAINT, TOOL_MUSIC, TOOL_CALC, TOOL_FILES, TOOL_TERM, TOOLS };
+static const char *const TOOL_NAMES[TOOLS] = {"Text editor", "Image viewer", "Image editor", "Music player",
+                                              "Calculator",  "Files",        "Terminal"};
+static const char *const TOOL_DESCS[TOOLS] = {
+    "Write and change text files on the card",
+    "BMP pictures on the card, Left/Right for the next",
+    "View and paint BMP pictures, in 240 colours",
+    "Play WAV files from the card (/Music)",
+    "Scientific calculator with history",
+    "Browse, copy, move and delete files (F3)",
+    "Commands for the card and the apps (F5)",
+};
+#else
 enum { TOOL_EDITOR, TOOL_IMAGE, TOOL_FILES, TOOL_TERM, TOOLS };
 static const char *const TOOL_NAMES[TOOLS] = {"Text editor", "Image viewer", "Files", "Terminal"};
 static const char *const TOOL_DESCS[TOOLS] = {
@@ -2746,6 +2765,7 @@ static const char *const TOOL_DESCS[TOOLS] = {
     "Browse, copy, move and delete files (F3)",
     "Commands for the card and the apps (F5)",
 };
+#endif
 
 static uint8_t s_shown[APPS_MAX + 1]; // the apps on the tab (indexes into s_apps.list), in order
 static int s_tab, s_hsel, s_htop;     // s_htop: the first grid row shown
@@ -3005,6 +3025,35 @@ static void draw_tool_icon(int tool, int x, int y)
             lcd_fill_rect(l, y + 14 + i, x + 11 + i - l + 1, 1, C_OK);
         }
         break;
+#if PML_BUILTIN_APPS
+    case TOOL_PAINT: // a palette with three paints and a brush across it
+        lcd_fill_rect(x + 3, y + 8, 24, 18, C_FIELD);
+        look_frame(x + 3, y + 8, 24, 18, C_LINE);
+        lcd_fill_rect(x + 7, y + 12, 5, 4, C_ERR);
+        lcd_fill_rect(x + 14, y + 12, 5, 4, C_OK);
+        lcd_fill_rect(x + 7, y + 18, 5, 4, C_ACC2);
+        for (int i = 0; i < 12; i++) { // the brush: bristles, then the handle
+            lcd_fill_rect(x + 16 + i, y + 23 - i, 3, 3, i < 3 ? C_WARN : C_ACCENT);
+        }
+        break;
+    case TOOL_MUSIC: // a pair of quavers
+        lcd_fill_rect(x + 11, y + 6, 15, 3, C_ACCENT);
+        lcd_fill_rect(x + 11, y + 6, 2, 17, C_ACCENT);
+        lcd_fill_rect(x + 24, y + 6, 2, 15, C_ACCENT);
+        lcd_fill_rect(x + 5, y + 21, 8, 6, C_BRIGHT);
+        lcd_fill_rect(x + 18, y + 19, 8, 6, C_BRIGHT);
+        break;
+    case TOOL_CALC: // a calculator: a display over a grid of keys
+        lcd_fill_rect(x + 6, y + 2, 20, 28, C_PANEL);
+        look_frame(x + 6, y + 2, 20, 28, C_LINE);
+        lcd_fill_rect(x + 9, y + 5, 14, 6, C_OK);
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < 3; c++) {
+                lcd_fill_rect(x + 9 + 5 * c, y + 13 + 4 * r, 4, 3, r == 3 && c == 2 ? C_ACCENT : C_FG);
+            }
+        }
+        break;
+#endif
     case TOOL_FILES: // a folder with a list in it
         lcd_fill_rect(x + 2, y + 6, 12, 4, C_ACCENT);
         lcd_fill_rect(x + 2, y + 9, 28, 19, C_ACCDK);
@@ -3213,6 +3262,21 @@ static void enter_term(void);
 static void edit_last(void);
 static void image_tool(void);
 
+#if PML_BUILTIN_APPS
+static uint64_t s_last_key_us; // (the idle screen's, below)
+
+// A bundled app built into the loader: it has the screen until the user leaves it.
+static void run_builtin(int which)
+{
+    bool ok = builtin_run(which);
+    if (!ok) {
+        note(C_ERR, "%s", "Not enough memory to start it.");
+    }
+    s_last_key_us = time_us_64(); // its time doesn't count towards the idle screen
+    ui_redraw();
+}
+#endif
+
 static void home_open(void)
 {
     if (!s_sd_ok) {
@@ -3230,6 +3294,17 @@ static void home_open(void)
     case TOOL_IMAGE:
         image_tool();
         return;
+#if PML_BUILTIN_APPS
+    case TOOL_PAINT:
+        run_builtin(BUILTIN_IMAGE);
+        return;
+    case TOOL_MUSIC:
+        run_builtin(BUILTIN_MUSIC);
+        return;
+    case TOOL_CALC:
+        run_builtin(BUILTIN_CALC);
+        return;
+#endif
     case TOOL_FILES:
         go_files();
         return;

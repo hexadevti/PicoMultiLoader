@@ -3,29 +3,86 @@
 #include "lcd.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include "plat.h"
 #include "uifont.h"
 
 static uint8_t s_fb[LCD_W * LCD_H / 2]; // two pixels per byte: low nibble = even x
 static uint16_t s_palette[16];
 
+#if PML_LCD8
+// The 8-bit mode for the built-in apps (lcd8_begin()): one byte per pixel, 256 colours.
+static uint8_t *s_fb8;
+static uint16_t s_pal8[256];
+
+bool lcd8_begin(void)
+{
+    if (!s_fb8) {
+        s_fb8 = calloc(LCD_W, LCD_H);
+        if (!s_fb8) {
+            return false;
+        }
+    }
+    memset(s_pal8, 0, sizeof(s_pal8));
+    memcpy(s_pal8, s_palette, sizeof(s_palette));
+    return true;
+}
+
+void lcd8_end(void)
+{
+    free(s_fb8);
+    s_fb8 = NULL;
+}
+
+uint8_t *lcd8_row(int y)
+{
+    return s_fb8 ? &s_fb8[y * LCD_W] : NULL;
+}
+#define FB8 s_fb8
+#else
+#define FB8 ((uint8_t *)NULL)
+#endif
+
 void lcd_set_palette(lcd_color_t index, uint16_t rgb565)
 {
-    s_palette[index & 15] = rgb565;
+#if PML_LCD8
+    s_pal8[index] = rgb565;
+#endif
+    if (index < 16) {
+        s_palette[index] = rgb565;
+    }
 }
 
 uint16_t lcd_get_palette(lcd_color_t index)
 {
+#if PML_LCD8
+    if (s_fb8) {
+        return s_pal8[index];
+    }
+#endif
     return s_palette[index & 15];
 }
 
 const uint8_t *lcd_row(int y)
 {
+    if (FB8) {
+        return &FB8[y * LCD_W];
+    }
     return &s_fb[y * (LCD_W / 2)];
 }
 
 void lcd_expand_rows(uint16_t *out, int y, int rows)
 {
+#if PML_LCD8
+    if (s_fb8) {
+        const uint8_t *p = &s_fb8[y * LCD_W];
+        for (int i = 0; i < rows * LCD_W; i++) {
+            out[i] = s_pal8[p[i]];
+        }
+        return;
+    }
+#endif
     const uint8_t *src = &s_fb[y * (LCD_W / 2)];
     for (int i = 0; i < rows * LCD_W / 2; i++) {
         uint8_t b = src[i];
@@ -41,6 +98,10 @@ void lcd_flush(void)
 
 static inline void put_pixel(int x, int y, lcd_color_t c)
 {
+    if (FB8) {
+        FB8[y * LCD_W + x] = c;
+        return;
+    }
     uint8_t *p = &s_fb[y * (LCD_W / 2) + (x >> 1)];
     *p = (x & 1) ? (uint8_t)((*p & 0x0F) | (c << 4)) : (uint8_t)((*p & 0xF0) | (c & 15));
 }
@@ -57,6 +118,12 @@ void lcd_fill_rect(int x, int y, int w, int h, lcd_color_t color)
     int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
     int x1 = x + w > LCD_W ? LCD_W : x + w, y1 = y + h > LCD_H ? LCD_H : y + h;
     if (x0 >= x1) {
+        return;
+    }
+    if (FB8) {
+        for (int j = y0; j < y1; j++) {
+            memset(&FB8[j * LCD_W + x0], color, x1 - x0);
+        }
         return;
     }
     uint8_t both = (uint8_t)((color & 15) * 0x11);
@@ -81,6 +148,14 @@ void lcd_hline(int x, int y, int w, lcd_color_t color)
 
 void lcd_checker(int y, int h, lcd_color_t color)
 {
+    if (FB8) {
+        for (int j = y < 0 ? 0 : y; j < y + h && j < LCD_H; j++) {
+            for (int i = j & 1; i < LCD_W; i += 2) {
+                FB8[j * LCD_W + i] = color;
+            }
+        }
+        return;
+    }
     uint8_t c = color & 15;
     for (int j = y < 0 ? 0 : y; j < y + h && j < LCD_H; j++) {
         // even rows: even pixels (low nibbles); odd rows: odd pixels (high nibbles)
@@ -130,6 +205,11 @@ int lcd_text(int x, int y, const char *s, lcd_color_t color, lcd_font_t font)
 
 static inline uint16_t pixel_rgb(int x, int y)
 {
+#if PML_LCD8
+    if (s_fb8) {
+        return s_pal8[s_fb8[y * LCD_W + x]];
+    }
+#endif
     uint8_t b = s_fb[y * (LCD_W / 2) + (x >> 1)];
     return s_palette[(x & 1) ? b >> 4 : b & 15];
 }
@@ -153,6 +233,9 @@ void lcd_dump(void)
             x += n;
         }
         printf("\n");
+        if ((y & 7) == 7) {
+            sleep_ms(1); // a busy screen takes seconds to print: let the idle task (watchdog) run
+        }
     }
     printf("FB end\n");
     fflush(stdout);

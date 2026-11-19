@@ -19,6 +19,14 @@
 // No Wi-Fi files in flash to install: the web page is built in, the C6 has its own firmware
 #define PML_RES 0
 
+// The bundled apps (apps/: Image Editor, Music Player, Calculator) are built into the loader's
+// Tools tab, drawn in the 8-bit mode of lcd.c (builtin.c)
+#define PML_LCD8          1
+#define PML_BUILTIN_APPS  1
+
+/** The next key typed on the serial console, or KEY_NONE (main.c). */
+int plat_console_key(void);
+
 // Apps are ESP-IDF images
 #define PML_APP_EXT ".bin"
 // One firmware holds both menus: the "ui" setting picks one at start (ui_dispatch.c)

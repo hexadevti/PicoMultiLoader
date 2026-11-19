@@ -51,7 +51,7 @@ static int console_getc_wait(void)
 }
 
 // Map terminal input (ANSI escape sequences) onto PicoCalc key codes.
-static int console_key(void)
+int plat_console_key(void)
 {
     int c = console_getc();
     switch (c) {
@@ -70,12 +70,9 @@ static int console_key(void)
     case 0x10: // Ctrl+P: dump the screen for screenshots
         lcd_dump();
         return KEY_NONE;
-    case KEY_CTRL_C:
-    case KEY_CTRL_V:
-    case KEY_CTRL_X:
-        return c;
     default:
-        return c >= 0x20 && c < 0x7F ? c : KEY_NONE; // typed text (Wi-Fi settings)
+        // typed text (Wi-Fi settings), and Ctrl+letter as the keyboard sends it (the tools use them)
+        return (c >= 0x20 && c < 0x7F) || (c >= 0x01 && c <= 0x1A) ? c : KEY_NONE;
     }
 
     int c1 = console_getc_wait();
@@ -206,7 +203,7 @@ void app_main(void)
         }
 
         int key;
-        while ((key = console_key()) != KEY_NONE) {
+        while ((key = plat_console_key()) != KEY_NONE) {
             ui_key(key);
         }
 

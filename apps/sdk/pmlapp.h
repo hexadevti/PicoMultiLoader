@@ -106,5 +106,14 @@ bool app_setting_get(const char *key, char *buf, size_t len);
 /** Store a setting (does nothing if the app's folder isn't on the card). */
 void app_setting_set(const char *key, const char *value);
 
+#if PML_BUILTIN
+/**
+ * In the loader (PML_BUILTIN): run `app_main` of a built-in app until it calls app_exit(), in the
+ * 8-bit mode, with its settings in `folder` (e.g. "/pml/Calculator"). -1 if there is no memory for
+ * the 8-bit framebuffer. Redraw the menu afterwards.
+ */
+int pmlapp_run(const char *name, const char *folder, int (*app_main)(void));
+#endif
+
 /** Go back to the loader's menu, leaving `message` (may be NULL) for it to show once. */
 void __attribute__((noreturn)) app_exit(const char *message);

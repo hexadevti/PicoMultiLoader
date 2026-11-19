@@ -71,7 +71,7 @@ static void names_sort(names_t *n)
 static bool names_read(names_t *n, const char *path, bool with_dirs)
 {
     n->count = n->used = 0;
-    DIR d;
+    FF_DIR d;
     FILINFO fi;
     if (f_opendir(&d, path[0] ? path : "/") != FR_OK) {
         return false;

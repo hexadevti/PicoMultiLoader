@@ -9,7 +9,7 @@
 
 #define RGB565(r, g, b) ((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3)))
 
-typedef uint8_t lcd_color_t; // palette index 0..15
+typedef uint8_t lcd_color_t; // palette index 0..15 (0..255 in the 8-bit mode)
 
 typedef enum {
     FONT_SMALL, // 6x10
@@ -50,6 +50,14 @@ int lcd_text(int x, int y, const char *s, lcd_color_t color, lcd_font_t font);
 
 int lcd_font_width(lcd_font_t font);
 int lcd_font_height(lcd_font_t font);
+
+// The 8-bit mode (platforms with PML_LCD8, for the built-in apps): while it is on, the drawing calls
+// work on one byte per pixel and a 256-entry palette (entries 0..15 start as the loader's), and
+// lcd_row() returns LCD_W bytes. The 4-bit framebuffer is kept: redraw it after lcd8_end().
+bool lcd8_begin(void);
+void lcd8_end(void);
+/** One row of the 8-bit framebuffer, or NULL when the mode is off. */
+uint8_t *lcd8_row(int y);
 
 /** Print the framebuffer on the console as run-length hex rows (Ctrl+P, used for screenshots). */
 void lcd_dump(void);

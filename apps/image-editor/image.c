@@ -30,8 +30,20 @@
 #define STATUS_H 13
 #define VIEW_Y   APP_TOP
 
+#if PML_BUILTIN
+// In the loader (no PSRAM) the canvas and the undo copy come from the heap while the editor runs,
+// as big as what is free allows (main()), up to the standalone app's size.
+#define CANVAS_LIMIT (160 * 1024)
+#define CANVAS_SPARE (32 * 1024) // left for the card, Wi-Fi and the rest of the loader
+#define CANVAS_MIN   (16 * 1024)
+#undef CANVAS_MAX
+#define CANVAS_MAX s_canvas_max
+static int s_canvas_max;
+static uint8_t *s_canvas, *s_undo;
+#else
 static uint8_t s_canvas[CANVAS_MAX];
 static uint8_t s_undo[CANVAS_MAX];
+#endif
 static int s_w, s_h, s_undo_w, s_undo_h;
 static bool s_has_undo, s_modified, s_reduced;
 static char s_path[256];
@@ -394,7 +406,7 @@ static bool step_file(int dir)
     char folder[sizeof(s_path)], best[sizeof(s_path)] = "";
     app_dirname(s_path, folder, sizeof(folder));
     const char *cur = app_basename(s_path);
-    DIR d;
+    FF_DIR d;
     FILINFO fi;
     if (f_opendir(&d, folder[0] ? folder : "/") != FR_OK) {
         return false;
@@ -741,6 +753,15 @@ static bool new_picture(uint8_t bg)
     char buf[24];
 #if PICO_RP2040
     strlcpy(buf, "200x150", sizeof(buf));
+#elif PML_BUILTIN
+    static const char *const SIZES[] = {"320x240", "240x180", "200x150", "160x120", "120x90"};
+    for (int i = 0; i < (int)(sizeof(SIZES) / sizeof(SIZES[0])); i++) {
+        int w, h;
+        strlcpy(buf, SIZES[i], sizeof(buf));
+        if (parse_size(buf, &w, &h)) {
+            break; // the biggest that fits the canvas this run got
+        }
+    }
 #else
     strlcpy(buf, "320x240", sizeof(buf));
 #endif
@@ -1091,9 +1112,49 @@ static const char *const VIEW_HELP[] = {
     "in memory, and shown with 240 colours.",
 };
 
+#if PML_BUILTIN
+/** The loader's builtin.c, once the editor has returned: give the canvas back. */
+void image_editor_release(void)
+{
+    free(s_canvas);
+    free(s_undo);
+    s_canvas = s_undo = NULL;
+}
+#endif
+
 int main(void)
 {
     app_init();
+#if PML_BUILTIN
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    size_t avail = esp_get_free_heap_size();
+    size_t each = avail > CANVAS_SPARE ? (avail - CANVAS_SPARE) / 2 : 0;
+    if (each > largest) {
+        each = largest;
+    }
+    if (each > CANVAS_LIMIT) {
+        each = CANVAS_LIMIT;
+    }
+    each &= ~(size_t)1023;
+    for (; each >= CANVAS_MIN; each -= 4096) {
+        s_canvas = malloc(each);
+        s_undo = s_canvas ? malloc(each) : NULL;
+        if (s_undo) {
+            break;
+        }
+        free(s_canvas);
+        s_canvas = NULL;
+    }
+    if (!s_undo) {
+        app_message(APP_NAME, "Not enough memory for the canvas.");
+        app_exit(NULL);
+    }
+    s_canvas_max = (int)each;
+    printf("Image Editor: canvas of %d bytes\n", s_canvas_max);
+    s_w = s_h = 0;
+    s_has_undo = s_modified = s_reduced = false;
+    s_path[0] = '\0';
+#endif
     cube_palette();
     char last[sizeof(s_path)];
     FILINFO fi;

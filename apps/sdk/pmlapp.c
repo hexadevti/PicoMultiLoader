@@ -1,20 +1,39 @@
 // pmlapp.c - the bundled apps' shared code (pmlapp.h).
+//
+// Built two ways: into each app's own .uf2 (apps/CMakeLists.txt), or with PML_BUILTIN into the
+// loader, where the apps run from its Tools tab (builtin.c starts them with pmlapp_run()). Built in,
+// the loader has already set up the card, panel and keyboard; the app draws in lcd.c's 8-bit mode,
+// keeps its settings in /pml/<folder>, and app_exit() returns to the menu.
 #include "pmlapp.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include "pico/stdlib.h"
-#include "hardware/watchdog.h"
 #include "board.h"
 #include "config.h"
+#if PML_BUILTIN
+#include <setjmp.h>
+#include "plat.h"
+#else
+#include "pico/stdlib.h"
+#include "hardware/watchdog.h"
+#endif
 
 #define KBD_EVERY_US     15000              // the keyboard's I2C read takes ~7 ms at 10 kHz
 #define BATTERY_EVERY_US (10 * 1000 * 1000)
 #define REPROBE_EVERY_US (1000 * 1000)
 
+#if PML_BUILTIN
+static const char *s_name, *s_dir; // pmlapp_run()'s
+static char s_settings_file[64];
+static jmp_buf s_exit_jmp;
+#define APP_NAME      s_name
+#define APP_DIR       s_dir
+#define SETTINGS_FILE s_settings_file
+#else
 #define SETTINGS_FILE APP_DIR "/settings.ini"
+#endif
 #define SETTINGS_MAX  16
 #define SETTING_LEN   96
 
@@ -24,7 +43,51 @@ static uint64_t s_next_kbd, s_next_battery, s_next_probe;
 static int s_battery = -1;
 static bool s_charging;
 
+static int s_set_count = -1; // the settings, loaded on first use
+
 // ---- start-up -----------------------------------------------------------------------------------
+#if PML_BUILTIN
+void app_init(void)
+{
+    printf("%s (built in), %u bytes of heap free\n", APP_NAME, (unsigned)esp_get_free_heap_size());
+    s_idle = NULL;
+    s_set_count = -1;
+    s_next_kbd = s_next_probe = 0;
+    s_sd_ok = true; // the Tools tab starts an app only with the card mounted
+    theme_apply();
+    look_anim_reset();
+    lcd_fill_rect(0, 0, LCD_W, LCD_H, C_BG);
+    lcd_flush();
+    s_battery = kbd_present() ? kbd_battery(&s_charging) : -1;
+    kbd_repeat_more(true);
+    s_next_battery = time_us_64() + BATTERY_EVERY_US;
+}
+
+uint8_t *app_fb_row(int y)
+{
+    return lcd8_row(y);
+}
+
+int pmlapp_run(const char *name, const char *folder, int (*app_main)(void))
+{
+    s_name = name;
+    s_dir = folder;
+    snprintf(s_settings_file, sizeof(s_settings_file), "%s/settings.ini", folder);
+    f_mkdir("/pml");
+    f_mkdir(folder);
+    if (!lcd8_begin()) {
+        return -1;
+    }
+    if (setjmp(s_exit_jmp) == 0) {
+        app_main();
+    }
+    kbd_repeat_more(false);
+    lcd8_end();
+    theme_apply();
+    look_anim_reset();
+    return 0;
+}
+#else
 void app_init(void)
 {
     stdio_uart_init_full(CONSOLE_UART, CONSOLE_BAUD, CONSOLE_TX_PIN, CONSOLE_RX_PIN);
@@ -43,6 +106,7 @@ void app_init(void)
     kbd_repeat_more(true);
     s_next_battery = time_us_64() + BATTERY_EVERY_US;
 }
+#endif
 
 bool app_sd_ok(void)
 {
@@ -58,6 +122,12 @@ int app_battery(bool *charging)
 }
 
 // ---- keys ---------------------------------------------------------------------------------------
+#if PML_BUILTIN
+static int console_key(void)
+{
+    return plat_console_key(); // the loader's, with the same keys (Ctrl+P dumps the screen)
+}
+#else
 static int console_getc(uint32_t wait_us)
 {
     int c = getchar_timeout_us(wait_us);
@@ -129,6 +199,7 @@ static int console_key(void)
     default: return KEY_NONE;
     }
 }
+#endif
 
 void app_set_idle(void (*fn)(void))
 {
@@ -157,6 +228,9 @@ int app_poll_key(void)
     }
     uint64_t now = time_us_64();
     if (now < s_next_kbd) {
+#if PML_BUILTIN
+        sleep_ms(1); // let the idle task (and its watchdog) run: the apps' loops poll without waiting
+#endif
         return KEY_NONE;
     }
     s_next_kbd = now + KBD_EVERY_US;
@@ -656,7 +730,6 @@ bool app_pick_file(const char *title, const char *exts, char *path, size_t len)
 
 // ---- settings -----------------------------------------------------------------------------------
 static char s_set[SETTINGS_MAX][SETTING_LEN]; // "key=value"
-static int s_set_count = -1;
 
 static void settings_load(void)
 {
@@ -723,6 +796,15 @@ void app_setting_set(const char *key, const char *value)
 }
 
 // ---- leaving ------------------------------------------------------------------------------------
+#if PML_BUILTIN
+void app_exit(const char *message)
+{
+    if (message) {
+        printf("%s: %s\n", APP_NAME, message);
+    }
+    longjmp(s_exit_jmp, 1);
+}
+#else
 void app_exit(const char *message)
 {
     FIL f;
@@ -754,3 +836,4 @@ void *uf2_scratch(size_t *len)
     *len = sizeof(buf);
     return buf;
 }
+#endif
